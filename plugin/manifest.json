@@ -1,0 +1,11 @@
+{
+  "name": "Design Bridge",
+  "id": "design-bridge",
+  "api": "1.0.0",
+  "main": "code.js",
+  "editorType": ["figma"],
+  "menu": [
+    { "command": "sync-page", "name": "Sync Full Page" },
+    { "command": "sync-selection", "name": "Sync Selected Nodes" }
+  ]
+}

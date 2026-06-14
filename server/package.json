@@ -1,0 +1,9 @@
+{
+  "name": "figma-design-bridge-server",
+  "version": "1.0.0",
+  "description": "Local server for Figma Design Bridge — lets Claude CLI read Figma designs without MCP",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  }
+}
