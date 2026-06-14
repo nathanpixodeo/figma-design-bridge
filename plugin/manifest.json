@@ -4,8 +4,16 @@
   "api": "1.0.0",
   "main": "code.js",
   "editorType": ["figma"],
+  "capabilities": [],
   "menu": [
-    { "command": "sync-page", "name": "Sync Full Page" },
-    { "command": "sync-selection", "name": "Sync Selected Nodes" }
+    {
+      "name": "Sync Design",
+      "menu": [
+        { "command": "sync-page", "name": "Sync Full Page" },
+        { "command": "sync-selection", "name": "Sync Selected Nodes" }
+      ]
+    },
+    { "type": "separator" },
+    { "command": "watch", "name": "Watch Mode (Auto-Sync)" }
   ]
 }

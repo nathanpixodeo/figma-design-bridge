@@ -1,33 +1,122 @@
 const SERVER_URL = 'http://localhost:3456'
 
-const UI_HTML = `<div id="root"></div>
+const UI_HTML = `<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{
+  font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+  background:#2C2C2E;color:#F5F5F7;font-size:13px;padding:14px;
+  -webkit-font-smoothing:antialiased
+}
+.header{font-size:15px;font-weight:600;margin-bottom:14px;display:flex;align-items:center;gap:6px}
+.status-bar{
+  display:flex;align-items:center;gap:7px;padding:8px 10px;
+  border-radius:7px;margin-bottom:12px;font-size:12px;font-weight:500
+}
+.status-bar.connected{background:rgba(48,209,88,0.12);color:#30D158}
+.status-bar.disconnected{background:rgba(255,69,58,0.12);color:#FF453A}
+.status-bar.connecting{background:rgba(255,214,10,0.12);color:#FFD60A}
+.dot{width:8px;height:8px;border-radius:50%;display:inline-block;flex-shrink:0}
+.dot.green{background:#30D158}
+.dot.red{background:#FF453A}
+.dot.yellow{background:#FFD60A}
+.info-grid{display:grid;grid-template-columns:auto 1fr;gap:5px 10px;margin-bottom:14px;font-size:12px;line-height:1.6}
+.info-grid .label{color:#8E8E93;white-space:nowrap}
+.info-grid .value{color:#F5F5F7;word-break:break-all;min-width:0}
+.actions{display:flex;flex-direction:column;gap:8px}
+.btn-sync{
+  background:#007AFF;color:white;border:none;border-radius:7px;
+  padding:9px 16px;font-size:13px;font-weight:500;cursor:pointer;
+  transition:background .15s;display:flex;align-items:center;justify-content:center;gap:5px
+}
+.btn-sync:hover{background:#0056CC}
+.btn-sync:active{background:#004499}
+.btn-sync:disabled{opacity:.5;cursor:not-allowed}
+.btn-sync.spinning{pointer-events:none}
+.btn-sync.spinning::after{
+  content:'';width:12px;height:12px;
+  border:2px solid rgba(255,255,255,.3);border-top-color:#fff;
+  border-radius:50%;animation:spin .6s linear infinite
+}
+@keyframes spin{to{transform:rotate(360deg)}}
+.checkbox-row{display:flex;align-items:center;gap:7px;font-size:12px;color:#AEAEB2;cursor:pointer;user-select:none}
+.checkbox-row input{accent-color:#007AFF;cursor:pointer}
+.error{color:#FF453A;font-size:11px;margin-top:6px;line-height:1.4;padding:6px 8px;background:rgba(255,69,58,0.08);border-radius:5px}
+.hidden{display:none!important}
+</style>
+<div id="app">
+  <div class="header">\uD83C\uDFA8 Design Bridge</div>
+  <div id="statusBar" class="status-bar connecting">
+    <span class="dot yellow"></span>
+    <span id="statusText">Starting...</span>
+  </div>
+  <div class="info-grid">
+    <span class="label">Page</span>
+    <span class="value" id="pageName">\u2014</span>
+    <span class="label">Nodes</span>
+    <span class="value" id="nodeCount">\u2014</span>
+    <span class="label">Last sync</span>
+    <span class="value" id="lastSync">\u2014</span>
+  </div>
+  <div class="actions">
+    <button class="btn-sync" id="syncBtn">\u27F3 Sync Now</button>
+    <label class="checkbox-row">
+      <input type="checkbox" id="autoSync" checked>
+      Auto-sync on selection change
+    </label>
+  </div>
+  <div id="errorMsg" class="error hidden"></div>
+</div>
 <script>
-window.addEventListener('message', async (e) => {
-  const msg = e.data.pluginMessage
-  if (!msg || msg.type !== 'sync') return
-  try {
-    const res = await fetch('${SERVER_URL}/design', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(msg.data)
-    })
-    const result = await res.json()
-    parent.postMessage({ pluginMessage: { type: 'done', success: true, nodeCount: msg.data.nodeCount, serverMessage: result.message } }, '*')
-  } catch (err) {
-    parent.postMessage({ pluginMessage: { type: 'done', success: false, error: err.message } }, '*')
+const SERVER_URL = '${SERVER_URL}'
+function q(s){return document.getElementById(s)}
+function setStatus(type,text){
+  const bar=q('statusBar'),el=q('statusText'),dot=bar.querySelector('.dot')
+  bar.className='status-bar '+type
+  dot.className='dot '+(type==='connected'?'green':type==='disconnected'?'red':'yellow')
+  el.textContent=text
+}
+function updateInfo(d){
+  if(d.pageName) q('pageName').textContent=d.pageName
+  if(d.nodeCount!==undefined) q('nodeCount').textContent=d.nodeCount.toString()
+  if(d.lastSync){try{q('lastSync').textContent=new Date(d.lastSync).toLocaleTimeString()}catch{}}
+  if(d.autoSync!==undefined) q('autoSync').checked=d.autoSync
+  setStatus(d.connected?'connected':'disconnected',d.connected?'Connected':'Disconnected')
+}
+function hideError(){q('errorMsg').classList.add('hidden')}
+function showError(m){q('errorMsg').textContent=m;q('errorMsg').classList.remove('hidden')}
+async function sendToServer(data){
+  hideError()
+  setStatus('connecting','Syncing...')
+  q('syncBtn').disabled=true
+  try{
+    const r=await fetch(SERVER_URL+'/design',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)})
+    const result=await r.json()
+    if(r.ok) parent.postMessage({pluginMessage:{type:'done',success:true,nodeCount:data.nodeCount,serverMessage:result.message}},'*')
+    else parent.postMessage({pluginMessage:{type:'done',success:false,error:result.error||r.statusText}},'*')
+  }catch(err){
+    showError('Cannot connect to server at '+SERVER_URL+'\nMake sure node server/index.js is running.')
+    parent.postMessage({pluginMessage:{type:'done',success:false,error:err.message}},'*')
+  }finally{
+    q('syncBtn').disabled=false
+  }
+}
+window.addEventListener('message',async e=>{
+  const msg=e.data.pluginMessage
+  if(!msg) return
+  switch(msg.type){
+    case 'sync': await sendToServer(msg.data); break
+    case 'status': updateInfo(msg); break
   }
 })
-window.parent.postMessage({ pluginMessage: { type: 'ui-ready' } }, '*')
+q('syncBtn').addEventListener('click',()=>parent.postMessage({pluginMessage:{type:'request-sync'}},'*'))
+q('autoSync').addEventListener('change',e=>parent.postMessage({pluginMessage:{type:'set-auto-sync',enabled:e.target.checked}},'*'))
+parent.postMessage({pluginMessage:{type:'ui-ready'}},'*')
 <\/script>`
 
-function serializeNode(node, depth = 0) {
+function serializeNode(node, depth) {
   if (depth > 30) return { id: node.id, name: node.name, type: node.type, truncated: true }
 
-  const obj = {
-    id: node.id,
-    name: node.name,
-    type: node.type,
-  }
+  const obj = { id: node.id, name: node.name, type: node.type }
 
   if ('x' in node) obj.x = Math.round(node.x)
   if ('y' in node) obj.y = Math.round(node.y)
@@ -39,7 +128,8 @@ function serializeNode(node, depth = 0) {
   if ('locked' in node && node.locked) obj.locked = true
   if ('clipsContent' in node && node.clipsContent) obj.clipsContent = true
 
-  if ((node.type === 'RECTANGLE' || node.type === 'FRAME' || node.type === 'COMPONENT' || node.type === 'INSTANCE' || node.type === 'ELLIPSE') && 'cornerRadius' in node && node.cornerRadius > 0) {
+  const isBox = node.type === 'RECTANGLE' || node.type === 'FRAME' || node.type === 'COMPONENT' || node.type === 'INSTANCE' || node.type === 'ELLIPSE'
+  if (isBox && 'cornerRadius' in node && node.cornerRadius > 0) {
     obj.cornerRadius = node.cornerRadius
   }
 
@@ -189,15 +279,11 @@ function countNodes(nodes) {
 
 function buildDesignData(selectionOnly) {
   const page = figma.currentPage
-  let nodes
+  const nodes = selectionOnly && page.selection.length > 0
+    ? page.selection.map(n => serializeNode(n, 0))
+    : page.children.map(child => serializeNode(child, 0))
 
-  if (selectionOnly && page.selection.length > 0) {
-    nodes = page.selection.map(n => serializeNode(n))
-  } else {
-    nodes = page.children.map(child => serializeNode(child))
-  }
-
-  const data = {
+  return {
     type: selectionOnly && page.selection.length > 0 ? 'selection' : 'page',
     pageName: page.name,
     pageId: page.id,
@@ -206,26 +292,89 @@ function buildDesignData(selectionOnly) {
     nodeCount: countNodes(nodes),
     syncedAt: new Date().toISOString(),
   }
-
-  return data
 }
 
-async function main() {
-  const selectionOnly = figma.command === 'sync-selection'
-  const data = buildDesignData(selectionOnly)
+const state = { autoSync: true, lastNodeCount: 0, lastSyncTime: null, connected: false }
 
-  figma.showUI(UI_HTML, { visible: false })
+let debounceTimer = null
+
+function debouncedSync() {
+  if (debounceTimer) clearTimeout(debounceTimer)
+  debounceTimer = setTimeout(triggerSync, 400)
+}
+
+function triggerSync() {
+  const selectionOnly = figma.currentPage.selection.length > 0
+  const data = buildDesignData(selectionOnly)
+  figma.ui.postMessage({ type: 'sync', data })
+}
+
+function updateUIStatus() {
+  figma.ui.postMessage({
+    type: 'status',
+    connected: state.connected,
+    pageName: figma.currentPage?.name || '?',
+    pageId: figma.currentPage?.id,
+    nodeCount: state.lastNodeCount,
+    lastSync: state.lastSyncTime?.toISOString(),
+    autoSync: state.autoSync,
+  })
+}
+
+function main() {
+  const isWatch = figma.command === 'watch'
+  const isSync = figma.command === 'sync-page' || figma.command === 'sync-selection'
+
+  if (!isWatch && !isSync) {
+    figma.closePlugin()
+    return
+  }
+
+  figma.showUI(UI_HTML, { visible: isWatch, width: 300, height: 360 })
+
+  if (isWatch) {
+    figma.on('selectionchange', () => {
+      if (state.autoSync) debouncedSync()
+    })
+  }
 
   figma.ui.onmessage = msg => {
-    if (msg.type === 'ui-ready') {
-      figma.ui.postMessage({ type: 'sync', data })
-    } else if (msg.type === 'done') {
-      if (msg.success) {
-        figma.notify(`✅ Synced ${msg.nodeCount} nodes to server`)
-      } else {
-        figma.notify(`❌ ${msg.error}`, { error: true })
-      }
-      figma.closePlugin()
+    switch (msg.type) {
+      case 'ui-ready':
+        triggerSync()
+        break
+
+      case 'done':
+        if (msg.success) {
+          state.lastSyncTime = new Date()
+          state.lastNodeCount = msg.nodeCount
+          state.connected = true
+        } else {
+          state.connected = false
+        }
+
+        if (isWatch) {
+          updateUIStatus()
+          if (!msg.success) {
+            figma.notify(`Sync failed: ${msg.error}`, { error: true })
+          }
+        } else {
+          if (msg.success) {
+            figma.notify(`Synced ${msg.nodeCount} nodes to server`)
+          } else {
+            figma.notify(`Sync failed: ${msg.error}`, { error: true })
+          }
+          figma.closePlugin()
+        }
+        break
+
+      case 'request-sync':
+        if (isWatch) triggerSync()
+        break
+
+      case 'set-auto-sync':
+        if (isWatch) state.autoSync = msg.enabled
+        break
     }
   }
 }

@@ -1,0 +1,10 @@
+{
+  "name": "figma-design-bridge",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Figma plugin + local server bridge for AI CLI tools to read designs without MCP",
+  "scripts": {
+    "start": "node server/index.js",
+    "inspect": "node server/index.js --inspect"
+  }
+}

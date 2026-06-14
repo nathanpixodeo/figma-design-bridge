@@ -19,16 +19,21 @@ Server health check and endpoint discovery.
   "hasDesign": true,
   "pageName": "Page 1",
   "nodeCount": 142,
+  "snapshotCount": 5,
+  "dataDir": "./data/snapshots",
   "endpoints": [
     "GET  /",
     "POST /design",
     "GET  /design",
+    "DELETE /design",
     "GET  /design/summary",
     "GET  /design/tree",
     "GET  /design/texts",
     "GET  /design/colors",
     "GET  /design/search?q=",
-    "GET  /health"
+    "GET  /health",
+    "GET  /snapshots",
+    "GET  /snapshots/:filename"
   ]
 }
 ```
@@ -40,6 +45,8 @@ Server health check and endpoint discovery.
 | `hasDesign` | boolean | Whether design data has been synced |
 | `pageName` | string or null | Name of the synced Figma page |
 | `nodeCount` | number | Total number of nodes in the synced design |
+| `snapshotCount` | number | Number of snapshots saved on disk |
+| `dataDir` | string | Path to the snapshots directory |
 | `endpoints` | string[] | List of available endpoints |
 
 ---
@@ -112,6 +119,20 @@ Returns the full design data as it was received from the plugin.
 ```json
 {
   "message": "No design data synced yet. Run the Figma plugin first."
+}
+```
+
+---
+
+## `DELETE /design`
+
+Clears the current design data from memory. Saved snapshots on disk are not affected.
+
+**Response `200 OK`:**
+
+```json
+{
+  "message": "Design data cleared from memory. Snapshots remain on disk."
 }
 ```
 
@@ -334,6 +355,62 @@ Each result includes:
 
 ---
 
+## `GET /snapshots`
+
+Lists all saved snapshot files on disk.
+
+**Response `200 OK`:**
+
+```json
+{
+  "snapshots": [
+    {
+      "filename": "2026-06-15T12-00-00-000Z.json",
+      "size": 12345,
+      "pageName": "Page 1",
+      "nodeCount": 142,
+      "syncedAt": "2026-06-15T12:00:00.000Z",
+      "savedAt": "2026-06-15T12:00:01.000Z"
+    }
+  ]
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `filename` | string | Snapshot filename (ISO timestamp with dashes) |
+| `size` | number | File size in bytes |
+| `pageName` | string | Name of the Figma page |
+| `nodeCount` | number | Total number of nodes in the snapshot |
+| `syncedAt` | string (ISO) | Timestamp when the plugin synced the data |
+| `savedAt` | string (ISO) | Timestamp when the snapshot was written to disk |
+
+---
+
+## `GET /snapshots/:filename`
+
+Loads a specific snapshot by filename.
+
+**Path Parameters:**
+
+| Param | Type | Description |
+|-------|------|-------------|
+| `filename` | string | Snapshot filename (e.g. `2026-06-15T12-00-00-000Z.json`) |
+
+**Response `200 OK`:**
+
+Returns the full snapshot data — same schema as `GET /design`.
+
+**Response `404 Not Found`:**
+
+```json
+{
+  "error": "Snapshot not found"
+}
+```
+
+---
+
 ## Error Handling
 
 All endpoints return appropriate HTTP status codes:
@@ -343,6 +420,7 @@ All endpoints return appropriate HTTP status codes:
 | `200` | Success |
 | `400` | Bad request (e.g., missing query parameter) |
 | `404` | Endpoint not found |
+| `413` | Payload too large (max 50 MB) |
 
 Error responses follow this format:
 
@@ -360,7 +438,7 @@ All responses include:
 
 ```
 Access-Control-Allow-Origin: *
-Access-Control-Allow-Methods: GET, POST, OPTIONS
+Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS
 Access-Control-Allow-Headers: Content-Type
 ```
 

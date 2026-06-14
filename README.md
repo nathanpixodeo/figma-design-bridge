@@ -36,7 +36,7 @@ Figma Design Bridge lets you sync your Figma design data to a local server so th
 
 2. **Hidden UI Bridge** — the plugin opens a tiny invisible iframe (`figma.showUI`) that receives the serialized data and forwards it via `fetch()` to your local server. This approach works on both **Figma Desktop** and **Figma Web** (unlike direct `fetch` from plugin sandbox).
 
-3. **Local Server** (`server/index.js`) — a zero-dependency Node.js HTTP server that stores the latest design snapshot in memory and exposes a rich REST API for querying the design.
+3. **Local Server** (`server/index.js`) — a zero-dependency Node.js HTTP server that stores the latest design snapshot in memory, persists it to disk, and exposes a rich REST API for querying the design.
 
 4. **Claude CLI / any HTTP client** — queries the server to read summaries, search nodes, extract text content, analyze colors, and more.
 
@@ -61,6 +61,8 @@ No `npm install` needed — the server uses only Node.js built-in modules.
 
 ### 2. Start the Server
 
+On first run, the server auto-creates `server/config.json` with default settings.
+
 ```bash
 node server/index.js
 ```
@@ -69,10 +71,21 @@ You'll see:
 ```
   🎨 Design Bridge Server running on http://localhost:3456
   ─────────────────────────────────────────────
+  Config loaded from server/config.json
   Run the "Design Bridge" plugin in Figma to sync
 ```
 
-To use a custom port:
+To customize settings, edit `server/config.json` before starting:
+```json
+{
+  "port": 3456,
+  "dataDir": "data",
+  "maxSnapshots": 50,
+  "logLevel": "info"
+}
+```
+
+You can also override the port via environment variable:
 ```bash
 FIGMA_BRIDGE_PORT=4567 node server/index.js
 ```
@@ -137,15 +150,18 @@ curl http://localhost:3456/health
   "pageName": "Page 1",
   "nodeCount": 142,
   "endpoints": [
-    "GET  /",
-    "POST /design",
-    "GET  /design",
-    "GET  /design/summary",
-    "GET  /design/tree",
-    "GET  /design/texts",
-    "GET  /design/colors",
-    "GET  /design/search?q=",
-    "GET  /health"
+    "GET     /",
+    "POST   /design",
+    "DELETE /design",
+    "GET    /design",
+    "GET    /design/summary",
+    "GET    /design/tree",
+    "GET    /design/texts",
+    "GET    /design/colors",
+    "GET    /design/search?q=",
+    "GET    /snapshots",
+    "GET    /snapshots/:filename",
+    "GET    /health"
   ]
 }
 ```
@@ -153,6 +169,10 @@ curl http://localhost:3456/health
 ### `POST /design`
 
 Receive design data from the Figma plugin. Sent automatically when you run the plugin.
+
+The server validates incoming data and returns proper error codes:
+- `400` — invalid or missing fields
+- `413` — payload exceeds maximum size
 
 ```bash
 curl -X POST http://localhost:3456/design \
@@ -267,6 +287,66 @@ curl "http://localhost:3456/design/search?q=button"
 }
 ```
 
+### `DELETE /design`
+
+Clears the current design from the server memory.
+
+```bash
+curl -X DELETE http://localhost:3456/design
+```
+
+```json
+{ "status": "ok", "message": "Design cleared" }
+```
+
+### `GET /snapshots`
+
+Lists all saved design snapshots on disk.
+
+```bash
+curl http://localhost:3456/snapshots
+```
+
+```json
+{
+  "snapshots": [
+    { "filename": "design-2026-06-15T10-30-00.json", "size": 28416, "savedAt": "2026-06-15T10:30:00.000Z" }
+  ]
+}
+```
+
+### `GET /snapshots/:filename`
+
+Loads a specific snapshot into memory, replacing the current design.
+
+```bash
+curl http://localhost:3456/snapshots/design-2026-06-15T10-30-00.json
+```
+
+---
+
+## Server Features
+
+### Persistence
+
+Design snapshots are automatically saved to `data/snapshots/` after each sync. On restart, the server loads the latest snapshot from disk, so your design survives server restarts. The server keeps a maximum of 50 snapshots, pruning the oldest automatically.
+
+### Graceful Shutdown
+
+The server handles SIGINT and SIGTERM signals, saving the current design to disk before shutting down.
+
+### Logging
+
+All requests and events are logged with structured output including timestamps and severity levels (`info`, `warn`, `error`). The log level is configurable via the `logLevel` setting in `server/config.json`.
+
+### Error Handling
+
+The server validates all incoming request payloads and returns appropriate HTTP status codes:
+- `400` — invalid or malformed request body
+- `404` — resource not found (snapshot, endpoint)
+- `413` — payload exceeds size limit
+- `500` — internal server error
+
 ---
 
 ## Plugin Details
@@ -277,6 +357,17 @@ curl "http://localhost:3456/design/search?q=button"
 |---------|--------|
 | **Sync Full Page** | Serializes all nodes on the current page |
 | **Sync Selected Nodes** | Serializes only the nodes currently selected in the editor |
+| **Watch Mode (Auto-Sync)** | Opens a persistent UI panel that auto-syncs on selection change with debounce. Includes Sync Now button and Auto-sync toggle. |
+
+### Watch Mode
+
+Watch Mode opens a persistent UI panel in Figma that stays open while you work. As you select different layers or frames, the plugin debounces and auto-syncs the selected nodes to the server — no manual re-syncing needed.
+
+- **Auto-sync toggle** — enable or disable automatic syncing from the panel
+- **Sync Now button** — trigger an immediate sync of the current selection
+- **Debounce** — selection changes are debounced to avoid flooding the server during rapid selection changes
+
+The plugin menu now includes a **Sync Design** submenu with **Full Page** and **Selected Nodes**, a separator, then **Watch Mode (Auto-Sync)**.
 
 ### What Gets Serialized
 
@@ -337,10 +428,13 @@ claude -p "Based on these text nodes, write better copy for the landing page: $T
 
 ```
 figma-bridge/
+├── data/
+│   └── snapshots/             # Auto-saved design snapshots (max 50, pruned)
 ├── plugin/
 │   ├── manifest.json          # Figma plugin manifest
 │   └── code.js                # Plugin code with node serializer + UI bridge
 ├── server/
+│   ├── config.json            # Auto-created config (port, dataDir, maxSnapshots, logLevel)
 │   ├── package.json           # Server metadata (no deps needed)
 │   └── index.js               # Zero-dependency HTTP server
 ├── docs/
