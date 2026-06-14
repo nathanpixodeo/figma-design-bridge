@@ -4,6 +4,8 @@ Base URL: `http://localhost:3456` (configurable via `FIGMA_BRIDGE_PORT`)
 
 All endpoints return JSON unless otherwise noted. CORS headers are set on every response (`Access-Control-Allow-Origin: *`) so the Figma plugin's hidden iframe can POST to the server.
 
+> This project also includes a **native MCP server** (`server/mcp.mjs`) — see the [README](../README.md#mcp-model-context-protocol-support) for Claude Code integration.
+
 ---
 
 ## `GET /health`

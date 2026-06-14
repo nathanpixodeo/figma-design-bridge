@@ -2,7 +2,7 @@
 
 **Bridge the gap between Figma designs and AI coding assistants.**
 
-Figma Design Bridge lets you sync your Figma design data to a local server so that LLM-based CLI tools (like Claude CLI) can read, search, and understand your designs — without requiring MCP, plugins, or any cloud service.
+Figma Design Bridge lets you sync your Figma design data so that LLM-based CLI tools (like Claude CLI, Claude Code) can read, search, and understand your designs — no MCP Pro subscription or cloud service required. Comes with both an HTTP API and a native MCP server.
 
 ---
 
@@ -394,11 +394,68 @@ The serializer caps recursion at 30 levels of nesting to prevent stack overflows
 
 ---
 
-## Example: Using with Claude CLI
+## MCP (Model Context Protocol) Support
 
-Once the server is running and a design is synced, you can feed the summary to Claude CLI:
+Figma Design Bridge includes a built-in MCP server (`server/mcp.mjs`) that adds native support for Claude Code and any MCP-compatible client. Instead of writing `curl` commands, you configure the MCP server once and then Claude can read your design directly.
+
+### Setup
 
 ```bash
+# Install dependencies (MCP SDK)
+npm install
+```
+
+### Configure in Claude Code
+
+Add to your `claude.json` or MCP config:
+
+```json
+{
+  "mcpServers": {
+    "figma-design-bridge": {
+      "command": "node",
+      "args": ["/absolute/path/to/figma-bridge/server/mcp.mjs"]
+    }
+  }
+}
+```
+
+The MCP server starts its own HTTP endpoint on port 3456 for the Figma plugin to POST to, and communicates with Claude Code via stdio. **No separate HTTP server needed.**
+
+> **Note:** Use the absolute path to `server/mcp.mjs` in your MCP config.
+
+### Available MCP Tools
+
+| Tool | Description |
+|------|-------------|
+| `get_design_summary` | Full markdown summary: screens, layer tree, text, colors, structure |
+| `get_design_tree` | ASCII tree of all layers with types, names, dimensions |
+| `get_design_texts` | All text content with font info and layer paths |
+| `get_design_colors` | Color palette grouped by usage frequency |
+| `search_design` | Search nodes by name or text content (`q` parameter) |
+| `get_design_info` | Basic info: page name, node count, sync timestamp |
+
+### Usage Flow with MCP
+
+1. Start Claude Code (it auto-starts the MCP server)
+2. In Figma: `Plugins > Development > Design Bridge > Sync Full Page`
+3. In Claude Code, ask:
+   - *"What's in the current Figma design?"*
+   - *"Extract all the text content and rewrite the hero section copy"*
+   - *"Search for all button components in the design"*
+   - *"Analyze the color palette and suggest an accessible alternative"*
+
+Design data persists to disk, so it survives between Claude Code sessions. You only need to re-sync from Figma when the design changes.
+
+## Example: Using with Claude CLI (HTTP API)
+
+If you prefer the HTTP API instead of MCP:
+
+```bash
+# Start the HTTP server
+npm start
+
+# In another terminal, query the design
 curl http://localhost:3456/design/summary | \
   claude -p "Analyze this Figma design and suggest improvements"
 ```
@@ -421,6 +478,8 @@ claude -p "Based on these text nodes, write better copy for the landing page: $T
 | `Fetch failed` on Figma Web | The UI bridge approach should work on web Figma. If it doesn't, try Figma Desktop instead. |
 | Server port conflict | Set a custom port: `FIGMA_BRIDGE_PORT=4567 node server/index.js` |
 | Design seems incomplete | Some properties may fail to serialize (e.g., unloaded fonts). These are caught by try-catch and skipped. |
+| MCP server not connecting | Make sure `npm install` was run. Use absolute path to `server/mcp.mjs` in config. |
+| MCP tools return "No design data" | Run the Figma plugin first: `Plugins > Design Bridge > Sync Full Page` |
 
 ---
 
@@ -435,8 +494,9 @@ figma-bridge/
 │   └── code.js                # Plugin code with node serializer + UI bridge
 ├── server/
 │   ├── config.json            # Auto-created config (port, dataDir, maxSnapshots, logLevel)
-│   ├── package.json           # Server metadata (no deps needed)
-│   └── index.js               # Zero-dependency HTTP server
+│   ├── package.json           # Server metadata
+│   ├── index.js               # HTTP server (zero dependencies)
+│   └── mcp.mjs                # MCP server (requires @modelcontextprotocol/sdk)
 ├── docs/
 │   └── SERVER_API.md          # Detailed API documentation
 ├── README.md

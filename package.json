@@ -5,6 +5,10 @@
   "description": "Figma plugin + local server bridge for AI CLI tools to read designs without MCP",
   "scripts": {
     "start": "node server/index.js",
+    "mcp": "node server/mcp.mjs",
     "inspect": "node server/index.js --inspect"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0"
   }
 }
