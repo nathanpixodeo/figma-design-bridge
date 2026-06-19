@@ -2,7 +2,7 @@
 
 Base URL: `http://localhost:3456` (configurable via `FIGMA_BRIDGE_PORT`)
 
-All endpoints return JSON unless otherwise noted. CORS headers are set on every response (`Access-Control-Allow-Origin: *`) so the Figma plugin's hidden iframe can POST to the server.
+All endpoints return JSON unless otherwise noted. CORS headers are set on every response (`Access-Control-Allow-Origin: *`). Design data can be imported through the official Figma REST API; the legacy plugin ingestion endpoint remains supported.
 
 > This project also includes a **native MCP server** (`server/mcp.mjs`) — see the [README](../README.md#mcp-model-context-protocol-support) for Claude Code integration.
 
@@ -22,9 +22,10 @@ Server health check and endpoint discovery.
   "pageName": "Page 1",
   "nodeCount": 142,
   "snapshotCount": 5,
-  "dataDir": "./data/snapshots",
+  "dataDir": "./server/data",
   "endpoints": [
     "GET  /",
+    "POST /figma/import",
     "POST /design",
     "GET  /design",
     "DELETE /design",
@@ -48,14 +49,61 @@ Server health check and endpoint discovery.
 | `pageName` | string or null | Name of the synced Figma page |
 | `nodeCount` | number | Total number of nodes in the synced design |
 | `snapshotCount` | number | Number of snapshots saved on disk |
-| `dataDir` | string | Path to the snapshots directory |
+| `dataDir` | string | Path to the bridge data directory |
 | `endpoints` | string[] | List of available endpoints |
+
+---
+
+## `POST /figma/import`
+
+Fetches a Figma file or selected nodes through the official Figma REST API, converts the response to the bridge schema, saves a snapshot, and makes it the current design.
+
+The server process must have a personal access token in `FIGMA_ACCESS_TOKEN` (or the legacy alias `FIGMA_TOKEN`). The token needs `file_content:read` scope and is never included in the saved snapshot.
+
+**Request Body:**
+
+```json
+{
+  "source": "https://www.figma.com/design/FILE_KEY/Design?node-id=1-2",
+  "nodeIds": ["3:4", "5:6"]
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `source` | string | Yes | Figma design URL or file key |
+| `nodeIds` | string[] | No | Nodes to fetch; overrides `node-id` from the URL |
+
+When neither `nodeIds` nor URL `node-id` is supplied, the complete file is fetched. Reading summary/tree/search endpoints afterward uses the local cache and does not call Figma again.
+
+**Response `200 OK`:**
+
+```json
+{
+  "message": "Imported 142 nodes from Figma",
+  "pageName": "Landing Page",
+  "fileName": "Website",
+  "nodeCount": 142,
+  "source": "figma-rest-api",
+  "snapshot": "2026-06-18T10-30-00.000Z.json"
+}
+```
+
+**Response `502 Bad Gateway`:**
+
+```json
+{
+  "error": "Figma API 403: Forbidden."
+}
+```
+
+Common causes are a missing/invalid token, missing `file_content:read` scope, no access to the file, or Figma API rate limiting.
 
 ---
 
 ## `POST /design`
 
-Receive design data from the Figma plugin. This is the endpoint the plugin posts to.
+Receive already-normalized bridge data. The legacy Figma plugin and the `import:figma` CLI use this endpoint.
 
 **Request Body:**
 
@@ -72,12 +120,12 @@ Receive design data from the Figma plugin. This is the endpoint the plugin posts
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `type` | string | `"page"` or `"selection"` |
+| `type` | string | `"file"`, `"page"`, or `"selection"` |
 | `pageName` | string | Name of the Figma page |
 | `pageId` | string | Figma internal page ID |
 | `nodes` | object[] | Array of serialized node trees |
 | `nodeCount` | number | Total flattened node count (all descendants) |
-| `syncedAt` | string (ISO) | Timestamp when the plugin ran |
+| `syncedAt` | string (ISO) | Timestamp when the data was imported or synced |
 | `selectionCount` | number | (only when `type: "selection"`) How many nodes were selected |
 
 **Response `200 OK`:**
@@ -101,7 +149,7 @@ Receive design data from the Figma plugin. This is the endpoint the plugin posts
 
 ## `GET /design`
 
-Returns the full design data as it was received from the plugin.
+Returns the current normalized design data, whether it came from Figma REST import or the legacy plugin.
 
 **Response `200 OK`:**
 
@@ -120,7 +168,7 @@ Returns the full design data as it was received from the plugin.
 
 ```json
 {
-  "message": "No design data synced yet. Run the Figma plugin first."
+  "message": "No design data loaded yet. Import a Figma URL first."
 }
 ```
 
@@ -384,7 +432,7 @@ Lists all saved snapshot files on disk.
 | `size` | number | File size in bytes |
 | `pageName` | string | Name of the Figma page |
 | `nodeCount` | number | Total number of nodes in the snapshot |
-| `syncedAt` | string (ISO) | Timestamp when the plugin synced the data |
+| `syncedAt` | string (ISO) | Timestamp when the design data was imported or synced |
 | `savedAt` | string (ISO) | Timestamp when the snapshot was written to disk |
 
 ---
@@ -423,6 +471,7 @@ All endpoints return appropriate HTTP status codes:
 | `400` | Bad request (e.g., missing query parameter) |
 | `404` | Endpoint not found |
 | `413` | Payload too large (max 50 MB) |
+| `502` | Figma REST API import failed |
 
 Error responses follow this format:
 

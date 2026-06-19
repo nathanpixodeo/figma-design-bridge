@@ -9,6 +9,9 @@ import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import figmaApi from "./figma-api.js";
+
+const { fetchFigmaDesign } = figmaApi;
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = parseInt(process.env.FIGMA_BRIDGE_PORT || "3456", 10);
@@ -96,7 +99,7 @@ function treeNode(n, d = 1) {
 }
 
 function summary(data) {
-  if (!data) return "No design data synced yet. Run the Figma plugin first.";
+  if (!data) return "No design data loaded yet. Call sync_figma_design with a Figma URL first.";
   const { pageName, nodes, type, nodeCount, savedAt } = data;
   const texts = getAllTexts(nodes);
   const palette = getColors(nodes);
@@ -169,6 +172,26 @@ function serve() {
       });
       return;
     }
+    if (req.method === "POST" && req.url === "/figma/import") {
+      let body = "";
+      req.on("data", c => body += c);
+      req.on("end", async () => {
+        try {
+          const input = JSON.parse(body);
+          const source = input.source || input.url || input.fileKey;
+          if (!source) return send(400, { error: 'Missing "source" (Figma URL or file key)' });
+          const design = await fetchFigmaDesign(source, { nodeIds: input.nodeIds });
+          currentDesign = design;
+          saveSnapshot(design);
+          log(`Figma API import: "${design.pageName}" — ${design.nodeCount} nodes`);
+          send(200, { message: `Imported ${design.nodeCount} nodes from Figma`, pageName: design.pageName, fileName: design.fileName, nodeCount: design.nodeCount, source: design.source });
+        } catch (error) {
+          log(`Figma API import failed: ${error.message}`);
+          send(502, { error: error.message });
+        }
+      });
+      return;
+    }
     if (req.method === "GET" && req.url === "/health") {
       send(200, { status: "ok", port: PORT, hasDesign: currentDesign !== null, pageName: currentDesign?.pageName || null, nodeCount: currentDesign?.nodeCount || 0 });
       return;
@@ -189,6 +212,18 @@ async function startMCP() {
 
   mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: [
+      {
+        name: "sync_figma_design",
+        description: "Fetch a Figma file or selected node through the official Figma REST API, normalize it, cache it locally, and make it the current design. Requires FIGMA_ACCESS_TOKEN with file_content:read scope in the MCP server environment. Call only when the user asks to sync or refresh to avoid unnecessary API usage.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            source: { type: "string", description: "Figma design URL (including node-id when relevant) or a Figma file key" },
+            node_ids: { type: "array", items: { type: "string" }, description: "Optional Figma node IDs to fetch instead of the full file" },
+          },
+          required: ["source"],
+        },
+      },
       {
         name: "get_design_summary",
         description: "Get a comprehensive markdown summary of the current Figma design — screens, layer tree, all text content, color palette, and structure statistics. Use this as the primary tool to understand a design.",
@@ -234,11 +269,24 @@ async function startMCP() {
     const err = msg => ({ content: [{ type: "text", text: `Error: ${msg}` }], isError: true });
     const ok = text => ({ content: [{ type: "text", text }] });
 
-    if (!currentDesign && name !== "get_design_info") {
-      return err("No design data synced. Open Figma → Plugins → Design Bridge → Sync Full Page.");
+    if (!currentDesign && name !== "get_design_info" && name !== "sync_figma_design") {
+      return err("No design data loaded. Call sync_figma_design with a Figma URL first.");
     }
 
     switch (name) {
+      case "sync_figma_design": {
+        const source = args?.source;
+        if (!source) return err('Missing required parameter "source"');
+        try {
+          const design = await fetchFigmaDesign(source, { nodeIds: args?.node_ids });
+          currentDesign = design;
+          const filepath = saveSnapshot(design);
+          return ok(`Imported **${design.pageName}** from Figma REST API.\n\n- File: ${design.fileName || design.pageName}\n- Nodes: ${design.nodeCount}\n- Source: ${design.source}\n- Snapshot: ${path.basename(filepath)}\n- Synced at: ${design.syncedAt}`);
+        } catch (error) {
+          return err(error.message);
+        }
+      }
+
       case "get_design_summary":
         return ok(summary(currentDesign));
 
@@ -286,7 +334,7 @@ async function startMCP() {
       }
 
       case "get_design_info":
-        return ok(`**Page:** ${currentDesign?.pageName || "—"}\n**Type:** ${currentDesign?.type || "—"}\n**Nodes:** ${currentDesign?.nodeCount ?? 0}\n**Synced at:** ${currentDesign?.syncedAt || currentDesign?.savedAt || "Never"}\n**Data dir:** ${DATA_DIR}`);
+        return ok(`**Page:** ${currentDesign?.pageName || "—"}\n**File:** ${currentDesign?.fileName || "—"}\n**Type:** ${currentDesign?.type || "—"}\n**Source:** ${currentDesign?.source || "legacy-plugin"}\n**Nodes:** ${currentDesign?.nodeCount ?? 0}\n**Synced at:** ${currentDesign?.syncedAt || currentDesign?.savedAt || "Never"}\n**Data dir:** ${DATA_DIR}`);
 
       default:
         return err(`Unknown tool: ${name}`);

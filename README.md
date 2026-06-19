@@ -1,44 +1,37 @@
 # 🎨 Figma Design Bridge
 
-**Bridge the gap between Figma designs and AI coding assistants.**
+**Let AI coding assistants read Figma designs without installing a Figma plugin.**
 
-Figma Design Bridge lets you sync your Figma design data so that LLM-based CLI tools (like Claude CLI, Claude Code) can read, search, and understand your designs — no MCP Pro subscription or cloud service required. Comes with both an HTTP API and a native MCP server.
+Figma Design Bridge imports design data through the official Figma REST API, normalizes it into an agent-friendly local snapshot, and exposes it through both HTTP and MCP. A legacy Figma plugin remains available, but it is no longer required.
 
 ---
 
 ## Architecture
 
-```
-┌─────────────────┐     postMessage     ┌───────────────┐     POST /design    ┌───────────────────┐
-│  Figma Desktop  │ ──────────────────> │  Plugin UI    │ ──────────────────> │  Local Server     │
-│  or Web App     │  (hidden iframe)    │  (code.js)    │                     │  localhost:3456   │
-│                 │                     │               │                     │                   │
-│  Plugin runs    │                     │  Serializes   │                     │  Stores in memory │
-│  sync command   │                     │  node tree &  │                     │  Exposes REST API │
-│                 │                     │  sends JSON   │                     │                   │
-└─────────────────┘                     └───────────────┘                     └────────┬──────────┘
-                                                                                       │
-                                                                          ┌────────────┼────────────┐
-                                                                          │            │            │
-                                                                   GET /design    GET /design   GET /design
-                                                                   /summary       /tree         /search?q=
-                                                                          │            │            │
-                                                                          ▼            ▼            ▼
-                                                                  ┌─────────────────────────────────────┐
-                                                                  │        Claude CLI / curl            │
-                                                                  │  "Understand this Figma design"     │
-                                                                  └─────────────────────────────────────┘
+```text
+Figma URL + Personal Access Token
+                 │
+                 ▼
+       Official Figma REST API
+                 │
+                 ▼
+     Normalize and cache locally
+                 │
+         ┌───────┴────────┐
+         ▼                ▼
+     MCP tools        HTTP API
+         │                │
+         └───────┬────────┘
+                 ▼
+       Claude Code / AI agents
 ```
 
 ### How It Works
 
-1. **Figma Plugin** (`plugin/code.js`) — when you run "Sync Full Page" or "Sync Selected Nodes", the plugin traverses the current page's node tree and serializes every layer, frame, text, color, effect, auto-layout, and component instance into JSON.
-
-2. **Hidden UI Bridge** — the plugin opens a tiny invisible iframe (`figma.showUI`) that receives the serialized data and forwards it via `fetch()` to your local server. This approach works on both **Figma Desktop** and **Figma Web** (unlike direct `fetch` from plugin sandbox).
-
-3. **Local Server** (`server/index.js`) — a zero-dependency Node.js HTTP server that stores the latest design snapshot in memory, persists it to disk, and exposes a rich REST API for querying the design.
-
-4. **Claude CLI / any HTTP client** — queries the server to read summaries, search nodes, extract text content, analyze colors, and more.
+1. `server/figma-api.js` parses a Figma URL and requests either the full file or the `node-id` embedded in the URL.
+2. The REST response is normalized into the same compact schema used by the bridge: dimensions, text, colors, effects, auto-layout, components, and child nodes.
+3. The normalized design is saved to `server/data/latest.json` plus timestamped snapshots.
+4. Agents query the cached data. Reading/searching never calls Figma again; only an explicit sync consumes an API request.
 
 ---
 
@@ -47,8 +40,10 @@ Figma Design Bridge lets you sync your Figma design data so that LLM-based CLI t
 ### Prerequisites
 
 - [Node.js](https://nodejs.org/) 18+ (for the local server)
-- [Figma Desktop](https://www.figma.com/downloads/) (or Figma Web)
-- Figma plugin development enabled: `Figma > Plugins > Development > Import plugin from manifest...`
+- A Figma account that can view the target file
+- A Figma personal access token with `file_content:read` scope
+
+See Figma's [authentication guide](https://developers.figma.com/docs/rest-api/authentication/) to create a token. Starter accounts are subject to Figma's API limits, so the bridge caches every successful import.
 
 ### 1. Clone & Install
 
@@ -57,11 +52,21 @@ git clone <your-repo-url>
 cd figma-bridge
 ```
 
-No `npm install` needed — the server uses only Node.js built-in modules.
+Install the MCP SDK dependency:
+
+```bash
+npm install
+```
 
 ### 2. Start the Server
 
-On first run, the server auto-creates `server/config.json` with default settings.
+Set the token in the shell that starts the bridge. Never commit it to the repository.
+
+```powershell
+$env:FIGMA_ACCESS_TOKEN="figd_your_token"
+```
+
+Then start the HTTP server:
 
 ```bash
 node server/index.js
@@ -72,7 +77,7 @@ You'll see:
   🎨 Design Bridge Server running on http://localhost:3456
   ─────────────────────────────────────────────
   Config loaded from server/config.json
-  Run the "Design Bridge" plugin in Figma to sync
+  Import with: npm run import:figma -- <figma-url>
 ```
 
 To customize settings, edit `server/config.json` before starting:
@@ -90,23 +95,23 @@ You can also override the port via environment variable:
 FIGMA_BRIDGE_PORT=4567 node server/index.js
 ```
 
-### 3. Import the Figma Plugin
+### 3. Import a Design from Chrome
 
-1. Open **Figma Desktop**
-2. Click `Plugins` → `Development` → `Import plugin from manifest...`
-3. Select `figma-bridge/plugin/manifest.json`
-4. The plugin "Design Bridge" now appears under `Plugins > Development > Design Bridge`
+Copy the design URL from Chrome. If the URL contains `node-id`, only that node is imported; otherwise the full file is imported.
 
-### 4. Sync a Design
+```powershell
+npm run import:figma -- "https://www.figma.com/design/FILE_KEY/Design?node-id=1-2"
+```
 
-1. Open any Figma design file
-2. Navigate to the page you want to analyze
-3. Right-click → `Plugins` → `Development` → `Design Bridge` → **Sync Full Page**
-4. You'll see a notification: `✅ Synced 142 nodes to server`
+Alternatively, ask the running HTTP server to fetch it:
 
-To sync only specific layers: select them first, then choose **Sync Selected Nodes**.
+```bash
+curl -X POST http://localhost:3456/figma/import \
+  -H "Content-Type: application/json" \
+  -d '{"source":"https://www.figma.com/design/FILE_KEY/Design?node-id=1-2"}'
+```
 
-### 5. Query from Claude CLI
+### 4. Query the Cached Design
 
 Once the design is synced, point Claude CLI to the server:
 
@@ -151,6 +156,7 @@ curl http://localhost:3456/health
   "nodeCount": 142,
   "endpoints": [
     "GET     /",
+    "POST   /figma/import",
     "POST   /design",
     "DELETE /design",
     "GET    /design",
@@ -168,7 +174,7 @@ curl http://localhost:3456/health
 
 ### `POST /design`
 
-Receive design data from the Figma plugin. Sent automatically when you run the plugin.
+Receive already-normalized design data. This endpoint remains compatible with the legacy plugin and is also used by the CLI importer.
 
 The server validates incoming data and returns proper error codes:
 - `400` — invalid or missing fields
@@ -179,6 +185,18 @@ curl -X POST http://localhost:3456/design \
   -H "Content-Type: application/json" \
   -d '{"pageName":"Page 1","nodes":[...],"nodeCount":142}'
 ```
+
+### `POST /figma/import`
+
+Fetch a Figma URL or file key through the official REST API, normalize it, cache it, and make it the current design. The server process must have `FIGMA_ACCESS_TOKEN` set.
+
+```bash
+curl -X POST http://localhost:3456/figma/import \
+  -H "Content-Type: application/json" \
+  -d '{"source":"https://www.figma.com/design/FILE_KEY/Design","nodeIds":["1:2"]}'
+```
+
+`nodeIds` is optional. A `node-id` in the URL is used automatically when `nodeIds` is omitted.
 
 ### `GET /design`
 
@@ -329,7 +347,7 @@ curl http://localhost:3456/snapshots/design-2026-06-15T10-30-00.json
 
 ### Persistence
 
-Design snapshots are automatically saved to `data/snapshots/` after each sync. On restart, the server loads the latest snapshot from disk, so your design survives server restarts. The server keeps a maximum of 50 snapshots, pruning the oldest automatically.
+Design snapshots are automatically saved to `server/data/snapshots/` after each sync. On restart, the server loads the latest snapshot from disk, so your design survives server restarts. The server keeps a maximum of 50 snapshots, pruning the oldest automatically.
 
 ### Graceful Shutdown
 
@@ -349,7 +367,9 @@ The server validates all incoming request payloads and returns appropriate HTTP 
 
 ---
 
-## Plugin Details
+## Legacy Plugin (Optional)
+
+The original Desktop development plugin is retained for users who can install local plugins. REST import is the primary path and does not require this plugin.
 
 ### Menu Commands
 
@@ -414,13 +434,16 @@ Add to your `claude.json` or MCP config:
   "mcpServers": {
     "figma-design-bridge": {
       "command": "node",
-      "args": ["/absolute/path/to/figma-bridge/server/mcp.mjs"]
+      "args": ["/absolute/path/to/figma-design-bridge/server/mcp.mjs"],
+      "env": {
+        "FIGMA_ACCESS_TOKEN": "${FIGMA_ACCESS_TOKEN}"
+      }
     }
   }
 }
 ```
 
-The MCP server starts its own HTTP endpoint on port 3456 for the Figma plugin to POST to, and communicates with Claude Code via stdio. **No separate HTTP server needed.**
+The MCP server communicates with Claude Code via stdio and also starts a local HTTP endpoint on port 3456. **No separate HTTP server is needed.** Restart the MCP client after changing its environment configuration.
 
 > **Note:** Use the absolute path to `server/mcp.mjs` in your MCP config.
 
@@ -428,6 +451,7 @@ The MCP server starts its own HTTP endpoint on port 3456 for the Figma plugin to
 
 | Tool | Description |
 |------|-------------|
+| `sync_figma_design` | Explicitly fetch a Figma URL/file key, normalize it, and cache it locally |
 | `get_design_summary` | Full markdown summary: screens, layer tree, text, colors, structure |
 | `get_design_tree` | ASCII tree of all layers with types, names, dimensions |
 | `get_design_texts` | All text content with font info and layer paths |
@@ -437,15 +461,16 @@ The MCP server starts its own HTTP endpoint on port 3456 for the Figma plugin to
 
 ### Usage Flow with MCP
 
-1. Start Claude Code (it auto-starts the MCP server)
-2. In Figma: `Plugins > Development > Design Bridge > Sync Full Page`
-3. In Claude Code, ask:
+1. Export `FIGMA_ACCESS_TOKEN` before starting Claude Code.
+2. Start Claude Code; it auto-starts the MCP server.
+3. Ask: *"Sync this Figma design: https://www.figma.com/design/..."*
+4. After it is cached, ask:
    - *"What's in the current Figma design?"*
    - *"Extract all the text content and rewrite the hero section copy"*
    - *"Search for all button components in the design"*
    - *"Analyze the color palette and suggest an accessible alternative"*
 
-Design data persists to disk, so it survives between Claude Code sessions. You only need to re-sync from Figma when the design changes.
+Design data persists to disk, so it survives between Claude Code sessions. Read/search tools use the cache and do not consume Figma API requests. Call `sync_figma_design` only when the design changes.
 
 ## Example: Using with Claude CLI (HTTP API)
 
@@ -473,13 +498,14 @@ claude -p "Based on these text nodes, write better copy for the landing page: $T
 
 | Problem | Solution |
 |---------|----------|
-| `Cannot connect to server` in Figma | Make sure `node server/index.js` is running. Check port `3456` isn't blocked by a firewall. |
-| Plugin not appearing in menu | Re-import the manifest in Figma: `Plugins > Development > Import plugin from manifest...` |
-| `Fetch failed` on Figma Web | The UI bridge approach should work on web Figma. If it doesn't, try Figma Desktop instead. |
+| `Missing FIGMA_ACCESS_TOKEN` | Export the token before starting the HTTP/MCP process, then restart it. |
+| Figma API `403` | Verify `file_content:read` scope and that the token owner can view the file. |
+| Figma API `429` | Wait for the reported retry period; use cached design tools instead of repeatedly syncing. |
+| Import command cannot connect | Start `npm start` or the MCP server first; override with `FIGMA_BRIDGE_URL` if using a custom port. |
 | Server port conflict | Set a custom port: `FIGMA_BRIDGE_PORT=4567 node server/index.js` |
-| Design seems incomplete | Some properties may fail to serialize (e.g., unloaded fonts). These are caught by try-catch and skipped. |
+| Design seems incomplete | Import the full-file URL without `node-id`, or pass the required `nodeIds` explicitly. |
 | MCP server not connecting | Make sure `npm install` was run. Use absolute path to `server/mcp.mjs` in config. |
-| MCP tools return "No design data" | Run the Figma plugin first: `Plugins > Design Bridge > Sync Full Page` |
+| MCP tools return "No design data" | Call `sync_figma_design` with a Figma URL first. |
 
 ---
 
@@ -487,15 +513,17 @@ claude -p "Based on these text nodes, write better copy for the landing page: $T
 
 ```
 figma-bridge/
-├── data/
-│   └── snapshots/             # Auto-saved design snapshots (max 50, pruned)
 ├── plugin/
-│   ├── manifest.json          # Figma plugin manifest
-│   └── code.js                # Plugin code with node serializer + UI bridge
+│   ├── manifest.json          # Optional legacy Figma plugin
+│   └── code.js
 ├── server/
+│   ├── data/                  # latest.json + timestamped snapshots (gitignored)
 │   ├── config.json            # Auto-created config (port, dataDir, maxSnapshots, logLevel)
+│   ├── figma-api.js           # Figma REST client + schema normalizer
+│   ├── figma-api.test.js      # Normalizer/import tests
+│   ├── import-figma.mjs       # CLI importer
 │   ├── package.json           # Server metadata
-│   ├── index.js               # HTTP server (zero dependencies)
+│   ├── index.js               # HTTP server
 │   └── mcp.mjs                # MCP server (requires @modelcontextprotocol/sdk)
 ├── docs/
 │   └── SERVER_API.md          # Detailed API documentation

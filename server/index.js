@@ -2,6 +2,7 @@ const http = require('http')
 const fs = require('fs')
 const path = require('path')
 const { URL } = require('url')
+const { fetchFigmaDesign } = require('./figma-api')
 
 // ── Config ────────────────────────────────────────────────
 
@@ -28,7 +29,10 @@ function loadConfig() {
 }
 
 const config = loadConfig()
-const { port, dataDir, maxSnapshots, logLevel } = config
+const port = parseInt(process.env.FIGMA_BRIDGE_PORT || config.port, 10)
+const dataDir = process.env.FIGMA_BRIDGE_DATA_DIR || config.dataDir
+const maxSnapshots = parseInt(process.env.FIGMA_BRIDGE_MAX_SNAPSHOTS || config.maxSnapshots, 10)
+const logLevel = process.env.FIGMA_BRIDGE_LOG_LEVEL || config.logLevel
 
 // ── Logger ────────────────────────────────────────────────
 
@@ -211,7 +215,7 @@ function treeNodeToString(n, depth = 1) {
 }
 
 function generateSummary(data) {
-  if (!data) return 'No design data synced yet. Run the Figma plugin first.'
+  if (!data) return 'No design data loaded yet. Import a Figma URL first.'
   const { pageName, nodes, type, nodeCount, savedAt } = data
   const texts = getAllTexts(nodes)
   const palette = getColorPalette(nodes)
@@ -332,6 +336,7 @@ function router(req, res) {
         dataDir,
         endpoints: [
           'GET  /health',
+          'POST /figma/import',
           'POST /design',
           'GET  /design',
           'DELETE /design',
@@ -347,7 +352,39 @@ function router(req, res) {
       return
     }
 
-    // POST /design
+    // POST /figma/import — fetch and normalize a file through the official Figma REST API
+    if (m === 'POST' && p === '/figma/import') {
+      parseBody(req).then(async body => {
+        let input
+        try { input = JSON.parse(body) } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }) }
+        const source = input.source || input.url || input.fileKey
+        if (!source) return sendJSON(res, 400, { error: 'Missing "source" (Figma URL or file key)' })
+
+        try {
+          const data = await fetchFigmaDesign(source, { nodeIds: input.nodeIds })
+          currentDesign = data
+          const filepath = saveSnapshot(data)
+          log('info', `Figma API import: "${data.pageName}" — ${data.nodeCount} nodes`)
+          sendJSON(res, 200, {
+            message: `Imported ${data.nodeCount} nodes from Figma`,
+            pageName: data.pageName,
+            fileName: data.fileName,
+            nodeCount: data.nodeCount,
+            source: data.source,
+            snapshot: path.basename(filepath),
+          })
+        } catch (error) {
+          log('warn', `Figma API import failed: ${error.message}`)
+          sendJSON(res, 502, { error: error.message })
+        }
+      }).catch(error => {
+        log('error', `POST /figma/import failed: ${error.message}`)
+        sendJSON(res, 413, { error: error.message })
+      })
+      return
+    }
+
+    // POST /design — legacy plugin/manual ingestion
     if (m === 'POST' && p === '/design') {
       parseBody(req).then(body => {
         let data
@@ -370,7 +407,7 @@ function router(req, res) {
 
     // GET /design
     if (m === 'GET' && p === '/design') {
-      sendJSON(res, 200, currentDesign || { message: 'No design data synced yet. Run the Figma plugin first.' })
+      sendJSON(res, 200, currentDesign || { message: 'No design data loaded yet. Import a Figma URL first.' })
       return
     }
 
@@ -389,7 +426,7 @@ function router(req, res) {
 
     // GET /design/tree
     if (m === 'GET' && p === '/design/tree') {
-      if (!currentDesign) return sendText(res, 200, 'No design data synced yet.')
+      if (!currentDesign) return sendText(res, 200, 'No design data loaded yet.')
       let tree = currentDesign.pageName + '\n'
       for (const n of currentDesign.nodes) tree += treeNodeToString(n)
       sendText(res, 200, tree)
@@ -475,7 +512,7 @@ server.listen(port, () => {
   console.log(`  🎨 Design Bridge Server — http://localhost:${port}`)
   console.log(`  ${'─'.repeat(47)}`)
   if (!currentDesign) {
-    console.log(`  Run "Design Bridge" plugin in Figma to sync design data.`)
+    console.log(`  Import with: npm run import:figma -- <figma-url>`)
   } else {
     console.log(`  Restored from disk: "${currentDesign.pageName}" (${currentDesign.nodeCount} nodes)`)
   }
