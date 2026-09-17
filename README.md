@@ -618,7 +618,15 @@ claude plugin install figma-bridge@figma-design-bridge
 | `/figma-bridge:page [summary\|tree\|texts\|colors]` | Shows what is currently in the cache, and how stale it is |
 | `/figma-bridge:sync <figma-url>` | Pulls a file or node through the REST API (needs a token) |
 
-The plugin resolves its own paths through `${CLAUDE_PLUGIN_ROOT}`, so nothing breaks when the clone moves. Point `node server/index.js` at the plugin's data directory, or set `FIGMA_BRIDGE_DATA_DIR` on both, so the HTTP server and the MCP server share one cache — this is the single most common way to end up with an empty design.
+The plugin resolves its own paths through `${CLAUDE_PLUGIN_ROOT}`, so nothing breaks when the clone moves, and it caches designs in `${CLAUDE_PLUGIN_DATA}`, which survives plugin updates.
+
+That data directory is the one thing worth understanding before you sync. The MCP server also tries to listen on port 3456, and when it succeeds it is itself the endpoint the Figma plugin posts to — install, sync from Figma, done. But if a standalone `node server/index.js` already holds 3456, that process receives the sync and writes it to *its* data directory, and the plugin's tools will correctly report that nothing is loaded. Either let the plugin's MCP server own the port, or start the standalone server against the same directory:
+
+```bash
+# print the directory the plugin's MCP server is reading
+# (also shown by /figma-bridge:page)
+FIGMA_BRIDGE_DATA_DIR="<that path>" node server/index.js
+```
 
 For Codex CLI, see [`integrations/codex/README.md`](integrations/codex/README.md).
 

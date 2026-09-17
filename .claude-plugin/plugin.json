@@ -1,7 +1,7 @@
 {
   "name": "figma-bridge",
   "displayName": "Figma Design Bridge",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Read Figma designs from a local cache and check front-end code against them, without pasting a Figma token into every project.",
   "author": {
     "name": "Nathan Pixodeo",
@@ -10,7 +10,25 @@
   "homepage": "https://github.com/nathanpixodeo/figma-design-bridge#readme",
   "repository": "https://github.com/nathanpixodeo/figma-design-bridge",
   "license": "Apache-2.0",
-  "keywords": ["figma", "design-to-code", "mcp", "ui-review", "front-end"],
-  "commands": ["./integrations/claude-code/commands"],
-  "mcpServers": "./integrations/claude-code/mcp.json"
+  "keywords": [
+    "figma",
+    "design-to-code",
+    "mcp",
+    "ui-review",
+    "front-end"
+  ],
+  "commands": [
+    "./integrations/claude-code/commands"
+  ],
+  "mcpServers": {
+    "bridge": {
+      "command": "node",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/server/mcp.mjs"
+      ],
+      "env": {
+        "FIGMA_BRIDGE_DATA_DIR": "${CLAUDE_PLUGIN_DATA}"
+      }
+    }
+  }
 }
