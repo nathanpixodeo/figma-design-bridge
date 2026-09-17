@@ -733,6 +733,16 @@ figma-bridge/
 
 ---
 
+## Buy Me a Beer 🍺
+
+This bridge is free and runs entirely on your own machine — no account, no telemetry, no hosted service to pay for. If it saved you an afternoon of copying values out of Figma by hand, a beer is a fine way to say so.
+
+[![Buy me a beer via PayPal](https://img.shields.io/badge/PayPal-Buy%20me%20a%20beer-00457C?style=for-the-badge&logo=paypal&logoColor=white)](https://paypal.me/shivakira95)
+
+Stars, bug reports, and pull requests are just as welcome.
+
+---
+
 ## License
 
 [Apache License 2.0](LICENSE) © 2026 Nathan Pixodeo
