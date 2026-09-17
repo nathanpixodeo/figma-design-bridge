@@ -4,6 +4,12 @@
 
 Figma Design Bridge imports design data through the official Figma REST API, normalizes it into an agent-friendly local snapshot, and exposes it through both HTTP and MCP. A legacy Figma plugin remains available, but it is no longer required.
 
+A second, request-driven path is being built alongside it: a plugin-first bridge
+where you paste any node URL and the agent reads that node live from the open
+Figma document, with no REST token. Phase 1 (the shared daemon, request broker
+and cache) is implemented and tested but not yet wired in — see
+[Request-Driven Plugin Bridge](#request-driven-plugin-bridge-phase-1).
+
 ---
 
 ## Architecture
@@ -367,6 +373,95 @@ The server validates all incoming request payloads and returns appropriate HTTP 
 
 ---
 
+## Request-Driven Plugin Bridge (Phase 1)
+
+> **Status: implemented and tested, not yet wired in.** The modules under
+> `server/bridge/` are complete and covered by tests, but neither the running
+> HTTP server nor the MCP server mounts them yet, and the Figma plugin does not
+> speak this protocol yet. Nothing in this section changes how the bridge behaves
+> today. Phase 2 connects the pieces.
+
+The REST import path above works, but it has a shape problem: it needs a personal
+access token, it caches one global "current design" that every sync replaces, and
+it cannot read a node the user has not explicitly imported. The request-driven
+bridge is the answer to that.
+
+The target workflow: open the Figma file, start the plugin, paste any node URL
+into your agent — and the agent reads that node out of the live document. No REST
+token, no selecting layers, no switching pages, no Sync button.
+
+```text
+MCP client (Claude Code, Codex, …)      Figma plugin UI
+            │                                  │
+            │  POST /bridge/read               │  poll / reply (long-poll)
+            ▼                                  ▼
+            shared loopback bridge daemon
+              ├── request broker   (routes a read to the session owning that file)
+              └── content cache    (file key + node id + representation)
+```
+
+What phase 1 delivers:
+
+| Module | Responsibility |
+|--------|----------------|
+| `server/bridge/identity.js` | Parse Figma URLs, canonicalize node ids, derive safe cache keys |
+| `server/bridge/cache.js` | Content-addressed cache with atomic writes and bounded retention |
+| `server/bridge/broker.js` | Session registry, bounded request queue, timeouts, coalescing |
+| `server/bridge/token.js` | Local bridge token: create, read, rotate, verify |
+| `server/bridge/routes.js` | The `/bridge/*` HTTP surface |
+| `server/bridge/daemon.js` | Loopback daemon with safe start-or-reuse |
+| `server/bridge/client.js` | Thin client for MCP adapters |
+
+Design rules it enforces:
+
+- **A live read is live or it is an error.** No cache fallback, no REST fallback.
+  With the plugin offline, a live read returns `409 NO_SESSION_FOR_FILE` and
+  says what to do, rather than quietly handing back older data.
+- **Freshness is asserted, never inferred.** `verifiedFresh: true` is written
+  only when a live plugin reply produced the entry. A cached read always reports
+  `freshness: "unknown"` and `stale: true`, however recently it was written.
+  A TTL is not a freshness guarantee.
+- **Files are isolated.** Entries are keyed by file key + node id +
+  representation. Reading node B never evicts node A, and one plugin session can
+  never answer, poll or invalidate another file's request.
+- **Authentication is not optional on localhost.** Every route but
+  `GET /bridge/health` requires a bearer token; session routes require a second
+  per-session secret. Requests are Host-checked against loopback to block DNS
+  rebinding, and CORS is an explicit origin allowlist, never `*`.
+- **Limits are explicit.** Truncation is reported as
+  `completeness: { nodeCount, byteSize, limitHit, truncatedNodeIds }`, so a
+  bounded response never claims to be the whole design.
+
+The token lives in `<dataDir>/bridge-token.json`, which `.gitignore` excludes. It
+is never included in a health response, a session listing, a snapshot or a log
+line.
+
+Full route contract, request/response schemas and error codes:
+**[docs/BRIDGE_PROTOCOL.md](docs/BRIDGE_PROTOCOL.md)**.
+Phase breakdown and acceptance cases:
+[docs/PLAN_PLUGIN_ON_DEMAND_MCP.md](docs/PLAN_PLUGIN_ON_DEMAND_MCP.md).
+
+### Running the tests
+
+```bash
+node --test
+```
+
+This runs the whole suite — the bridge modules plus the existing serializer and
+REST-import tests.
+
+### Known gaps before this works end to end
+
+- `plugin/manifest.json` has no `networkAccess` field, so Figma currently blocks
+  the plugin's `fetch` to `http://localhost:3456`. It must be added and the
+  plugin re-imported before any real Figma test can pass.
+- `server/index.js` and `server/mcp.mjs` both bind port 3456, so running both at
+  once fails. Phase 2 resolves this by making the MCP server a thin client of the
+  shared daemon.
+- No manual Figma acceptance run has been performed for this flow yet.
+
+---
+
 ## Legacy Plugin (Optional)
 
 The original Desktop development plugin is retained for users who can install local plugins. REST import is the primary path and does not require this plugin.
@@ -375,17 +470,23 @@ The original Desktop development plugin is retained for users who can install lo
 
 | Command | Action |
 |---------|--------|
-| **Sync Full Page** | Serializes all nodes on the current page |
-| **Sync Selected Nodes** | Serializes only the nodes currently selected in the editor |
-| **Watch Mode (Auto-Sync)** | Opens a persistent UI panel that auto-syncs on selection change with debounce. Includes Sync Now button and Auto-sync toggle. |
+| **Sync Full Page** | Serializes the whole current page, including descendants, regardless of the current selection |
+| **Sync Selected Nodes** | Serializes selected nodes and their descendants; requires a non-empty selection |
+| **Watch Mode (Auto-Sync)** | Syncs the whole current page on opening, then automatically after design edits or page switches. Includes Sync Now and an Auto-sync toggle. |
 
 ### Watch Mode
 
-Watch Mode opens a persistent UI panel in Figma that stays open while you work. As you select different layers or frames, the plugin debounces and auto-syncs the selected nodes to the server — no manual re-syncing needed.
+Watch Mode sends every frame and nested layer on the **current page**; you do not need to select or click each node. It sends an initial snapshot as soon as its panel opens, then watches document edits and page switches. Selecting a different layer does not shrink the synced data to that selection.
 
-- **Auto-sync toggle** — enable or disable automatic syncing from the panel
-- **Sync Now button** — trigger an immediate sync of the current selection
-- **Debounce** — selection changes are debounced to avoid flooding the server during rapid selection changes
+- Start the local bridge server, open the editable Figma copy on the page you want, then run **Plugins → Development → Design Bridge → Watch Mode (Auto-Sync)**. Keep the panel open.
+- **Auto-sync toggle** — pauses future automatic updates (an upload already in progress may finish). Re-enabling sends a fresh page snapshot.
+- **Sync Now button** — manually sends the whole current page, even when auto-sync is disabled.
+- **Debounce and queue** — edits/page switches are debounced for 800 ms. Only one upload runs at a time; changes during an upload are coalesced into a fresh snapshot afterward.
+- **Status** — the panel shows the last successfully synced page, recursive node count, and sync time. HTTP/network errors are shown; a stalled upload times out after 30 seconds. Use **Sync Now** to retry.
+
+This is **current-page sync, not whole-file sync**. Moving to another page replaces the server's current design; previous snapshots remain subject to the server's retention limit. Closing the plugin stops live updates, but cached data remains readable. A Figma URL alone does not yet make this plugin open another file or fetch an unsynced node. This plugin path posts directly to your local bridge and does not invoke Figma's REST import endpoint.
+
+The plugin uses Figma's [`documentchange` and `currentpagechange` events](https://developers.figma.com/docs/plugins/api/properties/figma-on/) with the existing legacy document-access manifest. If migrating the manifest to `dynamic-page`, load pages before subscribing to `documentchange` or migrate to page-scoped events. Very large pages may exceed the standalone server's 50 MB request limit; use **Sync Selected Nodes** on a containing frame/section in that case (its descendants are included).
 
 The plugin menu now includes a **Sync Design** submenu with **Full Page** and **Selected Nodes**, a separator, then **Watch Mode (Auto-Sync)**.
 
@@ -517,16 +618,27 @@ figma-bridge/
 │   ├── manifest.json          # Optional legacy Figma plugin
 │   └── code.js
 ├── server/
-│   ├── data/                  # latest.json + timestamped snapshots (gitignored)
+│   ├── data/                  # latest.json + snapshots + bridge-token.json (gitignored)
 │   ├── config.json            # Auto-created config (port, dataDir, maxSnapshots, logLevel)
 │   ├── figma-api.js           # Figma REST client + schema normalizer
 │   ├── figma-api.test.js      # Normalizer/import tests
 │   ├── import-figma.mjs       # CLI importer
 │   ├── package.json           # Server metadata
 │   ├── index.js               # HTTP server
-│   └── mcp.mjs                # MCP server (requires @modelcontextprotocol/sdk)
+│   ├── mcp.mjs                # MCP server (requires @modelcontextprotocol/sdk)
+│   └── bridge/                # Request-driven plugin bridge (phase 1, not yet wired in)
+│       ├── identity.js        # Figma URL/node-id parsing and cache keys
+│       ├── cache.js           # Content-addressed cache, atomic writes
+│       ├── broker.js          # Session registry, request queue, timeouts
+│       ├── token.js           # Local bridge token
+│       ├── routes.js          # /bridge/* HTTP surface
+│       ├── daemon.js          # Loopback daemon, safe start-or-reuse
+│       ├── client.js          # Thin client for MCP adapters
+│       └── *.test.js          # Tests for each module
 ├── docs/
-│   └── SERVER_API.md          # Detailed API documentation
+│   ├── SERVER_API.md          # REST/snapshot server API
+│   ├── BRIDGE_PROTOCOL.md     # /bridge/* route contract
+│   └── PLAN_PLUGIN_ON_DEMAND_MCP.md  # Implementation plan and acceptance cases
 ├── README.md
 └── .gitignore
 ```

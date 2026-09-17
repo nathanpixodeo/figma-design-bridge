@@ -6,6 +6,8 @@ All endpoints return JSON unless otherwise noted. CORS headers are set on every 
 
 > This project also includes a **native MCP server** (`server/mcp.mjs`) — see the [README](../README.md#mcp-model-context-protocol-support) for Claude Code integration.
 
+> **Scope of this document.** Everything below describes the snapshot-based REST-import server: unauthenticated, wildcard CORS, and one global "current design" that each sync replaces. The request-driven plugin bridge is a separate surface under the `/bridge/` prefix with its own authentication, per-file isolation and freshness rules — see [BRIDGE_PROTOCOL.md](./BRIDGE_PROTOCOL.md). The wildcard CORS and unauthenticated access described here do **not** apply to `/bridge/*`.
+
 ---
 
 ## `GET /health`
@@ -104,6 +106,8 @@ Common causes are a missing/invalid token, missing `file_content:read` scope, no
 ## `POST /design`
 
 Receive already-normalized bridge data. The legacy Figma plugin and the `import:figma` CLI use this endpoint.
+
+The plugin's **Watch Mode** posts a `type: "page"` snapshot on startup and after debounced design edits or page switches. It includes all roots and descendants on the current page, regardless of selection (subject to the serializer's 30-level depth limit). **Sync Selected Nodes** posts `type: "selection"` with the selected subtrees. These are complete snapshots, not incremental patches: each successful POST replaces the current design rather than merging pages or selections. Previously synced data remains in retained snapshots. Watch Mode must stay open in Figma for live updates; it does not fetch arbitrary nodes from a Figma URL.
 
 **Request Body:**
 
@@ -485,7 +489,7 @@ Error responses follow this format:
 
 ## CORS
 
-All responses include:
+All responses from the endpoints documented above include:
 
 ```
 Access-Control-Allow-Origin: *
@@ -494,6 +498,11 @@ Access-Control-Allow-Headers: Content-Type
 ```
 
 Preflight `OPTIONS` requests are handled with HTTP 204.
+
+Routes under `/bridge/` do not use these headers. They answer only to an explicit
+origin allowlist (defaulting to the Figma plugin iframe's opaque `null` origin),
+require a bearer token, and reject requests whose `Host` header is not a loopback
+host. See [BRIDGE_PROTOCOL.md](./BRIDGE_PROTOCOL.md#authentication).
 
 ---
 

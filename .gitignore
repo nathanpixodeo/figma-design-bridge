@@ -5,3 +5,9 @@ node_modules/
 Thumbs.db
 server/data/
 server/config.json
+
+# Local bridge pairing secret — never commit, wherever dataDir points
+**/bridge-token.json
+
+# GitNexus knowledge graph index
+.gitnexus/
