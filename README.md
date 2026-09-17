@@ -701,8 +701,8 @@ claude -p "Based on these text nodes, write better copy for the landing page: $T
 ```
 figma-bridge/
 ├── plugin/
-│   ├── manifest.json          # Optional legacy Figma plugin
-│   └── code.js
+│   ├── manifest.json          # Figma plugin manifest (declares networkAccess)
+│   └── code.js                # Plugin sandbox code — POSTs the page to /design
 ├── server/
 │   ├── data/                  # latest.json + snapshots + bridge-token.json (gitignored)
 │   ├── config.json            # Auto-created config (port, dataDir, maxSnapshots, logLevel)
@@ -720,12 +720,14 @@ figma-bridge/
 │       ├── routes.js          # /bridge/* HTTP surface
 │       ├── daemon.js          # Loopback daemon, safe start-or-reuse
 │       ├── client.js          # Thin client for MCP adapters
-│       └── *.test.js          # Tests for each module
+│       ├── e2e.test.js        # End-to-end tests over real HTTP
+│       └── *.test.js          # Unit tests for each module
 ├── docs/
 │   ├── SERVER_API.md          # REST/snapshot server API
 │   ├── BRIDGE_PROTOCOL.md     # /bridge/* route contract
 │   └── PLAN_PLUGIN_ON_DEMAND_MCP.md  # Implementation plan and acceptance cases
 ├── README.md
+├── LICENSE
 └── .gitignore
 ```
 
@@ -733,4 +735,4 @@ figma-bridge/
 
 ## License
 
-MIT
+[Apache License 2.0](LICENSE) © 2026 Nathan Pixodeo

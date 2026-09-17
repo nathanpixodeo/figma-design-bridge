@@ -2,7 +2,8 @@
   "name": "figma-design-bridge",
   "version": "1.0.0",
   "private": true,
-  "description": "Local REST and MCP bridge that imports Figma designs through the official API",
+  "description": "Local REST and MCP bridge that serves Figma designs to AI coding assistants, from either the Figma plugin or the official REST API",
+  "license": "Apache-2.0",
   "scripts": {
     "start": "node server/index.js",
     "mcp": "node server/mcp.mjs",

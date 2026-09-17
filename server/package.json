@@ -2,6 +2,7 @@
   "name": "figma-design-bridge-server",
   "version": "1.0.0",
   "description": "Local REST server that imports and exposes Figma designs to AI tools",
+  "license": "Apache-2.0",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
