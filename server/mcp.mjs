@@ -198,6 +198,20 @@ function serve() {
     }
     send(404, { error: "Not found" });
   });
+  // The MCP transport is stdio; this HTTP listener is only the plugin's ingest
+  // path. If another process already owns the port — typically server/index.js,
+  // which writes to the same DATA_DIR — that process is already doing the
+  // ingest, and the MCP tools can still read every snapshot from disk. Losing
+  // the listener must therefore not take the MCP server down with it.
+  srv.on("error", error => {
+    if (error.code === "EADDRINUSE") {
+      log(`Port ${PORT} is already in use; continuing without the HTTP ingest listener. `
+        + `MCP tools will read snapshots from ${DATA_DIR}. `
+        + `Set FIGMA_BRIDGE_PORT to run the listener on a free port.`);
+      return;
+    }
+    log(`HTTP server error: ${error.message}; continuing with MCP over stdio only.`);
+  });
   srv.listen(PORT, () => log(`HTTP server on http://localhost:${PORT}`));
   return srv;
 }

@@ -87,6 +87,30 @@ function loadLatestSnapshot() {
   return null
 }
 
+// Snapshot files are written once under a timestamped name and never edited,
+// so their metadata can be memoised on identity (name + size + mtime).
+const snapshotMetaCache = new Map()
+
+function snapshotMeta(filepath, filename, stat) {
+  const key = `${filename}:${stat.size}:${stat.mtimeMs}`
+  const hit = snapshotMetaCache.get(key)
+  if (hit) return hit
+
+  // The interesting fields (nodeCount, syncedAt, savedAt) are written after the
+  // large `nodes` array, so the whole file has to be parsed to reach them.
+  const parsed = JSON.parse(fs.readFileSync(filepath, 'utf8'))
+  const meta = {
+    pageName: parsed.pageName,
+    nodeCount: typeof parsed.nodeCount === 'number'
+      ? parsed.nodeCount
+      : (Array.isArray(parsed.nodes) ? countAllNodes(parsed.nodes) : 0),
+    syncedAt: parsed.syncedAt,
+    savedAt: parsed.savedAt
+  }
+  snapshotMetaCache.set(key, meta)
+  return meta
+}
+
 function listSnapshots() {
   try {
     ensureDirs()
@@ -96,15 +120,16 @@ function listSnapshots() {
       .reverse()
     return files.map(f => {
       const p = path.join(snapsDir, f)
-      let info = { filename: f, size: fs.statSync(p).size }
+      const stat = fs.statSync(p)
+      const info = { filename: f, size: stat.size }
       try {
-        const raw = fs.readFileSync(p, 'utf8').slice(0, 300)
-        const parsed = JSON.parse(raw.slice(0, raw.indexOf('"nodes"') > 0 ? raw.indexOf('"nodes"') + 50 : raw.length) + '}')
-        info.pageName = parsed.pageName
-        info.nodeCount = parsed.nodeCount
-        info.syncedAt = parsed.syncedAt
-        info.savedAt = parsed.savedAt
-      } catch {}
+        Object.assign(info, snapshotMeta(p, f, stat))
+      } catch (e) {
+        // A snapshot that cannot be read still belongs in the listing, but the
+        // reason has to surface instead of silently becoming `undefined`.
+        info.error = `metadata unavailable: ${e.message}`
+        log('warn', `Could not read snapshot metadata for ${f}: ${e.message}`)
+      }
       return info
     })
   } catch (e) {
