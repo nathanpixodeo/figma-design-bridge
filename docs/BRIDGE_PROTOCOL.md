@@ -506,12 +506,12 @@ re-probes and reuses the winner.
 - **Not yet wired in.** `server/index.js` and `server/mcp.mjs` do not mount
   these routes yet; that is phase 2 work. The plugin still speaks to the legacy
   `POST /design` route.
-- **`networkAccess` is absent from the manifest, but loopback does work.**
-  Figma only enforces `networkAccess` for published plugins, not for one
-  imported locally from a manifest, so `plugin/manifest.json` reaches
-  `http://localhost:3456` today — verified by a real 935-node sync on
-  2026-09-17. The field still has to be declared (with the loopback origin in
-  `devAllowedDomains`) before the plugin could be submitted; see the README.
+- **`networkAccess` pins the bridge to port 3456.** `plugin/manifest.json`
+  declares `allowedDomains: ["none"]` with `http://localhost:3456` in
+  `devAllowedDomains`. Moving the bridge with `FIGMA_BRIDGE_PORT` therefore
+  requires editing both the manifest entry and `SERVER_URL` in
+  `plugin/code.js`, then re-importing the plugin. A phase 2 plugin that talks
+  to `/bridge/*` will need the same origin declared.
 - **Port 3456 is shared, not contended.** `server/index.js` and `server/mcp.mjs`
   both try to bind it, but `mcp.mjs` now treats `EADDRINUSE` as a normal
   condition: it logs the clash, skips its HTTP ingest listener, and serves MCP

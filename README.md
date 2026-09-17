@@ -505,24 +505,8 @@ REST-import tests.
 
 ### Known gaps before this works end to end
 
-- `plugin/manifest.json` has no `networkAccess` field. Figma does not enforce
-  that field for a plugin imported locally from a manifest, which is why the
-  existing plugin already reaches `http://localhost:3456` — a verified sync of
-  935 nodes landed on 2026-09-17. It *is* enforced for a published plugin, so
-  the field has to be added before this plugin could ever be submitted:
-
-  ```json
-  "networkAccess": {
-    "allowedDomains": ["none"],
-    "devAllowedDomains": ["http://localhost:3456"],
-    "reasoning": "Sends the selected design to a bridge running on the developer's own machine."
-  }
-  ```
-
-  Adding it requires re-importing the plugin in Figma, so it is left out until
-  publishing is actually on the table.
 - No manual Figma acceptance run has been performed against the new `/bridge/*`
-  routes yet. The existing plugin still targets the legacy `POST /design` route.
+  routes yet. The plugin still targets `POST /design`.
 
 ---
 
@@ -533,6 +517,27 @@ and the only one that needs no Figma access token: it runs inside the document
 you already have open and posts to your local bridge directly. Install it as a
 local development plugin via **Plugins → Development → Import plugin from
 manifest…**, pointing at `plugin/manifest.json`.
+
+### Network access
+
+`plugin/manifest.json` declares:
+
+```json
+"networkAccess": {
+  "allowedDomains": ["none"],
+  "devAllowedDomains": ["http://localhost:3456"]
+}
+```
+
+The plugin contacts no external service, so production access is `none` and the
+loopback origin is declared under `devAllowedDomains`, which Figma honours for a
+plugin imported from a manifest. **This hard-codes port 3456.** If you move the
+bridge with `FIGMA_BRIDGE_PORT`, change `SERVER_URL` in `plugin/code.js` and the
+`devAllowedDomains` entry to match, then re-import the plugin — otherwise Figma
+blocks the request.
+
+Changing the manifest requires **Plugins → Development → Import plugin from
+manifest…** again for the change to take effect.
 
 Use the REST path instead if you cannot install local plugins, or if you need to
 read a file you do not have open. The two paths write to the same cache and are

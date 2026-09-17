@@ -5,6 +5,11 @@
   "main": "code.js",
   "editorType": ["figma"],
   "capabilities": [],
+  "networkAccess": {
+    "allowedDomains": ["none"],
+    "devAllowedDomains": ["http://localhost:3456"],
+    "reasoning": "The plugin sends the current page or selection to a Design Bridge server the user runs on their own machine. It contacts no external service, so production network access is 'none' and the loopback origin is declared for development only."
+  },
   "menu": [
     {
       "name": "Sync Design",
