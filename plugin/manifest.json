@@ -13,7 +13,7 @@
         { "command": "sync-selection", "name": "Sync Selected Nodes" }
       ]
     },
-    { "type": "separator" },
+    { "separator": true },
     { "command": "watch", "name": "Watch Mode (Auto-Sync)" }
   ]
 }

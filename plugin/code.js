@@ -40,6 +40,7 @@ body{
 @keyframes spin{to{transform:rotate(360deg)}}
 .checkbox-row{display:flex;align-items:center;gap:7px;font-size:12px;color:#AEAEB2;cursor:pointer;user-select:none}
 .checkbox-row input{accent-color:#007AFF;cursor:pointer}
+.hint{font-size:11px;color:#8E8E93;line-height:1.5}
 .error{color:#FF453A;font-size:11px;margin-top:6px;line-height:1.4;padding:6px 8px;background:rgba(255,69,58,0.08);border-radius:5px}
 .hidden{display:none!important}
 </style>
@@ -50,7 +51,7 @@ body{
     <span id="statusText">Starting...</span>
   </div>
   <div class="info-grid">
-    <span class="label">Page</span>
+    <span class="label">Synced page</span>
     <span class="value" id="pageName">\u2014</span>
     <span class="label">Nodes</span>
     <span class="value" id="nodeCount">\u2014</span>
@@ -61,8 +62,9 @@ body{
     <button class="btn-sync" id="syncBtn">\u27F3 Sync Now</button>
     <label class="checkbox-row">
       <input type="checkbox" id="autoSync" checked>
-      Auto-sync on selection change
+      Auto-sync page changes
     </label>
+    <p class="hint">Syncs the whole current page, including nested layers. Keep this panel open. Switching pages syncs the new page.</p>
   </div>
   <div id="errorMsg" class="error hidden"></div>
 </div>
@@ -84,19 +86,23 @@ function updateInfo(d){
 }
 function hideError(){q('errorMsg').classList.add('hidden')}
 function showError(m){q('errorMsg').textContent=m;q('errorMsg').classList.remove('hidden')}
-async function sendToServer(data){
+async function sendToServer(data,requestId){
   hideError()
   setStatus('connecting','Syncing...')
   q('syncBtn').disabled=true
+  const controller=new AbortController()
+  const timeout=setTimeout(()=>controller.abort(),30000)
   try{
-    const r=await fetch(SERVER_URL+'/design',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)})
+    const r=await fetch(SERVER_URL+'/design',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data),signal:controller.signal})
+    if(!r.ok) throw new Error('Server returned HTTP '+r.status+' '+r.statusText)
     const result=await r.json()
-    if(r.ok) parent.postMessage({pluginMessage:{type:'done',success:true,nodeCount:data.nodeCount,serverMessage:result.message}},'*')
-    else parent.postMessage({pluginMessage:{type:'done',success:false,error:result.error||r.statusText}},'*')
+    parent.postMessage({pluginMessage:{type:'done',requestId,success:true,serverMessage:result.message}},'*')
   }catch(err){
-    showError('Cannot connect to server at '+SERVER_URL+'\nMake sure node server/index.js is running.')
-    parent.postMessage({pluginMessage:{type:'done',success:false,error:err.message}},'*')
+    const message=err.name==='AbortError'?'Sync timed out after 30 seconds. Try Sync Now again.':err.message
+    showError(message+'\\nCheck the bridge server at '+SERVER_URL+'.')
+    parent.postMessage({pluginMessage:{type:'done',requestId,success:false,error:message}},'*')
   }finally{
+    clearTimeout(timeout)
     q('syncBtn').disabled=false
   }
 }
@@ -104,8 +110,9 @@ window.addEventListener('message',async e=>{
   const msg=e.data.pluginMessage
   if(!msg) return
   switch(msg.type){
-    case 'sync': await sendToServer(msg.data); break
+    case 'sync': await sendToServer(msg.data,msg.requestId); break
     case 'status': updateInfo(msg); break
+    case 'error': showError(msg.error); break
   }
 })
 q('syncBtn').addEventListener('click',()=>parent.postMessage({pluginMessage:{type:'request-sync'}},'*'))
@@ -129,7 +136,7 @@ function serializeNode(node, depth) {
   if ('clipsContent' in node && node.clipsContent) obj.clipsContent = true
 
   const isBox = node.type === 'RECTANGLE' || node.type === 'FRAME' || node.type === 'COMPONENT' || node.type === 'INSTANCE' || node.type === 'ELLIPSE'
-  if (isBox && 'cornerRadius' in node && node.cornerRadius > 0) {
+  if (isBox && typeof node.cornerRadius === 'number' && node.cornerRadius > 0) {
     obj.cornerRadius = node.cornerRadius
   }
 
@@ -279,12 +286,15 @@ function countNodes(nodes) {
 
 function buildDesignData(selectionOnly) {
   const page = figma.currentPage
-  const nodes = selectionOnly && page.selection.length > 0
+  if (selectionOnly && page.selection.length === 0) {
+    throw new Error('Select a frame or layers first, or use Sync Full Page / Watch Mode.')
+  }
+  const nodes = selectionOnly
     ? page.selection.map(n => serializeNode(n, 0))
     : page.children.map(child => serializeNode(child, 0))
 
   return {
-    type: selectionOnly && page.selection.length > 0 ? 'selection' : 'page',
+    type: selectionOnly ? 'selection' : 'page',
     pageName: page.name,
     pageId: page.id,
     selectionCount: selectionOnly ? page.selection.length : undefined,
@@ -294,27 +304,59 @@ function buildDesignData(selectionOnly) {
   }
 }
 
-const state = { autoSync: true, lastNodeCount: 0, lastSyncTime: null, connected: false }
+const state = {
+  autoSync: true, lastNodeCount: 0, lastSyncTime: null, lastPageName: null,
+  connected: false, ready: false, inFlight: null, pendingSync: null, nextRequestId: 0,
+}
 
 let debounceTimer = null
 
-function debouncedSync() {
-  if (debounceTimer) clearTimeout(debounceTimer)
-  debounceTimer = setTimeout(triggerSync, 400)
+function cancelDebounce() {
+  if (debounceTimer !== null) clearTimeout(debounceTimer)
+  debounceTimer = null
 }
 
-function triggerSync() {
-  const selectionOnly = figma.currentPage.selection.length > 0
-  const data = buildDesignData(selectionOnly)
-  figma.ui.postMessage({ type: 'sync', data })
+function debouncedSync() {
+  if (!state.ready || !state.autoSync) return
+  cancelDebounce()
+  debounceTimer = setTimeout(() => {
+    debounceTimer = null
+    triggerSync('auto')
+  }, 800)
+}
+
+function triggerSync(reason = 'manual') {
+  if (!state.ready || (reason === 'auto' && !state.autoSync)) return
+  if (state.inFlight) {
+    // Coalesce changes while sending. Build the next snapshot only when this one finishes.
+    if (state.pendingSync !== 'manual') state.pendingSync = reason
+    return
+  }
+  cancelDebounce()
+  state.pendingSync = null
+  try {
+    // Mixed Figma properties are Symbols, which cannot cross the UI message boundary.
+    const data = JSON.parse(JSON.stringify(buildDesignData(figma.command === 'sync-selection')))
+    const requestId = ++state.nextRequestId
+    state.inFlight = { requestId, data }
+    figma.ui.postMessage({ type: 'sync', requestId, data })
+  } catch (error) {
+    state.inFlight = null
+    figma.notify(`Sync failed: ${error.message}`, { error: true })
+    if (figma.command === 'watch') {
+      updateUIStatus()
+      figma.ui.postMessage({ type: 'error', error: error.message })
+    } else {
+      figma.closePlugin()
+    }
+  }
 }
 
 function updateUIStatus() {
   figma.ui.postMessage({
     type: 'status',
     connected: state.connected,
-    pageName: figma.currentPage?.name || '?',
-    pageId: figma.currentPage?.id,
+    pageName: state.lastPageName || '\u2014',
     nodeCount: state.lastNodeCount,
     lastSync: state.lastSyncTime?.toISOString(),
     autoSync: state.autoSync,
@@ -330,24 +372,36 @@ function main() {
     return
   }
 
-  figma.showUI(UI_HTML, { visible: isWatch, width: 300, height: 360 })
+  figma.showUI(UI_HTML, { visible: isWatch, width: 300, height: 390 })
 
   if (isWatch) {
-    figma.on('selectionchange', () => {
-      if (state.autoSync) debouncedSync()
+    // This development plugin uses legacy document access (no dynamic-page manifest).
+    // Watch page content, not selection: clicking a layer must not shrink the cache.
+    figma.on('documentchange', debouncedSync)
+    figma.on('currentpagechange', debouncedSync)
+    figma.on('close', () => {
+      cancelDebounce()
+      state.ready = false
+      state.pendingSync = null
     })
   }
 
   figma.ui.onmessage = msg => {
     switch (msg.type) {
       case 'ui-ready':
+        if (state.ready) break
+        state.ready = true
         triggerSync()
         break
 
       case 'done':
+        if (!state.inFlight || msg.requestId !== state.inFlight.requestId) break
+        const completed = state.inFlight.data
+        state.inFlight = null
         if (msg.success) {
           state.lastSyncTime = new Date()
-          state.lastNodeCount = msg.nodeCount
+          state.lastNodeCount = completed.nodeCount
+          state.lastPageName = completed.pageName
           state.connected = true
         } else {
           state.connected = false
@@ -358,9 +412,10 @@ function main() {
           if (!msg.success) {
             figma.notify(`Sync failed: ${msg.error}`, { error: true })
           }
+          if (state.pendingSync) triggerSync(state.pendingSync)
         } else {
           if (msg.success) {
-            figma.notify(`Synced ${msg.nodeCount} nodes to server`)
+            figma.notify(`Synced ${completed.nodeCount} nodes to server`)
           } else {
             figma.notify(`Sync failed: ${msg.error}`, { error: true })
           }
@@ -373,7 +428,15 @@ function main() {
         break
 
       case 'set-auto-sync':
-        if (isWatch) state.autoSync = msg.enabled
+        if (isWatch) {
+          state.autoSync = Boolean(msg.enabled)
+          if (state.autoSync) {
+            triggerSync('auto')
+          } else {
+            cancelDebounce()
+            if (state.pendingSync === 'auto') state.pendingSync = null
+          }
+        }
         break
     }
   }
