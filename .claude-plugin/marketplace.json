@@ -1,0 +1,16 @@
+{
+  "name": "figma-design-bridge",
+  "description": "Figma design data and design-versus-code review, served from a bridge that runs on your own machine.",
+  "owner": {
+    "name": "Nathan Pixodeo",
+    "url": "https://github.com/nathanpixodeo"
+  },
+  "plugins": [
+    {
+      "name": "figma-bridge",
+      "source": ".",
+      "description": "Read Figma designs from a local cache and check front-end code against them.",
+      "version": "1.0.0"
+    }
+  ]
+}

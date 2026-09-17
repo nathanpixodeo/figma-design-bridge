@@ -1,0 +1,52 @@
+---
+description: Compare front-end code against a Figma design and report every mismatch
+argument-hint: <figma-node-url-or-search-term> <path/to/component> [more paths...]
+---
+
+Compare the implemented front-end code against the design and report the differences. Arguments: `$ARGUMENTS` — the first is a Figma node URL, node id, or a layer name to search for; the rest are the code paths that implement it.
+
+This command reports. It does not edit code. Stop after the report unless the user asks for the fixes to be applied.
+
+## 1. Establish the design as the source of truth
+
+Prefer the official Figma MCP server when it is connected, because it is the only source here that returns a rendered image:
+
+- `get_screenshot` on the node — the rendered truth, needed for anything about layout or visual weight.
+- `get_design_context` on the node — structure, computed styles, and any Code Connect mapping.
+- `get_variable_defs` on the node — design tokens. A hard-coded value in the code that matches a token's *value* is still a finding: it will not follow the token when the token changes.
+
+Otherwise use this plugin's bridge tools against the local cache: `get_design_info` first to confirm something is loaded and how old it is, then `search_design` to locate the layer, and `get_design_texts` and `get_design_colors` for the values. Say in the report that the bridge was used, and mark every layout and visual-weight check as **not verified** rather than passed — the bridge exposes no image, so those checks cannot be performed from it.
+
+If neither source is reachable, stop and say which one failed and how to restore it. Do not review the code against assumptions about the design.
+
+## 2. Read the implementation
+
+Read every path in the arguments in full. Follow imports far enough to resolve what actually renders: the stylesheet or style object, the theme or token file, shared primitives, and any variant or state logic. A value that comes from a theme file is only correct if that theme entry is correct.
+
+## 3. Compare on six axes
+
+For each axis, check the code against the design and record concrete values on both sides.
+
+1. **Text and copy** — exact strings, casing, punctuation, truncation, pluralisation, and empty states. A trailing period or a different dash is a real finding.
+2. **Colour** — fills, strokes, shadows, and overlays, compared as resolved values. Note opacity applied separately from the colour.
+3. **Typography** — family, size, weight, line height, letter spacing, and text transform.
+4. **Spacing and size** — padding, gap, margin, width and height constraints, border radius, and border width.
+5. **State** — hover, focus, active, disabled, loading, error, and selected. Designs often carry these on separate frames; look for them before concluding a state is undesigned.
+6. **Responsive behaviour** — how the design's constraints or auto-layout map to the code's breakpoints, wrapping, and overflow.
+
+Also flag accessibility gaps that the design implies but the code drops: focus visibility, contrast against the actual background, alt text, and semantic element choice.
+
+## 4. Report
+
+Produce a table, most severe first:
+
+| Severity | Axis | Design | Code | Where |
+| --- | --- | --- | --- | --- |
+
+- **Blocker** — wrong information shown to the user, a missing state, or an accessibility failure.
+- **Major** — visible mismatch a designer would reject on review.
+- **Minor** — sub-pixel or rounding-level difference.
+
+Every row cites `file:line` and quotes both values. After the table, list any place where the design itself is ambiguous or missing a state, because those are decisions for the designer rather than defects in the code.
+
+Close with a one-line verdict: whether the implementation matches the design, and what the smallest set of changes would be to make it match.

@@ -603,9 +603,28 @@ Figma Design Bridge includes a built-in MCP server (`server/mcp.mjs`) that adds 
 npm install
 ```
 
-### Configure in Claude Code
+### Install as a Claude Code plugin (recommended)
 
-Add to your `claude.json` or MCP config:
+The repository is also a Claude Code plugin marketplace. Installing it registers the MCP server and three slash commands in one step, for every project on the machine:
+
+```bash
+claude plugin marketplace add nathanpixodeo/figma-design-bridge
+claude plugin install figma-bridge@figma-design-bridge
+```
+
+| Command | Does |
+| --- | --- |
+| `/figma-bridge:verify <node-url> <paths...>` | Compares front-end code against the design and reports every mismatch |
+| `/figma-bridge:page [summary\|tree\|texts\|colors]` | Shows what is currently in the cache, and how stale it is |
+| `/figma-bridge:sync <figma-url>` | Pulls a file or node through the REST API (needs a token) |
+
+The plugin resolves its own paths through `${CLAUDE_PLUGIN_ROOT}`, so nothing breaks when the clone moves. Point `node server/index.js` at the plugin's data directory, or set `FIGMA_BRIDGE_DATA_DIR` on both, so the HTTP server and the MCP server share one cache — this is the single most common way to end up with an empty design.
+
+For Codex CLI, see [`integrations/codex/README.md`](integrations/codex/README.md).
+
+### Configure in Claude Code manually
+
+If you would rather not install the plugin, add to your `claude.json` or MCP config:
 
 ```json
 {

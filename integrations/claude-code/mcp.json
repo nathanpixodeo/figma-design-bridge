@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "bridge": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/server/mcp.mjs"],
+      "env": {
+        "FIGMA_BRIDGE_DATA_DIR": "${CLAUDE_PLUGIN_ROOT}/server/data"
+      }
+    }
+  }
+}
