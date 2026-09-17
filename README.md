@@ -152,6 +152,11 @@ cases that genuinely need it, such as a container that has to be reachable from
 its host — the server logs a warning at startup whenever the bind address is not
 loopback. Do not set it on a shared network.
 
+Prefer an address over a name. `FIGMA_BRIDGE_HOST=localhost` binds whichever
+loopback family the name resolves to first, which on some systems is `::1`
+alone — and then nothing answers on `http://127.0.0.1:3456`, including the
+plugin.
+
 A loopback port is not a private port, though: a browser runs on the same
 machine, so a page you have open can issue requests to `127.0.0.1`. Three
 controls apply to every route, and all three are on by default — see
