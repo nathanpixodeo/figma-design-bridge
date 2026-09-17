@@ -350,7 +350,8 @@ a field:
 | Field | Meaning |
 |-------|---------|
 | `fileKey`, `fileName`, `nodeId`, `pageId`, `pageName` | What was actually read |
-| `source` | `"plugin"` for a live read, `"cache"` for a cached one |
+| `source` | Where the data originally came from. `"plugin"` when a plugin produced it — **including when it is later replayed from cache** |
+| `mode` | How *this* response was served: `"live"` or `"cached"` |
 | `fetchedAt` | When the data was produced |
 | `freshness` | `"live"` or `"unknown"` |
 | `verifiedFresh` | `true` only when a live plugin reply produced this response |
@@ -358,6 +359,11 @@ a field:
 | `ageMs` | Age of the entry, `0` for a live read |
 | `truncated` | Whether a limit cut the payload |
 | `completeness` | `{ nodeCount, byteSize, limitHit, truncatedNodeIds }` |
+
+> **Do not branch on `source` to decide whether a response is live.** A cached
+> replay of plugin-produced data still reports `source: "plugin"`; only
+> `mode`, `freshness`, `verifiedFresh` and `stale` are pinned per response.
+> `verifiedFresh` is the field to test.
 
 `verifiedFresh: true` is a positive assertion. It is written only when a live
 plugin reply produced the entry, and the cache layer rejects any attempt to
@@ -404,6 +410,7 @@ Errors are distinguishable by design: an agent can tell "plugin offline" from
 
 | Code | Status | Meaning |
 |------|--------|---------|
+| `FORBIDDEN_HOST` | 403 | The `Host` header was not a loopback host |
 | `BAD_REQUEST` | 400 | Schema violation or unknown field |
 | `INVALID_JSON` | 400 | Body was not valid JSON |
 | `INVALID_SOURCE` | 400 | Source was not a resolvable Figma URL or file key |
@@ -422,20 +429,41 @@ Errors are distinguishable by design: an agent can tell "plugin offline" from
 | `SESSION_LOST` | 503 | The answering session went away mid-request |
 | `TIMEOUT` | 504 | The plugin did not answer within `timeoutMs` |
 
-Error bodies carry the read envelope too, so a failed read still tells you which
-file and node it was about:
+An error body is **flat**: `error` is the human-readable message string and
+`code` is the machine-readable code. They are siblings, not nested.
 
 ```json
 {
-  "error": {
-    "code": "NO_SESSION_FOR_FILE",
-    "message": "No Figma plugin session is connected for file abc123DEF456. …"
-  },
+  "error": "No Figma plugin session is connected for file abc123DEF456. Open that file in Figma, run Plugins → Design Bridge and press Start, then retry. Pass mode \"cached\" to read explicitly unverified data instead.",
+  "code": "NO_SESSION_FOR_FILE"
+}
+```
+
+Branch on `code`, never on the text of `error` — the wording is meant for a
+human and may change.
+
+Errors raised on `/bridge/read` additionally carry the full read envelope, so a
+failed read still tells you which file and node it was about:
+
+```json
+{
   "fileKey": "abc123DEF456",
+  "fileName": null,
   "nodeId": "1:23",
+  "pageId": null,
+  "pageName": null,
+  "source": null,
+  "fetchedAt": null,
   "freshness": "unknown",
   "verifiedFresh": false,
-  "stale": true
+  "stale": true,
+  "truncated": false,
+  "completeness": null,
+  "ageMs": null,
+  "mode": "live",
+  "representation": "node-subtree",
+  "error": "No Figma plugin session is connected for file abc123DEF456. …",
+  "code": "NO_SESSION_FOR_FILE"
 }
 ```
 
@@ -476,13 +504,20 @@ re-probes and reuses the winner.
 ## Known limitations
 
 - **Not yet wired in.** `server/index.js` and `server/mcp.mjs` do not mount
-  these routes yet; that is phase 2 work.
-- **The plugin cannot reach loopback yet.** `plugin/manifest.json` has no
-  `networkAccess` field, so Figma blocks the plugin's `fetch` to
-  `http://localhost:3456`. This must be added, and the plugin re-imported,
-  before any real end-to-end test can pass.
-- **Port 3456 is contended.** `server/index.js` and `server/mcp.mjs` both bind
-  it, so running both at once fails. Resolving this is part of phase 2.
+  these routes yet; that is phase 2 work. The plugin still speaks to the legacy
+  `POST /design` route.
+- **`networkAccess` is absent from the manifest, but loopback does work.**
+  Figma only enforces `networkAccess` for published plugins, not for one
+  imported locally from a manifest, so `plugin/manifest.json` reaches
+  `http://localhost:3456` today — verified by a real 935-node sync on
+  2026-09-17. The field still has to be declared (with the loopback origin in
+  `devAllowedDomains`) before the plugin could be submitted; see the README.
+- **Port 3456 is shared, not contended.** `server/index.js` and `server/mcp.mjs`
+  both try to bind it, but `mcp.mjs` now treats `EADDRINUSE` as a normal
+  condition: it logs the clash, skips its HTTP ingest listener, and serves MCP
+  over stdio from the same `DATA_DIR` the other process writes to. Running both
+  at once is therefore safe. Making the MCP server a real client of the shared
+  daemon is still phase 2 work.
 - **Token file permissions are best-effort on Windows.** `chmod 0o600` is
   honoured on macOS and Linux; on NTFS the inherited ACL wins and the mode is a
   no-op. The real protection there is that the token lives in the git-ignored

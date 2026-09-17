@@ -452,13 +452,24 @@ REST-import tests.
 
 ### Known gaps before this works end to end
 
-- `plugin/manifest.json` has no `networkAccess` field, so Figma currently blocks
-  the plugin's `fetch` to `http://localhost:3456`. It must be added and the
-  plugin re-imported before any real Figma test can pass.
-- `server/index.js` and `server/mcp.mjs` both bind port 3456, so running both at
-  once fails. Phase 2 resolves this by making the MCP server a thin client of the
-  shared daemon.
-- No manual Figma acceptance run has been performed for this flow yet.
+- `plugin/manifest.json` has no `networkAccess` field. Figma does not enforce
+  that field for a plugin imported locally from a manifest, which is why the
+  existing plugin already reaches `http://localhost:3456` — a verified sync of
+  935 nodes landed on 2026-09-17. It *is* enforced for a published plugin, so
+  the field has to be added before this plugin could ever be submitted:
+
+  ```json
+  "networkAccess": {
+    "allowedDomains": ["none"],
+    "devAllowedDomains": ["http://localhost:3456"],
+    "reasoning": "Sends the selected design to a bridge running on the developer's own machine."
+  }
+  ```
+
+  Adding it requires re-importing the plugin in Figma, so it is left out until
+  publishing is actually on the table.
+- No manual Figma acceptance run has been performed against the new `/bridge/*`
+  routes yet. The existing plugin still targets the legacy `POST /design` route.
 
 ---
 
