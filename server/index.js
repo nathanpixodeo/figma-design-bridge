@@ -3,6 +3,11 @@ const fs = require('fs')
 const path = require('path')
 const { URL } = require('url')
 const { fetchFigmaDesign } = require('./figma-api')
+const createBridgeRoutes = require('./bridge/routes')
+const createBridgeCache = require('./bridge/cache')
+const createBridgeBroker = require('./bridge/broker')
+const bridgeIdentity = require('./bridge/identity')
+const { getOrCreateToken, verifyToken } = require('./bridge/token')
 
 // ── Config ────────────────────────────────────────────────
 
@@ -30,15 +35,17 @@ function loadConfig() {
 
 const config = loadConfig()
 const port = parseInt(process.env.FIGMA_BRIDGE_PORT || config.port, 10)
-// No route on this server is authenticated, so reaching it has to require being
-// on this machine. Binding elsewhere is possible — a container that must be
-// reachable from its host, for one — but it has to be asked for, and it is
-// announced at startup rather than happening by default.
+// Reaching this server has to require being on this machine. Binding elsewhere
+// is possible — a container that must be reachable from its host, for one — but
+// it has to be asked for, and it is announced at startup rather than happening
+// by default.
 const host = process.env.FIGMA_BRIDGE_HOST || config.host || '127.0.0.1'
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1'])
 const dataDir = process.env.FIGMA_BRIDGE_DATA_DIR || config.dataDir
 const maxSnapshots = parseInt(process.env.FIGMA_BRIDGE_MAX_SNAPSHOTS || config.maxSnapshots, 10)
 const logLevel = process.env.FIGMA_BRIDGE_LOG_LEVEL || config.logLevel
+const maxBodyBytes = parseInt(process.env.FIGMA_BRIDGE_MAX_BODY_BYTES || config.maxBodyBytes || 50_000_000, 10)
+const allowAnonymousLegacy = process.env.FIGMA_BRIDGE_ALLOW_ANONYMOUS_LEGACY === '1'
 
 // ── Logger ────────────────────────────────────────────────
 
@@ -53,6 +60,68 @@ function log(level, ...args) {
   if (level === 'error') console.error(...output)
   else if (level === 'warn') console.warn(...output)
   else console.log(...output)
+}
+
+// The legacy snapshot API and the request-driven bridge deliberately share one
+// listener. This keeps `npm start` compatible with existing /design consumers
+// while allowing MCP adapters to safely probe/reuse the same process.
+const bridgeToken = getOrCreateToken(dataDir).token
+const bridgeCache = createBridgeCache({ dataDir })
+const bridgeBroker = createBridgeBroker({ identity: bridgeIdentity, log })
+const bridgeRouter = createBridgeRoutes({
+  broker: bridgeBroker,
+  cache: bridgeCache,
+  identity: bridgeIdentity,
+  token: bridgeToken,
+  log,
+})
+
+// ── Legacy route guard ─────────────────────────────────────
+
+// The /design and /snapshots routes predate the bridge token, and a loopback
+// port is reachable from any page the user happens to have open: a browser runs
+// on the same machine, so binding to 127.0.0.1 does not keep a web page out.
+// Three controls stand in for the authentication these routes never had.
+//
+//   1. The Host header has to name loopback. This is what defeats DNS
+//      rebinding, where a page on attacker.example resolves to 127.0.0.1 and
+//      the browser still sends `Host: attacker.example`.
+//   2. A cross-origin request is refused outright, and the response never
+//      carries `Access-Control-Allow-Origin: *`, so a foreign page can neither
+//      send a request that is honoured nor read a reply.
+//   3. Anything that reads or writes design data needs the bridge token. The
+//      Figma plugin's iframe posts from an opaque origin — the literal string
+//      "null" — which an attacker's sandboxed iframe can also produce, so the
+//      origin check alone cannot tell the two apart. The token can.
+const LEGACY_LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]', '::1'])
+const OPAQUE_ORIGIN = 'null'
+const LEGACY_OPEN_PATHS = new Set(['/', '/health'])
+
+function hostIsLoopback(hostHeader) {
+  if (typeof hostHeader !== 'string' || !hostHeader) return false
+  const name = hostHeader.startsWith('[')
+    ? hostHeader.slice(0, hostHeader.indexOf(']') + 1)
+    : hostHeader.split(':')[0]
+  return LEGACY_LOOPBACK_HOSTS.has(name.toLowerCase())
+}
+
+function originIsAllowed(origin) {
+  // No Origin header at all means no browser imposed one: curl, an editor
+  // extension, the MCP adapter. Those are same-machine callers and still have
+  // to present the token below.
+  if (origin === undefined) return true
+  if (origin === OPAQUE_ORIGIN) return true
+  try {
+    const parsed = new URL(origin)
+    return parsed.protocol === 'http:' && LEGACY_LOOPBACK_HOSTS.has(parsed.hostname.toLowerCase())
+  } catch {
+    return false
+  }
+}
+
+function legacyRequestIsAuthorized(req) {
+  if (allowAnonymousLegacy) return true
+  return verifyToken(req, bridgeToken)
 }
 
 // ── Snapshot Store ─────────────────────────────────────────
@@ -312,47 +381,79 @@ function escapeMd(s) {
 
 let currentDesign = loadLatestSnapshot()
 
+// The allow-listed origin, when there is one, is set on the response by router
+// before dispatch. Neither helper may reintroduce a wildcard: `*` would let any
+// page on the internet read a reply from this port.
 function sendJSON(res, status, data) {
-  res.writeHead(status, {
-    'Content-Type': 'application/json',
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type',
-  })
+  res.writeHead(status, { 'Content-Type': 'application/json' })
   res.end(JSON.stringify(data) + '\n')
 }
 
 function sendText(res, status, text, contentType = 'text/plain') {
-  res.writeHead(status, {
-    'Content-Type': `${contentType}; charset=utf-8`,
-    'Access-Control-Allow-Origin': '*',
-  })
+  res.writeHead(status, { 'Content-Type': `${contentType}; charset=utf-8` })
   res.end(text + '\n')
 }
 
 function parseBody(req) {
   return new Promise((resolve, reject) => {
     let body = ''
-    req.on('data', c => { body += c; if (body.length > 50e6) reject(new Error('Payload too large')) })
+    req.on('data', c => {
+      body += c
+      if (body.length > maxBodyBytes) {
+        // Stop reading. Rejecting the promise alone leaves the upload streaming,
+        // so one request could still grow the buffer without limit.
+        req.destroy()
+        reject(new Error(`Payload too large (limit ${maxBodyBytes} bytes)`))
+      }
+    })
     req.on('end', () => resolve(body))
     req.on('error', reject)
   })
 }
 
 function router(req, res) {
+  if (req.url === '/bridge' || req.url.startsWith('/bridge/')) {
+    bridgeRouter(req, res)
+    return
+  }
+
+  if (!hostIsLoopback(req.headers.host)) {
+    log('warn', `Refused a request addressed to "${req.headers.host}" instead of loopback`)
+    sendJSON(res, 403, { error: 'This server only answers requests addressed to a loopback host.' })
+    return
+  }
+
+  const origin = req.headers.origin
+  if (!originIsAllowed(origin)) {
+    sendJSON(res, 403, { error: 'This origin is not allowed to reach the design bridge.' })
+    return
+  }
+  if (typeof origin === 'string') {
+    res.setHeader('Access-Control-Allow-Origin', origin)
+    res.setHeader('Vary', 'Origin')
+  }
+
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
-      'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Bridge-Token',
+      'Access-Control-Max-Age': '600',
     })
     res.end()
     return
   }
 
-  const url = new URL(req.url, `http://localhost:${port}`)
+  const url = new URL(req.url, `http://127.0.0.1:${port}`)
   const p = url.pathname
   const m = req.method
+
+  if (!LEGACY_OPEN_PATHS.has(p) && !legacyRequestIsAuthorized(req)) {
+    sendJSON(res, 401, {
+      error: 'A bridge token is required for this route.',
+      hint: 'Run `npm run bridge:token` and send it as `Authorization: Bearer <token>`.',
+    })
+    return
+  }
 
   try {
     // GET / — endpoint listing
@@ -538,9 +639,15 @@ process.on('SIGTERM', () => shutdown('SIGTERM'))
 server.listen(port, host, () => {
   log('info', `Server started on http://${host}:${port}`)
   if (!LOOPBACK_HOSTS.has(host)) {
-    log('warn', `Listening on ${host}, which is not loopback. These routes have no `
-      + `authentication: anyone who can reach this address can read, overwrite, or `
-      + `delete the cached design. Unset FIGMA_BRIDGE_HOST to bind 127.0.0.1 only.`)
+    log('warn', `Listening on ${host}, which is not loopback. Anyone who can reach `
+      + `this address can attempt to read, overwrite, or delete the cached design, `
+      + `and the token is the only thing stopping them. Unset FIGMA_BRIDGE_HOST to `
+      + `bind 127.0.0.1 only.`)
+  }
+  if (allowAnonymousLegacy) {
+    log('warn', `FIGMA_BRIDGE_ALLOW_ANONYMOUS_LEGACY=1: /design and /snapshots accept `
+      + `unauthenticated requests. Any web page open in a browser on this machine can `
+      + `read, overwrite, or delete the cached design. Unset it to require the token.`)
   }
   log('info', `Data directory: ${dataDir}`)
   log('info', `Max snapshots: ${maxSnapshots}`)

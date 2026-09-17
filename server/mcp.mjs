@@ -5,22 +5,27 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
 import figmaApi from "./figma-api.js";
 
 const { fetchFigmaDesign } = figmaApi;
+const require = createRequire(import.meta.url);
+const { startOrReuse } = require("./bridge/daemon.js");
+const { createClient } = require("./bridge/client.js");
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const PORT = parseInt(process.env.FIGMA_BRIDGE_PORT || "3456", 10);
-// The ingest listener below is unauthenticated, so it stays on loopback unless
-// the operator asks for something else. See the warning in serve().
-const HOST = process.env.FIGMA_BRIDGE_HOST || "127.0.0.1";
-const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1"]);
-const DATA_DIR = process.env.FIGMA_BRIDGE_DATA_DIR || path.join(__dirname, "data");
-const MAX_SNAPSHOTS = parseInt(process.env.FIGMA_BRIDGE_MAX_SNAPSHOTS || "50", 10);
+let fileConfig = {};
+try {
+  const configPath = path.join(__dirname, "config.json");
+  if (fs.existsSync(configPath)) fileConfig = JSON.parse(fs.readFileSync(configPath, "utf8"));
+} catch { /* fall back to defaults */ }
+const PORT = parseInt(process.env.FIGMA_BRIDGE_PORT || fileConfig.port || "3456", 10);
+const HOST = process.env.FIGMA_BRIDGE_HOST || fileConfig.host || "127.0.0.1";
+const DATA_DIR = process.env.FIGMA_BRIDGE_DATA_DIR || fileConfig.dataDir || path.join(__dirname, "data");
+const MAX_SNAPSHOTS = parseInt(process.env.FIGMA_BRIDGE_MAX_SNAPSHOTS || fileConfig.maxSnapshots || "50", 10);
 const snapsDir = path.join(DATA_DIR, "snapshots");
 const latestPath = path.join(DATA_DIR, "latest.json");
 
@@ -151,81 +156,87 @@ function summary(data) {
 // ── State ──────────────────────────────────────────────────
 
 let currentDesign = loadLatest();
+let bridgeDescriptor = null;
+let bridgeClient = null;
+let bridgeStartup = null;
 
-// ── HTTP server ────────────────────────────────────────────
+// ── Shared bridge client ────────────────────────────────────
 
-function serve() {
-  const srv = http.createServer((req, res) => {
-    const send = (status, data, ct = "application/json") => {
-      res.writeHead(status, { "Content-Type": ct, "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "GET, POST, OPTIONS", "Access-Control-Allow-Headers": "Content-Type" });
-      res.end(ct === "application/json" ? JSON.stringify(data) + "\n" : data);
-    };
-    if (req.method === "OPTIONS") { res.writeHead(204, { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "GET, POST, OPTIONS", "Access-Control-Allow-Headers": "Content-Type" }); res.end(); return; }
-    if (req.method === "POST" && req.url === "/design") {
-      let body = "";
-      req.on("data", c => body += c);
-      req.on("end", () => {
-        try {
-          const d = JSON.parse(body);
-          if (!d.nodes || !d.pageName) return send(400, { error: 'Missing "nodes" or "pageName"' });
-          currentDesign = d;
-          saveSnapshot(d);
-          log(`Design synced: "${d.pageName}" — ${d.nodeCount} nodes`);
-          send(200, { message: `Synced ${d.nodeCount} nodes`, nodeCount: d.nodeCount });
-        } catch { send(400, { error: "Invalid JSON" }); }
-      });
-      return;
-    }
-    if (req.method === "POST" && req.url === "/figma/import") {
-      let body = "";
-      req.on("data", c => body += c);
-      req.on("end", async () => {
-        try {
-          const input = JSON.parse(body);
-          const source = input.source || input.url || input.fileKey;
-          if (!source) return send(400, { error: 'Missing "source" (Figma URL or file key)' });
-          const design = await fetchFigmaDesign(source, { nodeIds: input.nodeIds });
-          currentDesign = design;
-          saveSnapshot(design);
-          log(`Figma API import: "${design.pageName}" — ${design.nodeCount} nodes`);
-          send(200, { message: `Imported ${design.nodeCount} nodes from Figma`, pageName: design.pageName, fileName: design.fileName, nodeCount: design.nodeCount, source: design.source });
-        } catch (error) {
-          log(`Figma API import failed: ${error.message}`);
-          send(502, { error: error.message });
-        }
-      });
-      return;
-    }
-    if (req.method === "GET" && req.url === "/health") {
-      send(200, { status: "ok", port: PORT, hasDesign: currentDesign !== null, pageName: currentDesign?.pageName || null, nodeCount: currentDesign?.nodeCount || 0 });
-      return;
-    }
-    send(404, { error: "Not found" });
-  });
-  // The MCP transport is stdio; this HTTP listener is only the plugin's ingest
-  // path. If another process already owns the port — typically server/index.js,
-  // which writes to the same DATA_DIR — that process is already doing the
-  // ingest, and the MCP tools can still read every snapshot from disk. Losing
-  // the listener must therefore not take the MCP server down with it.
-  srv.on("error", error => {
-    if (error.code === "EADDRINUSE") {
-      log(`Port ${PORT} is already in use; continuing without the HTTP ingest listener. `
-        + `MCP tools will read snapshots from ${DATA_DIR}. `
-        + `Set FIGMA_BRIDGE_PORT to run the listener on a free port.`);
-      return;
-    }
-    log(`HTTP server error: ${error.message}; continuing with MCP over stdio only.`);
-  });
-  srv.listen(PORT, HOST, () => {
-    log(`HTTP server on http://${HOST}:${PORT}`);
-    if (!LOOPBACK_HOSTS.has(HOST)) {
-      log(`Listening on ${HOST}, which is not loopback. This ingest endpoint has no `
-        + `authentication: anyone who can reach this address can overwrite the cached `
-        + `design. Unset FIGMA_BRIDGE_HOST to bind 127.0.0.1 only.`);
-    }
-  });
-  return srv;
+async function ensureBridge() {
+  if (bridgeClient) return bridgeClient;
+  if (!bridgeStartup) {
+    bridgeStartup = startOrReuse({
+      port: PORT,
+      host: HOST,
+      dataDir: DATA_DIR,
+      log: (level, ...args) => log(`[bridge:${level}]`, ...args),
+    }).then(descriptor => {
+      if (!descriptor.token) {
+        const error = new Error(`Bridge token is unavailable in ${DATA_DIR}. Run the bridge once to create pairing data.`);
+        error.code = "NO_TOKEN";
+        throw error;
+      }
+      bridgeDescriptor = descriptor;
+      bridgeClient = createClient({ url: descriptor.url, token: descriptor.token });
+      return bridgeClient;
+    }).catch(error => {
+      bridgeStartup = null;
+      throw error;
+    });
+  }
+  return bridgeStartup;
 }
+
+function readOptionsFromArgs(args = {}) {
+  const options = {};
+  for (const key of ["depth", "maxNodes", "maxBytes", "includeHidden", "representation"]) {
+    if (args[key] !== undefined) options[key] = args[key];
+  }
+  return Object.keys(options).length ? options : undefined;
+}
+
+function bridgeResultToDesign(result) {
+  const payload = result?.payload;
+  const nodes = result?.nodeId
+    ? (payload ? [payload] : [])
+    : (Array.isArray(payload?.pages) ? payload.pages : []);
+  return {
+    fileName: result?.fileName || null,
+    pageName: result?.pageName || result?.fileName || (result?.nodeId ? "Requested node" : "Document index"),
+    type: result?.nodeId ? "node" : "document-index",
+    source: "plugin",
+    nodes,
+    nodeCount: result?.completeness?.nodeCount ?? nodes.length,
+    syncedAt: result?.fetchedAt || null,
+    bridge: result,
+  };
+}
+
+async function resolveDesign(args = {}) {
+  if (args?.source) {
+    const client = await ensureBridge();
+    const result = await client.read({
+      source: args.source,
+      mode: args.mode || "live",
+      timeoutMs: args.timeout_ms,
+      options: readOptionsFromArgs(args),
+    });
+    return bridgeResultToDesign(result);
+  }
+  if (currentDesign) return currentDesign;
+  const error = new Error('No design source provided. Pass "source" with a Figma URL/file key, or explicitly import a legacy REST snapshot first.');
+  error.code = "NO_DESIGN_SOURCE";
+  throw error;
+}
+
+const SOURCE_PROPERTIES = {
+  source: { type: "string", description: "Figma URL or file key. When provided, this tool reads through the live plugin bridge instead of global legacy state." },
+  mode: { type: "string", enum: ["live", "cached"], description: "Live by default. Cached mode is explicit opt-in to unverified stale data." },
+  depth: { type: "integer", minimum: 0, maximum: 50 },
+  maxNodes: { type: "integer", minimum: 1, maximum: 200000 },
+  maxBytes: { type: "integer", minimum: 1, maximum: 50000000 },
+  includeHidden: { type: "boolean" },
+};
 
 // ── MCP server ─────────────────────────────────────────────
 
@@ -238,8 +249,29 @@ async function startMCP() {
   mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: [
       {
+        name: "get_design_context",
+        description: "Read a Figma file or exact node through the connected Figma plugin. A node URL returns that node and subtree; a file URL returns a lightweight document index. Live mode never silently falls back to REST or stale cache.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            source: { type: "string", description: "Figma design URL (including node-id when relevant) or a Figma file key" },
+            mode: { type: "string", enum: ["live", "cached"], description: "Use live unless the user explicitly asks for cached/offline data." },
+            depth: { type: "integer", minimum: 0, maximum: 50 },
+            maxNodes: { type: "integer", minimum: 1, maximum: 200000 },
+            maxBytes: { type: "integer", minimum: 1, maximum: 50000000 },
+            includeHidden: { type: "boolean" },
+          },
+          required: ["source"],
+        },
+      },
+      {
+        name: "get_bridge_status",
+        description: "Show whether the local bridge is ready, which Figma files have live plugin sessions, cache statistics, and actionable setup hints. Does not expose pairing secrets.",
+        inputSchema: { type: "object", properties: {} },
+      },
+      {
         name: "sync_figma_design",
-        description: "Fetch a Figma file or selected node through the official Figma REST API, normalize it, cache it locally, and make it the current design. Requires FIGMA_ACCESS_TOKEN with file_content:read scope in the MCP server environment. Call only when the user asks to sync or refresh to avoid unnecessary API usage.",
+        description: "Explicitly fetch a Figma file or selected node through the official Figma REST API and save a legacy snapshot. Requires FIGMA_ACCESS_TOKEN. This is separate from the plugin-first route and is never used as an automatic fallback.",
         inputSchema: {
           type: "object",
           properties: {
@@ -251,30 +283,31 @@ async function startMCP() {
       },
       {
         name: "get_design_summary",
-        description: "Get a comprehensive markdown summary of the current Figma design — screens, layer tree, all text content, color palette, and structure statistics. Use this as the primary tool to understand a design.",
-        inputSchema: { type: "object", properties: {} },
+        description: "Get a markdown summary for an explicit Figma source through the live plugin bridge, or for the legacy imported snapshot when source is omitted.",
+        inputSchema: { type: "object", properties: { ...SOURCE_PROPERTIES } },
       },
       {
         name: "get_design_tree",
-        description: "Get an ASCII tree visualization of every layer in the design showing type, name, dimensions, and colors.",
-        inputSchema: { type: "object", properties: {} },
+        description: "Get an ASCII layer tree for an explicit Figma source or the legacy imported snapshot.",
+        inputSchema: { type: "object", properties: { ...SOURCE_PROPERTIES } },
       },
       {
         name: "get_design_texts",
-        description: "Extract all text content from the design with font, size, and layer path for each text node.",
-        inputSchema: { type: "object", properties: {} },
+        description: "Extract text content from an explicit Figma source or the legacy imported snapshot.",
+        inputSchema: { type: "object", properties: { ...SOURCE_PROPERTIES } },
       },
       {
         name: "get_design_colors",
-        description: "Get the color palette — every unique color used in fills and strokes, grouped with usage count and example node names.",
-        inputSchema: { type: "object", properties: {} },
+        description: "Get solid fill/stroke colors from an explicit Figma source or the legacy imported snapshot.",
+        inputSchema: { type: "object", properties: { ...SOURCE_PROPERTIES } },
       },
       {
         name: "search_design",
-        description: "Search for nodes by name or text content (case-insensitive). Returns matching nodes with their full path, type, dimensions, and properties.",
+        description: "Search an explicit Figma source or the legacy imported snapshot by node name or text content.",
         inputSchema: {
           type: "object",
           properties: {
+            ...SOURCE_PROPERTIES,
             q: { type: "string", description: "Search term (matches node names and text content)" },
           },
           required: ["q"],
@@ -282,8 +315,8 @@ async function startMCP() {
       },
       {
         name: "get_design_info",
-        description: "Get basic info about the currently loaded design: page name, type, node count, and sync timestamp.",
-        inputSchema: { type: "object", properties: {} },
+        description: "Get basic info for an explicit Figma source or the legacy imported snapshot.",
+        inputSchema: { type: "object", properties: { ...SOURCE_PROPERTIES } },
       },
     ],
   }));
@@ -294,11 +327,31 @@ async function startMCP() {
     const err = msg => ({ content: [{ type: "text", text: `Error: ${msg}` }], isError: true });
     const ok = text => ({ content: [{ type: "text", text }] });
 
-    if (!currentDesign && name !== "get_design_info" && name !== "sync_figma_design") {
-      return err("No design data loaded. Call sync_figma_design with a Figma URL first.");
-    }
-
     switch (name) {
+      case "get_design_context": {
+        if (!args?.source) return err('Missing required parameter "source"');
+        try {
+          const client = await ensureBridge();
+          const result = await client.read({
+            source: args.source,
+            mode: args.mode || "live",
+            options: readOptionsFromArgs(args),
+          });
+          return ok(JSON.stringify(result, null, 2));
+        } catch (error) {
+          return err(`${error.code ? `${error.code}: ` : ""}${error.message}`);
+        }
+      }
+
+      case "get_bridge_status": {
+        try {
+          const client = await ensureBridge();
+          return ok(JSON.stringify(await client.status(), null, 2));
+        } catch (error) {
+          return err(`${error.code ? `${error.code}: ` : ""}${error.message}`);
+        }
+      }
+
       case "sync_figma_design": {
         const source = args?.source;
         if (!source) return err('Missing required parameter "source"');
@@ -312,54 +365,72 @@ async function startMCP() {
         }
       }
 
-      case "get_design_summary":
-        return ok(summary(currentDesign));
+      case "get_design_summary": {
+        try { return ok(summary(await resolveDesign(args))); }
+        catch (error) { return err(`${error.code ? `${error.code}: ` : ""}${error.message}`); }
+      }
 
       case "get_design_tree": {
-        let tree = (currentDesign.pageName || "Design") + "\n";
-        for (const n of currentDesign.nodes) tree += treeNode(n);
-        return ok(tree);
+        try {
+          const design = await resolveDesign(args);
+          let tree = (design.pageName || "Design") + "\n";
+          for (const n of design.nodes || []) tree += treeNode(n);
+          return ok(tree);
+        } catch (error) { return err(`${error.code ? `${error.code}: ` : ""}${error.message}`); }
       }
 
       case "get_design_texts": {
-        const texts = getAllTexts(currentDesign.nodes);
-        if (!texts.length) return ok("No text nodes found.");
-        let r = `# Text Content (${texts.length} nodes)\n\n| Path | Text | Font | Size |\n|---|---|---|---|\n`;
-        texts.forEach(t => { r += `| ${t.path.replace(/\|/g, "\\|")} | ${(t.characters || "").replace(/\|/g, "\\|")} | ${t.fontFamily || "-"} | ${t.fontSize || "-"} |\n`; });
-        return ok(r);
+        try {
+          const design = await resolveDesign(args);
+          const texts = getAllTexts(design.nodes || []);
+          if (!texts.length) return ok("No text nodes found.");
+          let r = `# Text Content (${texts.length} nodes)\n\n| Path | Text | Font | Size |\n|---|---|---|---|\n`;
+          texts.forEach(t => { r += `| ${t.path.replace(/\|/g, "\\|")} | ${(t.characters || "").replace(/\|/g, "\\|")} | ${t.fontFamily || "-"} | ${t.fontSize || "-"} |\n`; });
+          return ok(r);
+        } catch (error) { return err(`${error.code ? `${error.code}: ` : ""}${error.message}`); }
       }
 
       case "get_design_colors": {
-        const palette = getColors(currentDesign.nodes);
-        const keys = Object.keys(palette);
-        if (!keys.length) return ok("No solid colors found.");
-        const sorted = keys.sort((a, b) => palette[b].length - palette[a].length);
-        let r = `# Color Palette (${keys.length} unique)\n\n| Color | Count | Examples |\n|---|---|---|\n`;
-        for (const color of sorted) { const ex = [...new Set(palette[color].map(u => u.node))].slice(0, 3).join(", "); r += `| ${color} | ${palette[color].length} | ${ex} |\n`; }
-        return ok(r);
+        try {
+          const design = await resolveDesign(args);
+          const palette = getColors(design.nodes || []);
+          const keys = Object.keys(palette);
+          if (!keys.length) return ok("No solid colors found.");
+          const sorted = keys.sort((a, b) => palette[b].length - palette[a].length);
+          let r = `# Color Palette (${keys.length} unique)\n\n| Color | Count | Examples |\n|---|---|---|\n`;
+          for (const color of sorted) { const ex = [...new Set(palette[color].map(u => u.node))].slice(0, 3).join(", "); r += `| ${color} | ${palette[color].length} | ${ex} |\n`; }
+          return ok(r);
+        } catch (error) { return err(`${error.code ? `${error.code}: ` : ""}${error.message}`); }
       }
 
       case "search_design": {
         const q = args?.q;
         if (!q) return err('Missing required parameter "q"');
-        const ql = q.toLowerCase();
-        const results = findNodes(currentDesign.nodes, n => (n.name && n.name.toLowerCase().includes(ql)) || (n.type === "TEXT" && n.characters && n.characters.toLowerCase().includes(ql)));
-        if (!results.length) return ok(`No results for "${q}".`);
-        let r = `# Search: "${q}" (${results.length} matches)\n\n`;
-        results.forEach((res, i) => {
-          const p = [...res.path.map(x => x.name), res.node.name].join(" > ");
-          r += `**${i + 1}. ${res.node.name}** (${res.node.type})\n- Path: ${p}\n`;
-          if (res.node.characters) r += `- Text: "${res.node.characters}"\n`;
-          if (res.node.width && res.node.height) r += `- Size: ${res.node.width}x${res.node.height}\n`;
-          if (res.node.x !== undefined) r += `- Position: (${res.node.x}, ${res.node.y})\n`;
-          if (res.node.fills?.[0]?.type === "SOLID") r += `- Fill: ${res.node.fills[0].color}\n`;
-          r += "\n";
-        });
-        return ok(r);
+        try {
+          const design = await resolveDesign(args);
+          const ql = q.toLowerCase();
+          const results = findNodes(design.nodes || [], n => (n.name && n.name.toLowerCase().includes(ql)) || (n.type === "TEXT" && n.characters && n.characters.toLowerCase().includes(ql)));
+          if (!results.length) return ok(`No results for "${q}".`);
+          let r = `# Search: "${q}" (${results.length} matches)\n\n`;
+          results.forEach((res, i) => {
+            const p = [...res.path.map(x => x.name), res.node.name].join(" > ");
+            r += `**${i + 1}. ${res.node.name}** (${res.node.type})\n- Path: ${p}\n`;
+            if (res.node.characters) r += `- Text: "${res.node.characters}"\n`;
+            if (res.node.width && res.node.height) r += `- Size: ${res.node.width}x${res.node.height}\n`;
+            if (res.node.x !== undefined) r += `- Position: (${res.node.x}, ${res.node.y})\n`;
+            if (res.node.fills?.[0]?.type === "SOLID") r += `- Fill: ${res.node.fills[0].color}\n`;
+            r += "\n";
+          });
+          return ok(r);
+        } catch (error) { return err(`${error.code ? `${error.code}: ` : ""}${error.message}`); }
       }
 
-      case "get_design_info":
-        return ok(`**Page:** ${currentDesign?.pageName || "—"}\n**File:** ${currentDesign?.fileName || "—"}\n**Type:** ${currentDesign?.type || "—"}\n**Source:** ${currentDesign?.source || "legacy-plugin"}\n**Nodes:** ${currentDesign?.nodeCount ?? 0}\n**Synced at:** ${currentDesign?.syncedAt || currentDesign?.savedAt || "Never"}\n**Data dir:** ${DATA_DIR}`);
+      case "get_design_info": {
+        try {
+          const design = await resolveDesign(args);
+          return ok(`**Page:** ${design?.pageName || "—"}\n**File:** ${design?.fileName || "—"}\n**Type:** ${design?.type || "—"}\n**Source:** ${design?.source || "legacy-plugin"}\n**Nodes:** ${design?.nodeCount ?? 0}\n**Synced at:** ${design?.syncedAt || design?.savedAt || "Never"}\n**Data dir:** ${DATA_DIR}`);
+        } catch (error) { return err(`${error.code ? `${error.code}: ` : ""}${error.message}`); }
+      }
 
       default:
         return err(`Unknown tool: ${name}`);
@@ -373,9 +444,14 @@ async function startMCP() {
 
 // ── Entry ──────────────────────────────────────────────────
 
-process.on("SIGINT", () => { log("Shutting down..."); process.exit(0); });
-process.on("SIGTERM", () => { log("Shutting down..."); process.exit(0); });
+async function shutdown() {
+  log("Shutting down...");
+  try { if (bridgeDescriptor?.owned) await bridgeDescriptor.close(); } catch {}
+  process.exit(0);
+}
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);
 
 ensureDirs();
-serve();
+await ensureBridge();
 await startMCP();

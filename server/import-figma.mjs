@@ -1,7 +1,11 @@
 #!/usr/bin/env node
 import figmaApi from "./figma-api.js";
+import dataDirModule from "./data-dir.js";
+import tokenModule from "./bridge/token.js";
 
 const { fetchFigmaDesign } = figmaApi;
+const { resolveDataDir } = dataDirModule;
+const { readToken } = tokenModule;
 const source = process.argv[2];
 
 if (!source || source === "--help" || source === "-h") {
@@ -10,15 +14,35 @@ if (!source || source === "--help" || source === "-h") {
   process.exit(source ? 0 : 1);
 }
 
+// POST /design requires the bridge token. An explicit FIGMA_BRIDGE_TOKEN wins so
+// that this can import into a bridge whose data directory is not readable here;
+// otherwise the stored token is read from the same directory the server uses.
+function resolveBridgeToken() {
+  const fromEnv = process.env.FIGMA_BRIDGE_TOKEN;
+  if (fromEnv) return fromEnv.trim();
+  const stored = readToken(resolveDataDir());
+  return stored ? stored.token : null;
+}
+
 try {
   const design = await fetchFigmaDesign(source);
   const bridgeUrl = (process.env.FIGMA_BRIDGE_URL || "http://127.0.0.1:3456").replace(/\/$/, "");
+  const bridgeToken = resolveBridgeToken();
+  const headers = { "Content-Type": "application/json" };
+  if (bridgeToken) headers.Authorization = `Bearer ${bridgeToken}`;
+
   const response = await fetch(`${bridgeUrl}/design`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers,
     body: JSON.stringify(design),
   });
   const result = await response.json().catch(() => ({}));
+  if (response.status === 401) {
+    throw new Error(
+      "The bridge rejected the token. Run `npm run bridge:token` and either export " +
+      "FIGMA_BRIDGE_TOKEN or point FIGMA_BRIDGE_DATA_DIR at the directory the server uses."
+    );
+  }
   if (!response.ok) throw new Error(result.error || `Bridge returned HTTP ${response.status}`);
 
   console.log(`Imported "${design.pageName}" (${design.nodeCount} nodes) from Figma.`);

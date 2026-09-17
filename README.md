@@ -1,5 +1,7 @@
 # 🎨 Figma Design Bridge
 
+[![CI](https://github.com/nathanpixodeo/figma-design-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/nathanpixodeo/figma-design-bridge/actions/workflows/ci.yml)
+
 **Let AI coding assistants read Figma designs from a local cache.**
 
 Figma Design Bridge normalizes design data into an agent-friendly local snapshot
@@ -19,11 +21,16 @@ identically afterwards. Pick the plugin path if you can install a local plugin
 in Figma; pick the REST path if you cannot, or if you want to pull files you do
 not have open.
 
+Neither path needs a Figma token to *read* the cache, but both need the local
+**bridge token** to talk to the HTTP server — see
+[Pair with the bridge token](#3-pair-with-the-bridge-token). The two tokens are
+unrelated: the Figma one authenticates you to Figma, the bridge one keeps other
+programs on your machine out of your design data.
+
 A third, request-driven path is being built alongside them: a plugin-first
 bridge where you paste any node URL and the agent reads that node live from the
-open Figma document, with no REST token and no manual Sync click. Phase 1 (the
-shared daemon, request broker and cache) is implemented and tested but not yet
-wired in — see
+open Figma document, with no REST token and no manual Sync click. It is wired up
+but not yet proven end to end in Figma, so it is not a supported path yet — see
 [Request-Driven Plugin Bridge](#request-driven-plugin-bridge-phase-1).
 
 ---
@@ -31,8 +38,8 @@ wired in — see
 ## Architecture
 
 ```text
-   Plugin path (no token)          REST path (token required)
-   ──────────────────────          ──────────────────────────
+   Plugin path (no Figma token)    REST path (Figma token required)
+   ────────────────────────────    ────────────────────────────────
    Figma plugin, open document     Figma URL + personal access token
               │                                  │
               │ POST /design                     ▼
@@ -81,8 +88,10 @@ Agents query the cached data; reading and searching never call Figma again.
 to create one. Starter accounts are subject to Figma's API limits, so the bridge
 caches every successful import.
 
-**The plugin path needs no token.** If you are using the plugin, skip the token
-step below and go to [Figma Plugin](#figma-plugin-token-free-path).
+**The plugin path needs no Figma token.** If you are using the plugin, skip the
+Figma token step below and go to
+[Figma Plugin](#figma-plugin-token-free-path). You will still pair the plugin
+with the bridge token in [step 3](#3-pair-with-the-bridge-token).
 
 ### 1. Clone & Install
 
@@ -99,9 +108,9 @@ npm install
 
 ### 2. Start the Server
 
-If you intend to use the REST path, set the token in the shell that starts the
-bridge. Never commit it to the repository. Skip this if you are using the
-plugin — the server starts and accepts plugin syncs without any token.
+If you intend to use the REST path, set the Figma token in the shell that starts
+the bridge. Never commit it to the repository. Skip this if you are using the
+plugin — the server starts and accepts plugin syncs without a Figma credential.
 
 ```powershell
 $env:FIGMA_ACCESS_TOKEN="figd_your_token"
@@ -138,22 +147,65 @@ Every setting also has an environment variable: `FIGMA_BRIDGE_PORT`,
 FIGMA_BRIDGE_PORT=4567 node server/index.js
 ```
 
-**The server binds `127.0.0.1` only.** None of the routes in this document are
-authenticated, so anyone who could reach the port could read, overwrite, or
-delete the cached design; keeping the listener on loopback is what makes that
-require access to the machine itself. `FIGMA_BRIDGE_HOST` overrides it for cases
-that genuinely need it, such as a container that has to be reachable from its
-host — the server logs a warning at startup whenever the bind address is not
+**The server binds `127.0.0.1` only.** `FIGMA_BRIDGE_HOST` overrides that for
+cases that genuinely need it, such as a container that has to be reachable from
+its host — the server logs a warning at startup whenever the bind address is not
 loopback. Do not set it on a shared network.
 
-### 3a. Sync from the plugin (no token)
+A loopback port is not a private port, though: a browser runs on the same
+machine, so a page you have open can issue requests to `127.0.0.1`. Three
+controls apply to every route, and all three are on by default — see
+[SECURITY.md](SECURITY.md) and
+[docs/SERVER_API.md](docs/SERVER_API.md#access-control).
+
+1. The listener binds loopback.
+2. A request whose `Host` header names anything but a loopback host gets `403`,
+   which defeats DNS rebinding. A cross-origin `Origin` gets `403` too, and no
+   response ever carries `Access-Control-Allow-Origin: *`.
+3. Every route except `GET /` and `GET /health` requires the bridge token.
+
+### 3. Pair with the Bridge Token
+
+Everything that reads or writes design data needs a local token. The server
+creates one on first start and keeps it in `<dataDir>/bridge-token.json`. Print
+it with:
+
+```bash
+npm run bridge:token
+```
+
+Send it as `Authorization: Bearer <token>` or `X-Bridge-Token: <token>`. To
+revoke it and unpair every client, run `npm run bridge:token:rotate`.
+
+Every shell example in this README assumes `$BRIDGE_TOKEN`, so export it once:
+
+```bash
+export BRIDGE_TOKEN="$(npm run --silent bridge:token)"
+```
+
+`npm run import:figma` finds the token by itself, from `FIGMA_BRIDGE_TOKEN` if
+that is set and otherwise from the data directory.
+
+The Figma plugin has a **Bridge token** field in its panel: paste the value
+there once and it is remembered per Figma user, so subsequent syncs authenticate
+themselves.
+
+> **Breaking change in 1.1.0.** `/design`, `/snapshots` and the rest used to
+> answer without a token. Scripts written against 1.0.x get `401` until they
+> send one. `FIGMA_BRIDGE_ALLOW_ANONYMOUS_LEGACY=1` restores the old behaviour
+> for scripts that cannot be updated yet; the server then warns at every startup
+> and **any web page open on your machine can read, overwrite or delete the
+> cached design**. The `Host` and `Origin` checks still apply.
+
+### 4a. Sync from the plugin (no Figma token)
 
 Install `plugin/` as a local development plugin (see
-[Figma Plugin](#figma-plugin-token-free-path)), open the file you want, then run
+[Figma Plugin](#figma-plugin-token-free-path)), open the file you want, paste the
+bridge token into the plugin's **Bridge token** field, then run
 **Plugins → Development → Design Bridge → Sync Full Page**. The plugin posts the
-page straight to the running server. Nothing else is needed.
+page straight to the running server.
 
-### 3b. Import a Design from Chrome (REST path, token required)
+### 4b. Import a Design from Chrome (REST path, Figma token required)
 
 Copy the design URL from Chrome. If the URL contains `node-id`, only that node is imported; otherwise the full file is imported.
 
@@ -165,37 +217,42 @@ Alternatively, ask the running HTTP server to fetch it:
 
 ```bash
 curl -X POST http://localhost:3456/figma/import \
+  -H "Authorization: Bearer $BRIDGE_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"source":"https://www.figma.com/design/FILE_KEY/Design?node-id=1-2"}'
 ```
 
-### 4. Query the Cached Design
+### 5. Query the Cached Design
 
 Once the design is synced, point Claude CLI to the server:
 
 ```bash
 # Get a markdown summary of the entire design
-curl http://localhost:3456/design/summary
+curl -H "Authorization: Bearer $BRIDGE_TOKEN" http://localhost:3456/design/summary
 
 # ASCII tree of the layer hierarchy
-curl http://localhost:3456/design/tree
+curl -H "Authorization: Bearer $BRIDGE_TOKEN" http://localhost:3456/design/tree
 
 # All text content extracted from the design
-curl http://localhost:3456/design/texts
+curl -H "Authorization: Bearer $BRIDGE_TOKEN" http://localhost:3456/design/texts
 
 # Color palette analysis
-curl http://localhost:3456/design/colors
+curl -H "Authorization: Bearer $BRIDGE_TOKEN" http://localhost:3456/design/colors
 
 # Search nodes by name or text content
-curl "http://localhost:3456/design/search?q=button"
+curl -H "Authorization: Bearer $BRIDGE_TOKEN" "http://localhost:3456/design/search?q=button"
 
 # Full JSON design tree
-curl http://localhost:3456/design
+curl -H "Authorization: Bearer $BRIDGE_TOKEN" http://localhost:3456/design
 ```
 
 ---
 
 ## Server API Reference
+
+Every example below assumes `$BRIDGE_TOKEN` holds the bridge token, as in
+[step 3](#3-pair-with-the-bridge-token). `GET /` and `GET /health` are the only
+routes that answer without it; everything else returns `401`.
 
 ### `GET /health`
 
@@ -232,14 +289,16 @@ curl http://localhost:3456/health
 
 ### `POST /design`
 
-Receive already-normalized design data. This is the endpoint the Figma plugin posts to, and it is also used by the CLI importer. It requires no Figma access token.
+Receive already-normalized design data. This is the endpoint the Figma plugin posts to, and it is also used by the CLI importer. It requires no Figma access token — the bridge token is what it checks.
 
 The server validates incoming data and returns proper error codes:
 - `400` — invalid or missing fields
+- `401` — missing or wrong bridge token
 - `413` — payload exceeds maximum size
 
 ```bash
 curl -X POST http://localhost:3456/design \
+  -H "Authorization: Bearer $BRIDGE_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"pageName":"Page 1","nodes":[...],"nodeCount":142}'
 ```
@@ -250,6 +309,7 @@ Fetch a Figma URL or file key through the official REST API, normalize it, cache
 
 ```bash
 curl -X POST http://localhost:3456/figma/import \
+  -H "Authorization: Bearer $BRIDGE_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"source":"https://www.figma.com/design/FILE_KEY/Design","nodeIds":["1:2"]}'
 ```
@@ -300,7 +360,7 @@ Page 1
 Extracts every text node in the design:
 
 ```bash
-curl http://localhost:3456/design/texts
+curl -H "Authorization: Bearer $BRIDGE_TOKEN" http://localhost:3456/design/texts
 ```
 
 ```json
@@ -325,7 +385,7 @@ curl http://localhost:3456/design/texts
 Returns all unique colors used in fills and strokes, grouped by color, with usage locations:
 
 ```bash
-curl http://localhost:3456/design/colors
+curl -H "Authorization: Bearer $BRIDGE_TOKEN" http://localhost:3456/design/colors
 ```
 
 ```json
@@ -342,7 +402,7 @@ curl http://localhost:3456/design/colors
 Search nodes by name or text content (case-insensitive):
 
 ```bash
-curl "http://localhost:3456/design/search?q=button"
+curl -H "Authorization: Bearer $BRIDGE_TOKEN" "http://localhost:3456/design/search?q=button"
 ```
 
 ```json
@@ -368,7 +428,7 @@ curl "http://localhost:3456/design/search?q=button"
 Clears the current design from the server memory.
 
 ```bash
-curl -X DELETE http://localhost:3456/design
+curl -H "Authorization: Bearer $BRIDGE_TOKEN" -X DELETE http://localhost:3456/design
 ```
 
 ```json
@@ -380,7 +440,7 @@ curl -X DELETE http://localhost:3456/design
 Lists all saved design snapshots on disk.
 
 ```bash
-curl http://localhost:3456/snapshots
+curl -H "Authorization: Bearer $BRIDGE_TOKEN" http://localhost:3456/snapshots
 ```
 
 ```json
@@ -407,7 +467,7 @@ Newest first. A snapshot whose contents cannot be read still appears, with an
 Loads a specific snapshot into memory, replacing the current design.
 
 ```bash
-curl http://localhost:3456/snapshots/design-2026-06-15T10-30-00.json
+curl -H "Authorization: Bearer $BRIDGE_TOKEN" http://localhost:3456/snapshots/design-2026-06-15T10-30-00.json
 ```
 
 ---
@@ -438,11 +498,12 @@ The server validates all incoming request payloads and returns appropriate HTTP 
 
 ## Request-Driven Plugin Bridge (Phase 1)
 
-> **Status: implemented and tested, not yet wired in.** The modules under
-> `server/bridge/` are complete and covered by tests, but neither the running
-> HTTP server nor the MCP server mounts them yet, and the Figma plugin does not
-> speak this protocol yet. Nothing in this section changes how the bridge behaves
-> today. Phase 2 connects the pieces.
+> **Status: phase 1 complete, phase 2 in progress.** The modules under
+> `server/bridge/` are covered by tests and the HTTP server mounts them under
+> `/bridge/`, and the Figma plugin now opens a session and answers polls. What is
+> still missing is the manual Figma acceptance run described under
+> [Known gaps](#known-gaps-before-this-works-end-to-end), so treat this path as
+> unproven end to end and keep using the two paths above for real work.
 
 The REST import path above works, but it has a shape problem: it needs a personal
 access token, it caches one global "current design" that every sync replaces, and
@@ -507,11 +568,13 @@ Phase breakdown and acceptance cases:
 ### Running the tests
 
 ```bash
-node --test
+npm test
 ```
 
-This runs the whole suite — the bridge modules plus the existing serializer and
-REST-import tests.
+This runs the whole suite — the bridge modules, the legacy access-control tests,
+the plugin serializer and the REST importer. No network and no Figma credential
+are involved; every test uses a temporary data directory and a free port. CI runs
+the same command on Linux and Windows against Node 20, 22 and 24.
 
 ### Known gaps before this works end to end
 
@@ -527,6 +590,10 @@ and the only one that needs no Figma access token: it runs inside the document
 you already have open and posts to your local bridge directly. Install it as a
 local development plugin via **Plugins → Development → Import plugin from
 manifest…**, pointing at `plugin/manifest.json`.
+
+It still needs the local bridge token. Paste the output of
+`npm run bridge:token` into the panel's **Bridge token** field; the plugin stores
+it per Figma user, so this is a one-time step per machine.
 
 ### Network access
 
@@ -626,7 +693,7 @@ claude plugin install figma-bridge@figma-design-bridge
 | --- | --- |
 | `/figma-bridge:verify <node-url> <paths...>` | Compares front-end code against the design and reports every mismatch |
 | `/figma-bridge:page [summary\|tree\|texts\|colors]` | Shows what is currently in the cache, and how stale it is |
-| `/figma-bridge:sync <figma-url>` | Pulls a file or node through the REST API (needs a token) |
+| `/figma-bridge:sync <figma-url>` | Pulls a file or node through the REST API (needs a Figma token) |
 
 The plugin resolves its own paths through `${CLAUDE_PLUGIN_ROOT}`, so nothing breaks when the clone moves, and it caches designs in `${CLAUDE_PLUGIN_DATA}`, which survives plugin updates.
 
@@ -636,6 +703,13 @@ That data directory is the one thing worth understanding before you sync. The MC
 # print the directory the plugin's MCP server is reading
 # (also shown by /figma-bridge:page)
 FIGMA_BRIDGE_DATA_DIR="<that path>" node server/index.js
+```
+
+The bridge token lives in that same directory, so the token the Figma plugin has
+to be paired with is the one belonging to whichever process owns port 3456:
+
+```bash
+FIGMA_BRIDGE_DATA_DIR="<that path>" npm run bridge:token
 ```
 
 For Codex CLI, see [`integrations/codex/README.md`](integrations/codex/README.md).
@@ -705,14 +779,14 @@ If you prefer the HTTP API instead of MCP:
 npm start
 
 # In another terminal, query the design
-curl http://localhost:3456/design/summary | \
+curl -H "Authorization: Bearer $BRIDGE_TOKEN" http://localhost:3456/design/summary | \
   claude -p "Analyze this Figma design and suggest improvements"
 ```
 
 Or search for specific elements:
 
 ```bash
-TEXTS=$(curl -s http://localhost:3456/design/texts)
+TEXTS=$(curl -s -H "Authorization: Bearer $BRIDGE_TOKEN" http://localhost:3456/design/texts)
 claude -p "Based on these text nodes, write better copy for the landing page: $TEXTS"
 ```
 
@@ -722,6 +796,9 @@ claude -p "Based on these text nodes, write better copy for the landing page: $T
 
 | Problem | Solution |
 |---------|----------|
+| HTTP `401` from `/design` or `/snapshots` | Send the bridge token: `npm run bridge:token`, then `-H "Authorization: Bearer <token>"`. In the Figma plugin, paste it into the **Bridge token** field. |
+| HTTP `403` "addressed to a loopback host" | Reach the server as `localhost` or `127.0.0.1`, not through another host name or a reverse proxy that rewrites `Host`. |
+| HTTP `403` "origin is not allowed" | The request came from a web page on a real origin. Only the Figma plugin iframe (`Origin: null`) and loopback origins are allowed. |
 | `Missing FIGMA_ACCESS_TOKEN` | Export the token before starting the HTTP/MCP process, then restart it. |
 | Figma API `403` | Verify `file_content:read` scope and that the token owner can view the file. |
 | Figma API `429` | Wait for the reported retry period; use cached design tools instead of repeatedly syncing. |
@@ -746,8 +823,11 @@ figma-bridge/
 │   ├── figma-api.js           # Figma REST client + schema normalizer
 │   ├── figma-api.test.js      # Normalizer/import tests
 │   ├── import-figma.mjs       # CLI importer
+│   ├── bridge-token.js        # Prints/rotates the bridge token
+│   ├── data-dir.js            # Read-only data-directory resolution
 │   ├── package.json           # Server metadata
 │   ├── index.js               # HTTP server
+│   ├── legacy-auth.test.js    # Access control on the snapshot routes
 │   ├── mcp.mjs                # MCP server (requires @modelcontextprotocol/sdk)
 │   └── bridge/                # Request-driven plugin bridge (phase 1, not yet wired in)
 │       ├── identity.js        # Figma URL/node-id parsing and cache keys
@@ -763,10 +843,21 @@ figma-bridge/
 │   ├── SERVER_API.md          # REST/snapshot server API
 │   ├── BRIDGE_PROTOCOL.md     # /bridge/* route contract
 │   └── PLAN_PLUGIN_ON_DEMAND_MCP.md  # Implementation plan and acceptance cases
+├── .github/workflows/ci.yml   # Tests on Linux + Windows, Node 20/22/24
+├── SECURITY.md                # Threat model and how to report a vulnerability
 ├── README.md
 ├── LICENSE
 └── .gitignore
 ```
+
+---
+
+## Security
+
+The bridge holds a copy of whatever design was last synced, which can include
+unreleased work. [SECURITY.md](SECURITY.md) describes the threat model — the
+network, the browser and the token — and how to report a vulnerability
+privately. Please do not open a public issue for anything exploitable.
 
 ---
 

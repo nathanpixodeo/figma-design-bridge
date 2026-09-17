@@ -11,6 +11,8 @@
     "reasoning": "The plugin sends the current page or selection to a Design Bridge server the user runs on their own machine. It contacts no external service, so production network access is 'none' and the loopback origin is declared for development only."
   },
   "menu": [
+    { "command": "bridge", "name": "Connect On-Demand Bridge" },
+    { "separator": true },
     {
       "name": "Sync Design",
       "menu": [

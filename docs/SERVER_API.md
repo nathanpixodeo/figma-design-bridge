@@ -2,13 +2,27 @@
 
 Base URL: `http://127.0.0.1:3456` (port configurable via `FIGMA_BRIDGE_PORT`)
 
-The listener binds the loopback interface and nothing else. Because every route below is unauthenticated, that bind address is the only thing separating the cached design from the rest of the network. `FIGMA_BRIDGE_HOST` can override it — the server warns at startup when the result is not loopback — but on a shared network doing so exposes read, overwrite, and delete of the current design to anyone who can reach the port.
+All endpoints return JSON unless otherwise noted. Design data reaches the server by either of two supported paths: the Figma plugin posts it to `POST /design`, or `POST /figma/import` pulls it through the official Figma REST API using `FIGMA_ACCESS_TOKEN`. Both produce the same normalized schema.
 
-All endpoints return JSON unless otherwise noted. CORS headers are set on every response (`Access-Control-Allow-Origin: *`). Design data reaches the server by either of two supported paths: the Figma plugin posts it to `POST /design` with no access token, or `POST /figma/import` pulls it through the official Figma REST API using `FIGMA_ACCESS_TOKEN`. Both produce the same normalized schema.
+## Access control
+
+Three controls apply to every route in this document. They exist because a loopback port is not a private port: a browser runs on the same machine, so a page the user has open can issue requests to `127.0.0.1`.
+
+1. **Loopback bind.** The listener binds `127.0.0.1` and nothing else. `FIGMA_BRIDGE_HOST` overrides it — the server warns at startup when the result is not loopback — but on a shared network that exposes the port to everyone who can reach it.
+2. **Loopback `Host` header.** A request whose `Host` names anything else gets `403`. This is what defeats DNS rebinding, where `attacker.example` resolves to `127.0.0.1` and the browser still sends the attacker's host name.
+3. **Bridge token.** Every route except `GET /` and `GET /health` requires the token, sent as `Authorization: Bearer <token>` or `X-Bridge-Token: <token>`. Without it the response is `401`. `npm run bridge:token` prints the token; `npm run bridge:token:rotate` replaces it.
+
+A request carrying a cross-origin `Origin` header is refused with `403`, and no response ever carries `Access-Control-Allow-Origin: *`. An allowed origin is echoed back verbatim alongside `Vary: Origin`. The allow-list is the opaque origin `null`, which is what the Figma plugin's iframe sends, plus `http://localhost` and `http://127.0.0.1` at any port. Because a hostile page can also produce `Origin: null` from a sandboxed iframe, the origin check is defence in depth and the token is what actually separates the two.
+
+```bash
+curl -H "Authorization: Bearer $(npm run --silent bridge:token)" http://127.0.0.1:3456/design
+```
+
+> **Breaking change in 1.1.0.** These routes used to answer without a token and returned `Access-Control-Allow-Origin: *`. `FIGMA_BRIDGE_ALLOW_ANONYMOUS_LEGACY=1` restores the old token-free behaviour for scripts that cannot be updated yet; the server then warns at every startup, and the `Host` and `Origin` checks still apply. See [SECURITY.md](../SECURITY.md).
 
 > This project also includes a **native MCP server** (`server/mcp.mjs`) — see the [README](../README.md#mcp-model-context-protocol-support) for Claude Code integration.
 
-> **Scope of this document.** Everything below describes the snapshot-based REST-import server: unauthenticated, wildcard CORS, and one global "current design" that each sync replaces. The request-driven plugin bridge is a separate surface under the `/bridge/` prefix with its own authentication, per-file isolation and freshness rules — see [BRIDGE_PROTOCOL.md](./BRIDGE_PROTOCOL.md). The wildcard CORS and unauthenticated access described here do **not** apply to `/bridge/*`.
+> **Scope of this document.** Everything below describes the snapshot-based REST-import server, which keeps one global "current design" that each sync replaces. The request-driven plugin bridge is a separate surface under the `/bridge/` prefix with per-file isolation and freshness rules of its own — see [BRIDGE_PROTOCOL.md](./BRIDGE_PROTOCOL.md).
 
 ---
 
@@ -494,20 +508,30 @@ Error responses follow this format:
 
 ## CORS
 
-All responses from the endpoints documented above include:
+A request with no `Origin` header — every `curl`, every server-side client — gets
+no CORS headers back and is unaffected by this section.
+
+A request from an allowed origin gets that origin echoed back, never `*`:
 
 ```
-Access-Control-Allow-Origin: *
+Access-Control-Allow-Origin: null
 Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS
-Access-Control-Allow-Headers: Content-Type
+Access-Control-Allow-Headers: Content-Type, Authorization, X-Bridge-Token
+Access-Control-Max-Age: 600
+Vary: Origin
 ```
 
-Preflight `OPTIONS` requests are handled with HTTP 204.
+The allow-list is the opaque origin `null`, which is what the Figma plugin's
+iframe sends, plus `http://localhost` and `http://127.0.0.1` at any port. Any
+other `Origin` is refused with `403` and no CORS headers, preflight included, so
+a page on a real web origin cannot read a response even if it guesses the token.
 
-Routes under `/bridge/` do not use these headers. They answer only to an explicit
-origin allowlist (defaulting to the Figma plugin iframe's opaque `null` origin),
-require a bearer token, and reject requests whose `Host` header is not a loopback
-host. See [BRIDGE_PROTOCOL.md](./BRIDGE_PROTOCOL.md#authentication).
+Preflight `OPTIONS` requests from an allowed origin are answered with HTTP 204.
+They carry no token, so the token check does not apply to them; the request that
+follows still needs one.
+
+Routes under `/bridge/` use the same three controls with their own configurable
+allow-list. See [BRIDGE_PROTOCOL.md](./BRIDGE_PROTOCOL.md#authentication).
 
 ---
 
