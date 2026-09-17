@@ -1,6 +1,8 @@
 # Server API Documentation
 
-Base URL: `http://localhost:3456` (configurable via `FIGMA_BRIDGE_PORT`)
+Base URL: `http://127.0.0.1:3456` (port configurable via `FIGMA_BRIDGE_PORT`)
+
+The listener binds the loopback interface and nothing else. Because every route below is unauthenticated, that bind address is the only thing separating the cached design from the rest of the network. `FIGMA_BRIDGE_HOST` can override it — the server warns at startup when the result is not loopback — but on a shared network doing so exposes read, overwrite, and delete of the current design to anyone who can reach the port.
 
 All endpoints return JSON unless otherwise noted. CORS headers are set on every response (`Access-Control-Allow-Origin: *`). Design data reaches the server by either of two supported paths: the Figma plugin posts it to `POST /design` with no access token, or `POST /figma/import` pulls it through the official Figma REST API using `FIGMA_ACCESS_TOKEN`. Both produce the same normalized schema.
 

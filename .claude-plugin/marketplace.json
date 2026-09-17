@@ -10,7 +10,7 @@
       "name": "figma-bridge",
       "source": ".",
       "description": "Read Figma designs from a local cache and check front-end code against them.",
-      "version": "1.0.1"
+      "version": "1.0.2"
     }
   ]
 }

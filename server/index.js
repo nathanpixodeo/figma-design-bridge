@@ -30,6 +30,12 @@ function loadConfig() {
 
 const config = loadConfig()
 const port = parseInt(process.env.FIGMA_BRIDGE_PORT || config.port, 10)
+// No route on this server is authenticated, so reaching it has to require being
+// on this machine. Binding elsewhere is possible — a container that must be
+// reachable from its host, for one — but it has to be asked for, and it is
+// announced at startup rather than happening by default.
+const host = process.env.FIGMA_BRIDGE_HOST || config.host || '127.0.0.1'
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1'])
 const dataDir = process.env.FIGMA_BRIDGE_DATA_DIR || config.dataDir
 const maxSnapshots = parseInt(process.env.FIGMA_BRIDGE_MAX_SNAPSHOTS || config.maxSnapshots, 10)
 const logLevel = process.env.FIGMA_BRIDGE_LOG_LEVEL || config.logLevel
@@ -529,8 +535,13 @@ function shutdown(signal) {
 process.on('SIGINT', () => shutdown('SIGINT'))
 process.on('SIGTERM', () => shutdown('SIGTERM'))
 
-server.listen(port, () => {
-  log('info', `Server started on http://localhost:${port}`)
+server.listen(port, host, () => {
+  log('info', `Server started on http://${host}:${port}`)
+  if (!LOOPBACK_HOSTS.has(host)) {
+    log('warn', `Listening on ${host}, which is not loopback. These routes have no `
+      + `authentication: anyone who can reach this address can read, overwrite, or `
+      + `delete the cached design. Unset FIGMA_BRIDGE_HOST to bind 127.0.0.1 only.`)
+  }
   log('info', `Data directory: ${dataDir}`)
   log('info', `Max snapshots: ${maxSnapshots}`)
   console.log('')

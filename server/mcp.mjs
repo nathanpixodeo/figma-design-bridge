@@ -15,6 +15,10 @@ const { fetchFigmaDesign } = figmaApi;
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = parseInt(process.env.FIGMA_BRIDGE_PORT || "3456", 10);
+// The ingest listener below is unauthenticated, so it stays on loopback unless
+// the operator asks for something else. See the warning in serve().
+const HOST = process.env.FIGMA_BRIDGE_HOST || "127.0.0.1";
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1"]);
 const DATA_DIR = process.env.FIGMA_BRIDGE_DATA_DIR || path.join(__dirname, "data");
 const MAX_SNAPSHOTS = parseInt(process.env.FIGMA_BRIDGE_MAX_SNAPSHOTS || "50", 10);
 const snapsDir = path.join(DATA_DIR, "snapshots");
@@ -212,7 +216,14 @@ function serve() {
     }
     log(`HTTP server error: ${error.message}; continuing with MCP over stdio only.`);
   });
-  srv.listen(PORT, () => log(`HTTP server on http://localhost:${PORT}`));
+  srv.listen(PORT, HOST, () => {
+    log(`HTTP server on http://${HOST}:${PORT}`);
+    if (!LOOPBACK_HOSTS.has(HOST)) {
+      log(`Listening on ${HOST}, which is not loopback. This ingest endpoint has no `
+        + `authentication: anyone who can reach this address can overwrite the cached `
+        + `design. Unset FIGMA_BRIDGE_HOST to bind 127.0.0.1 only.`);
+    }
+  });
   return srv;
 }
 

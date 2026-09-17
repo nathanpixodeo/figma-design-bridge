@@ -131,10 +131,20 @@ To customize settings, edit `server/config.json` before starting:
 }
 ```
 
-You can also override the port via environment variable:
+Every setting also has an environment variable: `FIGMA_BRIDGE_PORT`,
+`FIGMA_BRIDGE_DATA_DIR`, `FIGMA_BRIDGE_MAX_SNAPSHOTS`, `FIGMA_BRIDGE_LOG_LEVEL`.
+
 ```bash
 FIGMA_BRIDGE_PORT=4567 node server/index.js
 ```
+
+**The server binds `127.0.0.1` only.** None of the routes in this document are
+authenticated, so anyone who could reach the port could read, overwrite, or
+delete the cached design; keeping the listener on loopback is what makes that
+require access to the machine itself. `FIGMA_BRIDGE_HOST` overrides it for cases
+that genuinely need it, such as a container that has to be reachable from its
+host — the server logs a warning at startup whenever the bind address is not
+loopback. Do not set it on a shared network.
 
 ### 3a. Sync from the plugin (no token)
 
