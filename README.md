@@ -1,13 +1,29 @@
 # 🎨 Figma Design Bridge
 
-**Let AI coding assistants read Figma designs without installing a Figma plugin.**
+**Let AI coding assistants read Figma designs from a local cache.**
 
-Figma Design Bridge imports design data through the official Figma REST API, normalizes it into an agent-friendly local snapshot, and exposes it through both HTTP and MCP. A legacy Figma plugin remains available, but it is no longer required.
+Figma Design Bridge normalizes design data into an agent-friendly local snapshot
+and exposes it through both HTTP and MCP. There are two independent ways to get
+design data in, and you only need one of them:
 
-A second, request-driven path is being built alongside it: a plugin-first bridge
-where you paste any node URL and the agent reads that node live from the open
-Figma document, with no REST token. Phase 1 (the shared daemon, request broker
-and cache) is implemented and tested but not yet wired in — see
+| | **Plugin path** | **REST path** |
+|---|---|---|
+| How data arrives | The Figma plugin pushes the current page or selection | The server pulls a Figma URL through the official REST API |
+| Figma access token | **Not needed** | Required (`file_content:read`) |
+| Needs plugin install | Yes, as a local development plugin | No |
+| Reaches | The document you have open | Any file the token can read |
+| Rate limits | None | Figma's API limits apply |
+
+Both write to the same cache, so every MCP tool and HTTP route behaves
+identically afterwards. Pick the plugin path if you can install a local plugin
+in Figma; pick the REST path if you cannot, or if you want to pull files you do
+not have open.
+
+A third, request-driven path is being built alongside them: a plugin-first
+bridge where you paste any node URL and the agent reads that node live from the
+open Figma document, with no REST token and no manual Sync click. Phase 1 (the
+shared daemon, request broker and cache) is implemented and tested but not yet
+wired in — see
 [Request-Driven Plugin Bridge](#request-driven-plugin-bridge-phase-1).
 
 ---
@@ -15,29 +31,40 @@ and cache) is implemented and tested but not yet wired in — see
 ## Architecture
 
 ```text
-Figma URL + Personal Access Token
-                 │
-                 ▼
-       Official Figma REST API
-                 │
-                 ▼
-     Normalize and cache locally
-                 │
-         ┌───────┴────────┐
-         ▼                ▼
-     MCP tools        HTTP API
-         │                │
-         └───────┬────────┘
-                 ▼
-       Claude Code / AI agents
+   Plugin path (no token)          REST path (token required)
+   ──────────────────────          ──────────────────────────
+   Figma plugin, open document     Figma URL + personal access token
+              │                                  │
+              │ POST /design                     ▼
+              │                        Official Figma REST API
+              │                                  │
+              └───────────────┬──────────────────┘
+                              ▼
+                  Normalize and cache locally
+                   (latest.json + snapshots)
+                              │
+                      ┌───────┴────────┐
+                      ▼                ▼
+                  MCP tools        HTTP API
+                      │                │
+                      └───────┬────────┘
+                              ▼
+                    Claude Code / AI agents
 ```
 
 ### How It Works
 
-1. `server/figma-api.js` parses a Figma URL and requests either the full file or the `node-id` embedded in the URL.
-2. The REST response is normalized into the same compact schema used by the bridge: dimensions, text, colors, effects, auto-layout, components, and child nodes.
-3. The normalized design is saved to `server/data/latest.json` plus timestamped snapshots.
-4. Agents query the cached data. Reading/searching never calls Figma again; only an explicit sync consumes an API request.
+**Plugin path.** `plugin/code.js` serializes the current page or selection and
+posts it to `POST /design` on the local server. No Figma credential is involved:
+the plugin already runs inside the document you have open.
+
+**REST path.** `server/figma-api.js` parses a Figma URL and requests either the
+full file or the `node-id` embedded in it, using `FIGMA_ACCESS_TOKEN`.
+
+**Both paths converge.** The incoming design is normalized into one compact
+schema — dimensions, text, colors, effects, auto-layout, components and child
+nodes — then saved to `server/data/latest.json` plus timestamped snapshots.
+Agents query the cached data; reading and searching never call Figma again.
 
 ---
 
@@ -47,9 +74,15 @@ Figma URL + Personal Access Token
 
 - [Node.js](https://nodejs.org/) 18+ (for the local server)
 - A Figma account that can view the target file
-- A Figma personal access token with `file_content:read` scope
 
-See Figma's [authentication guide](https://developers.figma.com/docs/rest-api/authentication/) to create a token. Starter accounts are subject to Figma's API limits, so the bridge caches every successful import.
+**For the REST path only**, also: a Figma personal access token with
+`file_content:read` scope. See Figma's
+[authentication guide](https://developers.figma.com/docs/rest-api/authentication/)
+to create one. Starter accounts are subject to Figma's API limits, so the bridge
+caches every successful import.
+
+**The plugin path needs no token.** If you are using the plugin, skip the token
+step below and go to [Figma Plugin](#figma-plugin-token-free-path).
 
 ### 1. Clone & Install
 
@@ -66,7 +99,9 @@ npm install
 
 ### 2. Start the Server
 
-Set the token in the shell that starts the bridge. Never commit it to the repository.
+If you intend to use the REST path, set the token in the shell that starts the
+bridge. Never commit it to the repository. Skip this if you are using the
+plugin — the server starts and accepts plugin syncs without any token.
 
 ```powershell
 $env:FIGMA_ACCESS_TOKEN="figd_your_token"
@@ -101,7 +136,14 @@ You can also override the port via environment variable:
 FIGMA_BRIDGE_PORT=4567 node server/index.js
 ```
 
-### 3. Import a Design from Chrome
+### 3a. Sync from the plugin (no token)
+
+Install `plugin/` as a local development plugin (see
+[Figma Plugin](#figma-plugin-token-free-path)), open the file you want, then run
+**Plugins → Development → Design Bridge → Sync Full Page**. The plugin posts the
+page straight to the running server. Nothing else is needed.
+
+### 3b. Import a Design from Chrome (REST path, token required)
 
 Copy the design URL from Chrome. If the URL contains `node-id`, only that node is imported; otherwise the full file is imported.
 
@@ -180,7 +222,7 @@ curl http://localhost:3456/health
 
 ### `POST /design`
 
-Receive already-normalized design data. This endpoint remains compatible with the legacy plugin and is also used by the CLI importer.
+Receive already-normalized design data. This is the endpoint the Figma plugin posts to, and it is also used by the CLI importer. It requires no Figma access token.
 
 The server validates incoming data and returns proper error codes:
 - `400` — invalid or missing fields
@@ -334,10 +376,21 @@ curl http://localhost:3456/snapshots
 ```json
 {
   "snapshots": [
-    { "filename": "design-2026-06-15T10-30-00.json", "size": 28416, "savedAt": "2026-06-15T10:30:00.000Z" }
+    {
+      "filename": "2026-06-15T10-30-00.000Z.json",
+      "size": 28416,
+      "pageName": "Page 1",
+      "nodeCount": 142,
+      "syncedAt": "2026-06-15T10:30:00.000Z",
+      "savedAt": "2026-06-15T10:30:00.123Z"
+    }
   ]
 }
 ```
+
+Newest first. A snapshot whose contents cannot be read still appears, with an
+`error` field explaining why instead of missing metadata. Full field reference:
+[docs/SERVER_API.md](docs/SERVER_API.md#get-snapshots).
 
 ### `GET /snapshots/:filename`
 
@@ -473,9 +526,17 @@ REST-import tests.
 
 ---
 
-## Legacy Plugin (Optional)
+## Figma Plugin (Token-Free Path)
 
-The original Desktop development plugin is retained for users who can install local plugins. REST import is the primary path and does not require this plugin.
+The Figma plugin in `plugin/` is a fully supported way to get design data in,
+and the only one that needs no Figma access token: it runs inside the document
+you already have open and posts to your local bridge directly. Install it as a
+local development plugin via **Plugins → Development → Import plugin from
+manifest…**, pointing at `plugin/manifest.json`.
+
+Use the REST path instead if you cannot install local plugins, or if you need to
+read a file you do not have open. The two paths write to the same cache and are
+never both required.
 
 ### Menu Commands
 
@@ -555,7 +616,16 @@ Add to your `claude.json` or MCP config:
 }
 ```
 
-The MCP server communicates with Claude Code via stdio and also starts a local HTTP endpoint on port 3456. **No separate HTTP server is needed.** Restart the MCP client after changing its environment configuration.
+`FIGMA_ACCESS_TOKEN` is only read by the `sync_figma_design` tool. Omit the
+whole `env` block if you feed the bridge from the plugin — every other tool
+reads the local cache and needs no credential.
+
+The MCP server communicates with Claude Code via stdio and also tries to start a
+local HTTP endpoint on port 3456 for plugin syncs. If another process already
+holds that port — typically `node server/index.js` — the MCP server logs the
+clash, skips the listener and keeps serving over stdio, reading snapshots from
+the same data directory. Running both is therefore safe. Restart the MCP client
+after changing its environment configuration.
 
 > **Note:** Use the absolute path to `server/mcp.mjs` in your MCP config.
 

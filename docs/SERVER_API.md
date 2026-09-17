@@ -2,7 +2,7 @@
 
 Base URL: `http://localhost:3456` (configurable via `FIGMA_BRIDGE_PORT`)
 
-All endpoints return JSON unless otherwise noted. CORS headers are set on every response (`Access-Control-Allow-Origin: *`). Design data can be imported through the official Figma REST API; the legacy plugin ingestion endpoint remains supported.
+All endpoints return JSON unless otherwise noted. CORS headers are set on every response (`Access-Control-Allow-Origin: *`). Design data reaches the server by either of two supported paths: the Figma plugin posts it to `POST /design` with no access token, or `POST /figma/import` pulls it through the official Figma REST API using `FIGMA_ACCESS_TOKEN`. Both produce the same normalized schema.
 
 > This project also includes a **native MCP server** (`server/mcp.mjs`) — see the [README](../README.md#mcp-model-context-protocol-support) for Claude Code integration.
 
@@ -153,7 +153,7 @@ The plugin's **Watch Mode** posts a `type: "page"` snapshot on startup and after
 
 ## `GET /design`
 
-Returns the current normalized design data, whether it came from Figma REST import or the legacy plugin.
+Returns the current normalized design data, whether it came from the plugin or a Figma REST import.
 
 **Response `200 OK`:**
 
@@ -438,6 +438,9 @@ Lists all saved snapshot files on disk.
 | `nodeCount` | number | Total number of nodes in the snapshot |
 | `syncedAt` | string (ISO) | Timestamp when the design data was imported or synced |
 | `savedAt` | string (ISO) | Timestamp when the snapshot was written to disk |
+| `error` | string | Only present when the snapshot could not be parsed. `filename` and `size` are still returned; the other fields are absent |
+
+Snapshots are listed newest first.
 
 ---
 
