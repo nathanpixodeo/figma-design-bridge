@@ -9,11 +9,14 @@ Report only. Do not edit code. Stop after the report unless asked to apply the f
 
 ## 1. Establish the design as the source of truth
 
-Use the `figma-bridge` MCP server against the local cache:
+Use the `figma-bridge` MCP server:
 
-- `get_design_info` first, to confirm something is loaded and how old it is.
-- `search_design` to locate the layer named in the arguments.
-- `get_design_texts` and `get_design_colors` for the values.
+- `get_bridge_status` first, to confirm the local bridge is ready.
+- If the first argument is a Figma URL or file key, call `get_design_context`
+  with that value as `source`; otherwise call `get_design_info` for the legacy
+  imported snapshot.
+- Call `search_design`, `get_design_texts`, and `get_design_colors` with the
+  same `source` when reviewing a specific file or node.
 
 The bridge exposes no rendered image. Mark every layout and visual-weight check as **not verified** rather than passed, because they cannot be performed from structural data alone. If another connected server can return a screenshot of the node, use it and say so.
 

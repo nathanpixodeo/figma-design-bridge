@@ -754,20 +754,30 @@ after changing its environment configuration.
 
 | Tool | Description |
 |------|-------------|
+| `get_design_context` | Read a Figma file or exact node through the connected plugin (`source` required; live by default) |
+| `get_bridge_status` | Show bridge readiness, live plugin sessions, cache statistics, and setup hints |
 | `sync_figma_design` | Explicitly fetch a Figma URL/file key, normalize it, and cache it locally |
-| `get_design_summary` | Full markdown summary: screens, layer tree, text, colors, structure |
-| `get_design_tree` | ASCII tree of all layers with types, names, dimensions |
-| `get_design_texts` | All text content with font info and layer paths |
-| `get_design_colors` | Color palette grouped by usage frequency |
-| `search_design` | Search nodes by name or text content (`q` parameter) |
-| `get_design_info` | Basic info: page name, node count, sync timestamp |
+| `get_design_summary` | Full markdown summary for an explicit `source` or the legacy snapshot |
+| `get_design_tree` | ASCII tree for an explicit `source` or the legacy snapshot |
+| `get_design_texts` | Text content for an explicit `source` or the legacy snapshot |
+| `get_design_colors` | Color palette for an explicit `source` or the legacy snapshot |
+| `search_design` | Search an explicit `source` or the legacy snapshot by node name/text (`q` required) |
+| `get_design_info` | Basic info for an explicit `source` or the legacy snapshot |
 
 ### Usage Flow with MCP
 
-1. Export `FIGMA_ACCESS_TOKEN` before starting Claude Code.
-2. Start Claude Code; it auto-starts the MCP server.
-3. Ask: *"Sync this Figma design: https://www.figma.com/design/..."*
-4. After it is cached, ask:
+For a live plugin read, no Figma REST token is needed:
+
+1. Start Claude Code; it auto-starts the MCP server.
+2. Ask: *"Read this Figma design: https://www.figma.com/design/..."*
+3. The agent calls `get_bridge_status`, then `get_design_context` with the
+   exact URL as `source`; use the same `source` for searches and extracted
+   text or colors.
+
+For the explicit REST-import flow, export `FIGMA_ACCESS_TOKEN` before starting
+Claude Code and ask: *"Sync this Figma design: https://www.figma.com/design/..."*
+1. `sync_figma_design` for the explicit import.
+2. The legacy snapshot tools after import, for example:
    - *"What's in the current Figma design?"*
    - *"Extract all the text content and rewrite the hero section copy"*
    - *"Search for all button components in the design"*

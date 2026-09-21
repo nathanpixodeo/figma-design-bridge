@@ -305,7 +305,10 @@ function createRoutes(options = {}) {
         } else if (key === 'maxNodes') {
           if (!isInteger(value, 1, 200_000)) return 'Option "maxNodes" must be an integer between 1 and 200000'
         } else if (key === 'maxBytes') {
-          if (!isInteger(value, 1, 50_000_000)) return 'Option "maxBytes" must be an integer between 1 and 50000000'
+          // The plugin cannot serialize a meaningful response smaller than its
+          // 1 KiB floor. Rejecting a lower request here keeps the advertised
+          // bridge limit equal to the limit the live reader can enforce.
+          if (!isInteger(value, 1024, 50_000_000)) return 'Option "maxBytes" must be an integer between 1024 and 50000000'
         } else if (key === 'includeHidden') {
           if (typeof value !== 'boolean') return 'Option "includeHidden" must be a boolean'
         } else {

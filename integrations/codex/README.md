@@ -1,6 +1,9 @@
 # Codex CLI
 
-Codex has no plugin format, so the bridge is wired in as two separate pieces: the MCP server, and a prompt file.
+Current Codex CLI releases support plugins, but this repository currently ships
+Claude Code plugin metadata only. For Codex, use the MCP registration below;
+the prompt file is an optional manual aid rather than an installable Codex
+plugin.
 
 ## 1. Register the MCP server
 
@@ -29,13 +32,16 @@ Add `FIGMA_ACCESS_TOKEN` to that `env` table only if you want `sync_figma_design
 
 Check it with `codex mcp list`.
 
-## 2. Install the prompt
+## 2. Use the review prompt (optional)
 
-```bash
-mkdir -p ~/.codex/prompts
-cp integrations/codex/prompts/figma-verify.md ~/.codex/prompts/
-```
+The current Codex CLI help exposes no prompt installation command. Copy the
+body of `integrations/codex/prompts/figma-verify.md` into a task when you want
+the repeatable review instructions, or package those instructions into a
+Codex skill in your own environment.
 
-Invoke it as `/figma-verify <figma-node-url> <path/to/component>`. Prompts load at session start, so restart Codex after copying.
+The prompt's MCP calls match the server: use `get_design_info` for the legacy
+cache, or pass `source` to the live-aware tools when reviewing a specific Figma
+file or node. `get_bridge_status` is available for setup diagnostics.
 
-OpenAI has deprecated custom prompts in favour of skills. The prompt still works; if it stops appearing after a Codex upgrade, that is the reason, and the file's body can be moved into a skill unchanged.
+Codex skills are the supported reusable-instruction mechanism. This file can
+be used as the body of a skill if you want a named reusable command.

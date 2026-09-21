@@ -234,7 +234,7 @@ const SOURCE_PROPERTIES = {
   mode: { type: "string", enum: ["live", "cached"], description: "Live by default. Cached mode is explicit opt-in to unverified stale data." },
   depth: { type: "integer", minimum: 0, maximum: 50 },
   maxNodes: { type: "integer", minimum: 1, maximum: 200000 },
-  maxBytes: { type: "integer", minimum: 1, maximum: 50000000 },
+  maxBytes: { type: "integer", minimum: 1024, maximum: 50000000 },
   includeHidden: { type: "boolean" },
 };
 
@@ -258,7 +258,7 @@ async function startMCP() {
             mode: { type: "string", enum: ["live", "cached"], description: "Use live unless the user explicitly asks for cached/offline data." },
             depth: { type: "integer", minimum: 0, maximum: 50 },
             maxNodes: { type: "integer", minimum: 1, maximum: 200000 },
-            maxBytes: { type: "integer", minimum: 1, maximum: 50000000 },
+            maxBytes: { type: "integer", minimum: 1024, maximum: 50000000 },
             includeHidden: { type: "boolean" },
           },
           required: ["source"],

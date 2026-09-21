@@ -441,6 +441,7 @@ test('unknown, missing and wrong-typed read fields are refused with 400', async 
     { source: FILE_URL, options: { unknownOption: 1 } },
     { source: FILE_URL, options: { depth: 'deep' } },
     { source: FILE_URL, options: { depth: 999 } },
+    { source: FILE_URL, options: { maxBytes: 1023 } },
     { source: FILE_URL, options: { includeHidden: 'yes' } },
     { source: FILE_URL, timeoutMs: -1 },
     { source: 'x'.repeat(2400) },

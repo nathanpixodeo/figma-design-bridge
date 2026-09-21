@@ -5,7 +5,10 @@ argument-hint: "[summary|tree|texts|colors]  (default: info)"
 
 Report the state of the local design cache. Argument: `$ARGUMENTS` — which view to show, defaulting to the short one.
 
-Always start with `get_design_info`. It reports the page name, node count, sync timestamp, and the data directory actually in use, which is the fastest way to tell a stale cache from a misconfigured one.
+Always start with `get_bridge_status`, then call `get_design_info`. The status
+tool reports bridge readiness and setup hints without exposing pairing secrets;
+the info tool reports the page name, node count, sync timestamp, and data
+directory actually in use.
 
 Then, depending on the argument:
 

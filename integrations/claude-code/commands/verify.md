@@ -15,7 +15,14 @@ Prefer the official Figma MCP server when it is connected, because it is the onl
 - `get_design_context` on the node — structure, computed styles, and any Code Connect mapping.
 - `get_variable_defs` on the node — design tokens. A hard-coded value in the code that matches a token's *value* is still a finding: it will not follow the token when the token changes.
 
-Otherwise use this plugin's bridge tools against the local cache: `get_design_info` first to confirm something is loaded and how old it is, then `search_design` to locate the layer, and `get_design_texts` and `get_design_colors` for the values. Say in the report that the bridge was used, and mark every layout and visual-weight check as **not verified** rather than passed — the bridge exposes no image, so those checks cannot be performed from it.
+Otherwise use this plugin's bridge tools: call `get_bridge_status` first for
+setup diagnostics. If the first argument is a Figma URL or file key, call
+`get_design_context` with it as `source`, then pass the same `source` to
+`search_design`, `get_design_texts`, and `get_design_colors`. Only use
+unscoped `get_design_info` and omit `source` when checking the legacy imported
+snapshot. Say in the report that the bridge was used, and mark every layout and
+visual-weight check as **not verified** rather than passed — the bridge exposes
+no image, so those checks cannot be performed from it.
 
 If neither source is reachable, stop and say which one failed and how to restore it. Do not review the code against assumptions about the design.
 
