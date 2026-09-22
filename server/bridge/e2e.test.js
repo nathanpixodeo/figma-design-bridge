@@ -125,9 +125,10 @@ function createFakePlugin({ t, url, token, fileKey, fileName, instanceId }) {
       // A handler returning null models a plugin that receives the request and
       // never answers. It must not block this loop.
       if (result === null || result === undefined) continue
-      await call('POST', `/bridge/session/${sessionId}/reply`, {
-        body: { requestId: request.requestId, ok: true, result },
-      })
+      const reply = result && typeof result === 'object' && typeof result.ok === 'boolean'
+        ? { requestId: request.requestId, ok: result.ok, result: result.result, error: result.error }
+        : { requestId: request.requestId, ok: true, result }
+      await call('POST', `/bridge/session/${sessionId}/reply`, { body: reply })
     }
     return res
   }
@@ -226,6 +227,33 @@ test('a live read with no plugin connected is 409, never a silent fallback', asy
   // The freshness envelope is present even on the error path, so a caller can
   // never mistake a failure for stale-but-usable data.
   assert.equal(res.body.verifiedFresh, false)
+})
+
+test('a real string plugin failure reaches HTTP as a diagnostic PLUGIN_ERROR without caching secrets', async t => {
+  const { api, plugin, token } = await startBridge(t)
+  const p = plugin()
+  await p.start()
+  p.setHandler(async () => ({
+    ok: false,
+    error: `Could not read node 26164:111624 (INSTANCE LIVE CONTROL SIDE NAV depth0); `
+      + `{"authorization":"Bearer ${token}","sessionSecret":"${p.secret}"}`,
+  }))
+  p.run()
+
+  const res = await api('POST', '/bridge/read', { body: { source: sourceFor(FILE_A, '26164:111624') } })
+  assert.equal(res.status, 502)
+  assert.equal(res.body.code, 'PLUGIN_ERROR')
+  assert.match(res.body.error, /26164:111624/)
+  assert.match(res.body.error, /INSTANCE LIVE CONTROL SIDE NAV depth0/)
+  assert.equal(res.body.error.includes(token), false)
+  assert.equal(res.body.error.includes(p.secret), false)
+  assert.equal(res.raw.includes('Bearer '), false)
+
+  const cached = await api('POST', '/bridge/read', {
+    body: { source: sourceFor(FILE_A, '26164:111624'), mode: 'cached' },
+  })
+  assert.equal(cached.status, 404)
+  assert.equal(cached.body.code, 'NO_CACHED_DATA')
 })
 
 test('a registered plugin serves a live read end to end', async t => {

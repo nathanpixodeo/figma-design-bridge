@@ -370,10 +370,11 @@ function serializeNode(node, depth, limits) {
     } catch (e) {}
   }
 
-  if (node.type === 'COMPONENT' || node.type === 'COMPONENT_SET') {
-    if (node.componentPropertyDefinitions) {
+  if (node.type === 'COMPONENT_SET' || (node.type === 'COMPONENT' && node.parent?.type !== 'COMPONENT_SET')) {
+    const definitions = node.componentPropertyDefinitions
+    if (definitions) {
       obj.componentPropertyDefinitions = {}
-      for (const [key, def] of Object.entries(node.componentPropertyDefinitions)) {
+      for (const [key, def] of Object.entries(definitions)) {
         obj.componentPropertyDefinitions[key] = { type: def.type, defaultValue: def.defaultValue }
       }
     }
@@ -452,6 +453,10 @@ function countNodes(nodes) {
     if (n.children) c += countNodes(n.children)
   }
   return c
+}
+
+function sanitizeForMessage(value) {
+  return JSON.parse(JSON.stringify(value))
 }
 
 function buildDesignData(selectionOnly) {
@@ -586,7 +591,7 @@ async function readBridgeNode(request) {
     }
   }
 
-  let payload = serializeNode(node, 0, limits)
+  let payload = sanitizeForMessage(serializeNode(node, 0, limits))
   payload = fitNodePayloadToLimit(payload, limits, node.id)
   const completeness = completenessFor(payload, limits)
   const page = findPageForNode(node)
@@ -707,7 +712,7 @@ function triggerSync(reason = 'manual') {
   state.pendingSync = null
   try {
     // Mixed Figma properties are Symbols, which cannot cross the UI message boundary.
-    const data = JSON.parse(JSON.stringify(buildDesignData(figma.command === 'sync-selection')))
+    const data = sanitizeForMessage(buildDesignData(figma.command === 'sync-selection'))
     const requestId = ++state.nextRequestId
     state.inFlight = { requestId, data }
     figma.ui.postMessage({ type: 'sync', requestId, data })

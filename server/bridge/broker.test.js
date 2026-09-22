@@ -465,6 +465,28 @@ test('missing node, wrong file (no session), and timeout each produce a distinct
   // All three codes are pairwise distinct by construction: NO_SESSION_FOR_FILE, NODE_NOT_FOUND, TIMEOUT.
 })
 
+test('a string plugin error is preserved as a bounded PLUGIN_ERROR', async () => {
+  const { broker } = makeHarness()
+  const session = registerTestSession(broker)
+  const pending = broker.request({ fileKey: 'FILE_DEFAULT', op: 'read-node' })
+  const polled = await broker.poll(session.sessionId, session.sessionSecret, { waitMs: 10 })
+
+  broker.reply(session.sessionId, session.sessionSecret, {
+    requestId: polled.requests[0].requestId,
+    ok: false,
+    error: `Could not read node; {"authorization":"Bearer DO-NOT-LEAK","sessionSecret":"ALSO-DO-NOT-LEAK"} ${'x'.repeat(500)}`,
+  })
+
+  await assert.rejects(pending, error => {
+    assert.equal(error.code, 'PLUGIN_ERROR')
+    assert.match(error.message, /Could not read node/)
+    assert.match(error.message, /authorization=\[redacted\]/)
+    assert.match(error.message, /sessionSecret=\[redacted\]/)
+    assert.ok(error.message.length <= 400)
+    return true
+  })
+})
+
 test('hasSessionForFile reflects only currently alive sessions', () => {
   const { broker } = makeHarness()
   assert.equal(broker.hasSessionForFile('FILE_DEFAULT'), false)

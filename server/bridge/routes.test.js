@@ -624,6 +624,8 @@ test('broker failures map to distinct HTTP statuses', async t => {
     UNAUTHORIZED: 401,
     QUEUE_FULL: 429,
     TOO_MANY_PENDING: 429,
+    PLUGIN_ERROR: 502,
+    NODE_NOT_FOUND: 404,
   }
 
   for (const [code, status] of Object.entries(expected)) {
@@ -633,6 +635,16 @@ test('broker failures map to distinct HTTP statuses', async t => {
     assert.equal(res.body.code, code)
     assert.equal(res.body.verifiedFresh, false)
   }
+
+  ctx.broker.nextRequestError = brokerError(
+    'PLUGIN_ERROR',
+    'Could not read node 26164:111624 (INSTANCE) at depth 0',
+  )
+  const pluginFailure = await ctx.authed({ method: 'POST', path: '/bridge/read', body: { source: FILE_URL } })
+  assert.equal(pluginFailure.status, 502)
+  assert.equal(pluginFailure.body.code, 'PLUGIN_ERROR')
+  assert.match(pluginFailure.body.error, /26164:111624/)
+  assert.equal(pluginFailure.body.verifiedFresh, false)
 
   // An unexpected failure is a 500 that does not leak internals.
   ctx.broker.nextRequestError = new Error('boom: /home/user/secret/path')

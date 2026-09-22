@@ -218,6 +218,32 @@ test('mixed text and corner properties do not break full-page serialization or m
   assert.equal(frame.children[0].characters, 'Hello')
 })
 
+test('Sync handles variants without reading unsupported component property definitions', async () => {
+  const currentPage = page()
+  const variant = { id: '3:2', name: 'State=On', type: 'COMPONENT' }
+  const componentSet = {
+    id: '3:1', name: 'Button', type: 'COMPONENT_SET', children: [variant],
+    componentPropertyDefinitions: { Label: { type: 'TEXT', defaultValue: 'Go' } },
+  }
+  variant.parent = componentSet
+  Object.defineProperty(variant, 'componentPropertyDefinitions', {
+    get() { throw new Error('Can only get component property definitions of a component set or non-variant component') },
+  })
+  const standalone = {
+    id: '3:3', name: 'Icon', type: 'COMPONENT',
+    componentPropertyDefinitions: { Visible: { type: 'BOOLEAN', defaultValue: true } },
+  }
+  currentPage.children = [componentSet, standalone]
+  const p = plugin('sync-page', currentPage)
+  await p.ready()
+  assert.equal(p.notifications.length, 0)
+  assert.equal(p.syncs().length, 1)
+  const [set, component] = p.syncs()[0].data.nodes
+  assert.equal(set.componentPropertyDefinitions.Label.defaultValue, 'Go')
+  assert.equal(set.children[0].componentPropertyDefinitions, undefined)
+  assert.equal(component.componentPropertyDefinitions.Visible.defaultValue, true)
+})
+
 test('serialization failures are visible and do not leave Watch stuck busy', async () => {
   const p = plugin()
   const children = p.figma.currentPage.children
@@ -273,6 +299,87 @@ test('Bridge reads an exact node on another page without switching pages or sele
   assert.equal(reply.result.payload.characters, 'Hello from another page')
   assert.equal(p.figma.currentPage, originalPage)
   assert.equal(p.figma.currentPage.selection, originalSelection)
+})
+
+test('Bridge reads a variant without requesting unsupported property definitions', async () => {
+  const p = bridgePlugin()
+  const componentSet = { id: '2:3', name: 'Button', type: 'COMPONENT_SET', parent: p.target.parent }
+  p.target.type = 'COMPONENT'
+  p.target.parent = componentSet
+  Object.defineProperty(p.target, 'componentPropertyDefinitions', {
+    get() { throw new Error('Can only get component property definitions of a component set or non-variant component') },
+  })
+  await p.ready()
+  await p.message({
+    type: 'connect-bridge', serverUrl: 'http://localhost:3456', token: 'pairing-token',
+    fileSource: 'AAAAfileKeyAAAA',
+  })
+  await p.message({ type: 'bridge-status', connected: true })
+  await p.message({
+    type: 'bridge-request', sessionId: 'session-1',
+    request: {
+      requestId: 'request-variant', op: 'read-node',
+      params: { fileKey: 'AAAAfileKeyAAAA', nodeId: p.target.id, options: { depth: 4 } },
+    },
+  })
+  const reply = p.sent.filter(message => message.type === 'bridge-result').at(-1)
+  assert.equal(reply.ok, true)
+  assert.equal(reply.result.payload.type, 'COMPONENT')
+  assert.equal(reply.result.payload.componentPropertyDefinitions, undefined)
+  assert.equal(reply.result.pageId, p.otherPage.id)
+})
+
+test('Bridge sanitizes mixed nested properties before structured clone and recovers from genuine errors', async () => {
+  const p = bridgePlugin()
+  p.target.type = 'INSTANCE'
+  p.target.strokes = [{ type: 'SOLID', color: { r: 1, g: 0, b: 0 } }]
+  p.target.strokeWeight = Symbol('mixed')
+  p.target.parent.children = [p.target]
+  await p.ready()
+  await p.message({
+    type: 'connect-bridge', serverUrl: 'http://localhost:3456', token: 'pairing-token',
+    fileSource: 'AAAAfileKeyAAAA',
+  })
+  await p.message({ type: 'bridge-status', connected: true })
+  await p.message({
+    type: 'bridge-request', sessionId: 'session-1',
+    request: {
+      requestId: 'request-mixed', op: 'read-node',
+      params: { fileKey: 'AAAAfileKeyAAAA', nodeId: p.target.parent.id, options: { depth: 1 } },
+    },
+  })
+
+  let reply = p.sent.filter(message => message.type === 'bridge-result').at(-1)
+  assert.equal(reply.ok, true)
+  assert.equal(reply.result.payload.children[0].strokeWeight, undefined)
+  assert.equal(reply.result.payload.children[0].strokes[0].color, '#FF0000')
+
+  const children = p.target.parent.children
+  Object.defineProperty(p.target.parent, 'children', {
+    configurable: true, get() { throw new Error('Node removed') },
+  })
+  await p.message({
+    type: 'bridge-request', sessionId: 'session-1',
+    request: {
+      requestId: 'request-error', op: 'read-node',
+      params: { fileKey: 'AAAAfileKeyAAAA', nodeId: p.target.parent.id, options: { depth: 1 } },
+    },
+  })
+  reply = p.sent.filter(message => message.type === 'bridge-result').at(-1)
+  assert.equal(reply.ok, false)
+  assert.equal(reply.error, 'Node removed')
+
+  Object.defineProperty(p.target.parent, 'children', { value: children })
+  await p.message({
+    type: 'bridge-request', sessionId: 'session-1',
+    request: {
+      requestId: 'request-recovery', op: 'read-node',
+      params: { fileKey: 'AAAAfileKeyAAAA', nodeId: p.target.parent.id, options: { depth: 1 } },
+    },
+  })
+  reply = p.sent.filter(message => message.type === 'bridge-result').at(-1)
+  assert.equal(reply.ok, true)
+  assert.equal(reply.requestId, 'request-recovery')
 })
 
 test('Bridge enforces maxBytes for large node payloads and reports truncation', async () => {

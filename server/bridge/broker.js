@@ -9,6 +9,8 @@ const crypto = require('crypto')
 
 const ALLOWED_OPS = new Set(['read-node', 'read-document-index', 'ping'])
 const MAX_PARAMS_BYTES = 256 * 1024
+const MAX_PLUGIN_ERROR_MESSAGE = 400
+const PLUGIN_ERROR_CODES = new Set(['NODE_NOT_FOUND'])
 
 // ── Typed errors ─────────────────────────────────────────────
 
@@ -17,6 +19,15 @@ function brokerError(code, message, extra) {
   err.code = code
   if (extra) Object.assign(err, extra)
   return err
+}
+
+function sanitizePluginErrorMessage(value) {
+  if (typeof value !== 'string' || !value) return 'Plugin reported an error'
+  return value
+    .replace(/[\u0000-\u001f\u007f]/g, ' ')
+    .replace(/['"]?(bridge[-_ ]?token|session[-_ ]?secret|x-session-secret|authorization|bearer|token|secret|password|api[-_ ]?key)['"]?\s*[:=]\s*(?:"[^"]*"|'[^']*'|\S+)/gi, '$1=[redacted]')
+    .replace(/\b[0-9a-f]{32,}\b/gi, '[redacted]')
+    .slice(0, MAX_PLUGIN_ERROR_MESSAGE)
 }
 
 const errors = {
@@ -476,12 +487,13 @@ function createBroker(options = {}) {
     if (ok) {
       settleRequest(req, true, result, null)
     } else {
-      const message = (error && error.message) || 'Plugin reported an error'
-      const code = (error && error.code) || 'PLUGIN_ERROR'
-      const err = new Error(message)
-      err.code = code
-      err.fileKey = req.fileKey
-      err.requestId = req.requestId
+      const rawMessage = typeof error === 'string' ? error : error && error.message
+      const rawCode = error && typeof error.code === 'string' ? error.code : null
+      const code = PLUGIN_ERROR_CODES.has(rawCode) ? rawCode : 'PLUGIN_ERROR'
+      const err = brokerError(code, sanitizePluginErrorMessage(rawMessage), {
+        fileKey: req.fileKey,
+        requestId: req.requestId,
+      })
       settleRequest(req, false, null, err)
     }
     return { accepted: true }

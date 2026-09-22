@@ -39,6 +39,8 @@ const BROKER_STATUS = {
   UNAUTHORIZED: 401,
   QUEUE_FULL: 429,
   TOO_MANY_PENDING: 429,
+  PLUGIN_ERROR: 502,
+  NODE_NOT_FOUND: 404,
 }
 
 const READ_FIELDS = new Set(['source', 'options', 'mode', 'timeoutMs'])
