@@ -1,7 +1,7 @@
 {
   "name": "figma-bridge",
   "displayName": "Figma Design Bridge",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Read Figma designs from a local cache and check front-end code against them, without pasting a Figma token into every project.",
   "author": {
     "name": "Nathan Pixodeo",
