@@ -14,6 +14,12 @@ const { verifyToken } = require('./token')
 const SERVICE_NAME = 'figma-design-bridge'
 const DEFAULT_PROTOCOL_VERSION = '1.0'
 const DEFAULT_MAX_BODY_BYTES = 2_000_000
+// A plugin reply carries a payload of up to the read's maxBytes plus its
+// envelope. Every reply to a legal read has to fit, or the read dies with the
+// connection instead of reporting why.
+const MAX_READ_BYTES = 50_000_000
+const REPLY_ENVELOPE_BYTES = 1_000_000
+const DEFAULT_MAX_REPLY_BODY_BYTES = MAX_READ_BYTES + REPLY_ENVELOPE_BYTES
 const MAX_POLL_WAIT_MS = 30_000
 const DEFAULT_POLL_WAIT_MS = 25_000
 const DEFAULT_READ_TIMEOUT_MS = 30_000
@@ -107,6 +113,7 @@ function createRoutes(options = {}) {
     token,
     protocolVersion = DEFAULT_PROTOCOL_VERSION,
     maxBodyBytes = DEFAULT_MAX_BODY_BYTES,
+    maxReplyBodyBytes = Math.max(maxBodyBytes, DEFAULT_MAX_REPLY_BODY_BYTES),
     allowedOrigins = DEFAULT_ALLOWED_ORIGINS,
     now = () => Date.now(),
     log = () => {},
@@ -164,7 +171,7 @@ function createRoutes(options = {}) {
 
   // ── Body handling ───────────────────────────────────────
 
-  function readBody(req) {
+  function readBody(req, limit) {
     return new Promise((resolve, reject) => {
       let size = 0
       let chunks = []
@@ -182,9 +189,9 @@ function createRoutes(options = {}) {
       req.on('data', chunk => {
         if (settled) return
         size += chunk.length
-        if (size > maxBodyBytes) {
+        if (size > limit) {
           // Drop everything buffered so far rather than holding an oversized body.
-          fail(`Request body exceeds the ${maxBodyBytes} byte limit`, 'PAYLOAD_TOO_LARGE')
+          fail(`Request body exceeds the ${limit} byte limit`, 'PAYLOAD_TOO_LARGE')
           return
         }
         chunks.push(chunk)
@@ -199,8 +206,8 @@ function createRoutes(options = {}) {
     })
   }
 
-  async function readJSONBody(req) {
-    const raw = await readBody(req)
+  async function readJSONBody(req, limit = maxBodyBytes) {
+    const raw = await readBody(req, limit)
     if (!raw.trim()) return {}
     try {
       return JSON.parse(raw)
@@ -273,7 +280,9 @@ function createRoutes(options = {}) {
     if (opts.depth !== undefined) parts.push(`d${opts.depth}`)
     if (opts.maxNodes !== undefined) parts.push(`n${opts.maxNodes}`)
     if (opts.maxBytes !== undefined) parts.push(`b${opts.maxBytes}`)
-    if (opts.includeHidden) parts.push('hidden')
+    // The plugin includes hidden layers unless includeHidden is false, so only
+    // false changes the payload, and only false may change the key.
+    if (opts.includeHidden === false) parts.push('visible-only')
     return parts.length ? `${base}+${parts.join('+')}` : base
   }
 
@@ -310,7 +319,7 @@ function createRoutes(options = {}) {
           // The plugin cannot serialize a meaningful response smaller than its
           // 1 KiB floor. Rejecting a lower request here keeps the advertised
           // bridge limit equal to the limit the live reader can enforce.
-          if (!isInteger(value, 1024, 50_000_000)) return 'Option "maxBytes" must be an integer between 1024 and 50000000'
+          if (!isInteger(value, 1024, MAX_READ_BYTES)) return `Option "maxBytes" must be an integer between 1024 and ${MAX_READ_BYTES}`
         } else if (key === 'includeHidden') {
           if (typeof value !== 'boolean') return 'Option "includeHidden" must be a boolean'
         } else {
@@ -459,7 +468,7 @@ function createRoutes(options = {}) {
 
   async function handleReply(req, res, sessionId, secret) {
     let body
-    try { body = await readJSONBody(req) } catch (error) { return sendBodyError(req, res, error) }
+    try { body = await readJSONBody(req, maxReplyBodyBytes) } catch (error) { return sendBodyError(req, res, error) }
 
     const invalid = validateReplyRequest(body)
     if (invalid) return sendError(req, res, 400, 'BAD_REQUEST', invalid)
@@ -603,7 +612,8 @@ function createRoutes(options = {}) {
     if (!hasSession) {
       return sendError(req, res, 409, 'NO_SESSION_FOR_FILE',
         `No Figma plugin session is connected for file ${fileKey}. `
-        + 'Open that file in Figma, run Plugins → Design Bridge and press Start, then retry. '
+        + 'Open that file in Figma, run Plugins → Development → Design Bridge → '
+        + 'Connect On-Demand Bridge, press Start, then retry. '
         + 'Pass mode "cached" to read explicitly unverified data instead.',
         { ...envelope, mode: 'live', representation })
     }
@@ -741,7 +751,8 @@ function createRoutes(options = {}) {
     const ready = liveFileKeys.length > 0
     const setupHints = ready ? [] : [
       'No Figma plugin session is connected.',
-      'Open the Figma file you want to read, run Plugins → Design Bridge and press Start.',
+      'Open the Figma file you want to read, run Plugins → Development → Design Bridge → '
+        + 'Connect On-Demand Bridge and press Start.',
       'Pair the plugin with this bridge using the local bridge token from the bridge data directory.',
     ]
 

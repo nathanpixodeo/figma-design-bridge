@@ -211,9 +211,17 @@ async function beginBridge(config){
 }
 async function sendBridgeReply(msg){
   if(!bridgeWanted||!sessionId||msg.sessionId!==sessionId) return
+  const path='/bridge/session/'+encodeURIComponent(sessionId)+'/reply'
   try{
-    await bridgeFetch('/bridge/session/'+encodeURIComponent(sessionId)+'/reply',{method:'POST',body:{requestId:msg.requestId,ok:msg.ok,result:msg.result,error:msg.error}})
-  }catch(err){handleBridgeDisconnect(err)}
+    await bridgeFetch(path,{method:'POST',body:{requestId:msg.requestId,ok:msg.ok,result:msg.result,error:msg.error}})
+  }catch(err){
+    // A reply the bridge refuses, such as one over its size limit, fails that
+    // read with the reason instead of dropping the session and every queued read.
+    // If the session changed meanwhile, the old reply has nowhere to go.
+    if(!bridgeWanted||sessionId!==msg.sessionId) return
+    try{await bridgeFetch(path,{method:'POST',body:{requestId:msg.requestId,ok:false,error:'The bridge did not accept the plugin reply: '+err.message}})}
+    catch(retryErr){handleBridgeDisconnect(retryErr)}
+  }
 }
 async function invalidateBridge(msg){
   if(!bridgeWanted||!sessionId) return
@@ -512,23 +520,99 @@ function findPageForNode(node) {
   return current && current.type === 'PAGE' ? current : null
 }
 
+// maxBytes is a promise about the bytes the bridge receives, and non-ASCII text
+// takes more UTF-8 bytes than its string length, so sizes are counted in UTF-8.
+function utf8Length(text) {
+  // Native scan first: an ASCII payload is as long in bytes as in characters,
+  // and the loop below is slow in an interpreted plugin sandbox.
+  if (!/[^\x00-\x7f]/.test(text)) return text.length
+  let bytes = 0
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i)
+    if (code < 0x80) bytes += 1
+    else if (code < 0x800) bytes += 2
+    else if (code >= 0xd800 && code <= 0xdbff && i + 1 < text.length
+      && text.charCodeAt(i + 1) >= 0xdc00 && text.charCodeAt(i + 1) <= 0xdfff) {
+      bytes += 4
+      i++
+    } else bytes += 3
+  }
+  return bytes
+}
+
+function jsonBytes(value) {
+  const text = JSON.stringify(value)
+  return typeof text === 'string' ? utf8Length(text) : 0
+}
+
+// Counts the nodes the caller actually receives, placeholders included, rather
+// than the nodes the walk visited before a limit cut the payload down.
+function countPayloadNodes(value) {
+  if (!value || typeof value !== 'object') return 0
+  if (Array.isArray(value.pages)) {
+    return value.pages.reduce((sum, page) => sum + countPayloadNodes(page), 0)
+  }
+  let count = 1
+  if (Array.isArray(value.children)) {
+    for (const child of value.children) count += countPayloadNodes(child)
+  }
+  return count
+}
+
 function completenessFor(payload, limits) {
   let byteSize = 0
-  try { byteSize = JSON.stringify(payload).length } catch { byteSize = limits.state.byteSize }
+  try { byteSize = jsonBytes(payload) } catch { byteSize = limits.state.byteSize }
   return {
-    nodeCount: limits.state.nodeCount,
+    nodeCount: countPayloadNodes(payload),
     byteSize,
     limitHit: limits.state.limitHit || byteSize > limits.maxBytes,
     truncatedNodeIds: limits.state.truncatedNodeIds.slice(0, 200),
   }
 }
 
+// Removes the last node in document order, repeatedly, until the payload fits.
+// The serializer's running estimate leaves out the nesting overhead, so a cut
+// subtree can still come out over budget; trimming from the end keeps every
+// node that fits instead of dropping the whole subtree. Returns the final size.
+function pruneTrailingNodes(root, limits, size = jsonBytes(root)) {
+  while (size > limits.maxBytes) {
+    let parent = null
+    let node = root
+    while (Array.isArray(node.children) && node.children.length) {
+      parent = node
+      node = node.children[node.children.length - 1]
+    }
+    if (!parent) break
+
+    parent.children.pop()
+    if (parent.children.length) {
+      size -= jsonBytes(node) + 1 // the node and the comma before it
+    } else {
+      delete parent.children
+      size -= jsonBytes(node) + 14 // `,"children":[` + node + `]`
+    }
+    // A parent already flagged was recorded when it was flagged, so each one is
+    // recorded once rather than once per removed child.
+    if (parent.truncated !== true) {
+      parent.truncated = true
+      size += 17 // `,"truncated":true`
+      markBridgeTruncated(limits, parent.id)
+    }
+    // Confirm against the real serialization before stopping.
+    if (size <= limits.maxBytes) size = jsonBytes(root)
+  }
+  return size
+}
+
 function fitNodePayloadToLimit(payload, limits, nodeId) {
   if (!payload) return payload
-  let serialized = ''
-  try { serialized = JSON.stringify(payload) } catch { serialized = '' }
-  if (!serialized || serialized.length <= limits.maxBytes) return payload
+  let size = 0
+  try { size = jsonBytes(payload) } catch { size = 0 }
+  if (!size || size <= limits.maxBytes) return payload
 
+  if (pruneTrailingNodes(payload, limits, size) <= limits.maxBytes) return payload
+
+  // Only the requested node is left, and it is too large on its own.
   markBridgeTruncated(limits, nodeId)
   const fitted = { ...payload, children: undefined, truncated: true }
 
@@ -540,13 +624,13 @@ function fitNodePayloadToLimit(payload, limits, nodeId) {
     while (low < high) {
       const mid = Math.ceil((low + high) / 2)
       fitted.characters = original.slice(0, mid)
-      if (JSON.stringify(fitted).length <= limits.maxBytes) low = mid
+      if (jsonBytes(fitted) <= limits.maxBytes) low = mid
       else high = mid - 1
     }
     fitted.characters = original.slice(0, low)
   }
 
-  if (JSON.stringify(fitted).length <= limits.maxBytes) return fitted
+  if (jsonBytes(fitted) <= limits.maxBytes) return fitted
 
   const minimal = {
     id: String(payload.id || nodeId || '').slice(0, 128),
@@ -554,27 +638,42 @@ function fitNodePayloadToLimit(payload, limits, nodeId) {
     truncated: true,
   }
   if (payload.name) minimal.name = String(payload.name).slice(0, 256)
-  while (minimal.name && JSON.stringify(minimal).length > limits.maxBytes) {
+  while (minimal.name && jsonBytes(minimal) > limits.maxBytes) {
     minimal.name = minimal.name.slice(0, Math.floor(minimal.name.length / 2))
   }
   return minimal
 }
 
+// Same trimming as pruneTrailingNodes, with the size kept up to date by
+// arithmetic instead of serializing the whole index after every removal.
 function fitDocumentIndexToLimit(payload, limits) {
-  if (!payload || JSON.stringify(payload).length <= limits.maxBytes) return payload
+  if (!payload) return payload
+  let size = jsonBytes(payload)
+  if (size <= limits.maxBytes) return payload
   markBridgeTruncated(limits)
   const pages = payload.pages || []
-  while (pages.length && JSON.stringify(payload).length > limits.maxBytes) {
+  while (pages.length && size > limits.maxBytes) {
     const last = pages[pages.length - 1]
     if (last.children && last.children.length) {
       const removed = last.children.pop()
       markBridgeTruncated(limits, removed && removed.id)
-      last.truncated = true
-      if (!last.children.length) delete last.children
+      if (last.children.length) {
+        size -= jsonBytes(removed) + 1 // the entry and the comma before it
+      } else {
+        delete last.children
+        size -= jsonBytes(removed) + 14 // `,"children":[` + entry + `]`
+      }
+      if (last.truncated !== true) {
+        last.truncated = true
+        size += 17 // `,"truncated":true`
+      }
     } else {
       const removed = pages.pop()
       markBridgeTruncated(limits, removed && removed.id)
+      size -= jsonBytes(removed) + (pages.length ? 1 : 0)
     }
+    // Confirm against the real serialization before stopping.
+    if (size <= limits.maxBytes) size = jsonBytes(payload)
   }
   return payload
 }

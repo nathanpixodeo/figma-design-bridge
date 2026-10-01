@@ -406,6 +406,105 @@ test('Bridge enforces maxBytes for large node payloads and reports truncation', 
   assert.ok(reply.result.payload.characters.length < 20_000)
 })
 
+async function connectedBridgePlugin(options) {
+  const p = bridgePlugin(options)
+  await p.ready()
+  await p.message({
+    type: 'connect-bridge', serverUrl: 'http://localhost:3456', token: 'pairing-token',
+    fileSource: 'AAAAfileKeyAAAA',
+  })
+  await p.message({ type: 'bridge-status', connected: true })
+  return p
+}
+
+async function readNode(p, nodeId, options) {
+  await p.message({
+    type: 'bridge-request', sessionId: 'session-1',
+    request: { requestId: `read-${nodeId}`, op: 'read-node', params: { fileKey: 'AAAAfileKeyAAAA', nodeId, options } },
+  })
+  return p.sent.filter(message => message.type === 'bridge-result').at(-1)
+}
+
+// Screen > 60 cards > body > 3 text layers: 301 nodes, about 37 KB serialized.
+function nestedScreen(parent) {
+  const screen = { id: '3:1', name: 'Screen', type: 'FRAME', width: 1440, height: 4000, parent, children: [] }
+  const nodes = new Map([[screen.id, screen]])
+  let next = 2
+  for (let c = 0; c < 60; c++) {
+    const card = { id: `3:${next++}`, name: `Card ${c}`, type: 'FRAME', width: 320, height: 200, parent: screen, children: [] }
+    const body = { id: `3:${next++}`, name: 'Body', type: 'FRAME', width: 300, height: 180, parent: card, children: [] }
+    card.children.push(body)
+    for (let t = 0; t < 3; t++) {
+      body.children.push({
+        id: `3:${next++}`, name: `Text ${t}`, type: 'TEXT', characters: `Card ${c} line ${t}`, parent: body,
+        fontSize: 14, fontName: { family: 'Inter', style: 'Regular' },
+      })
+    }
+    screen.children.push(card)
+    for (const node of [card, body, ...body.children]) nodes.set(node.id, node)
+  }
+  return { screen, nodes }
+}
+
+function countTree(node) {
+  return node ? 1 + (node.children || []).reduce((sum, child) => sum + countTree(child), 0) : 0
+}
+
+test('Bridge keeps every node that fits when maxBytes cuts a nested subtree', async () => {
+  const p = await connectedBridgePlugin()
+  const { screen, nodes } = nestedScreen(p.otherPage)
+  p.figma.getNodeByIdAsync = async id => nodes.get(id) || null
+
+  const full = await readNode(p, screen.id, { maxBytes: 1_000_000 })
+  assert.equal(full.result.completeness.limitHit, false)
+  assert.equal(countTree(full.result.payload), 301)
+  assert.equal(full.result.completeness.nodeCount, 301)
+
+  const bounded = await readNode(p, screen.id, { maxBytes: 20_000 })
+  const payload = bounded.result.payload
+  const bytes = Buffer.byteLength(JSON.stringify(payload))
+  assert.equal(bounded.ok, true)
+  assert.equal(bounded.result.truncated, true)
+  assert.ok(bytes <= 20_000, `${bytes} bytes`)
+  assert.equal(bounded.result.completeness.byteSize, bytes)
+  assert.ok(countTree(payload) > 100, `only ${countTree(payload)} nodes survived`)
+  assert.equal(bounded.result.completeness.nodeCount, countTree(payload))
+  assert.equal(payload.children[0].name, 'Card 0')
+  assert.equal(payload.truncated, true)
+})
+
+test('Bridge trims a document index with non-ASCII names to maxBytes exactly', async () => {
+  const p = await connectedBridgePlugin()
+  for (let i = 0; i < 80; i++) {
+    const frame = { id: `5:${i}`, name: `Màn hình thanh toán số ${i} — “bản nháp”`, type: 'FRAME', width: 390, height: 844, parent: p.otherPage }
+    p.otherPage.children.push(frame)
+  }
+  await p.message({
+    type: 'bridge-request', sessionId: 'session-1',
+    request: { requestId: 'index-utf8', op: 'read-document-index', params: { fileKey: 'AAAAfileKeyAAAA', options: { maxBytes: 2048 } } },
+  })
+
+  const reply = p.sent.filter(message => message.type === 'bridge-result').at(-1)
+  const bytes = Buffer.byteLength(JSON.stringify(reply.result.payload))
+  const entries = reply.result.payload.pages.reduce((sum, page) => sum + 1 + (page.children || []).length, 0)
+  assert.equal(reply.result.truncated, true)
+  assert.ok(bytes <= 2048, `${bytes} bytes`)
+  assert.ok(bytes > 1500, `trimmed too far: ${bytes} bytes`)
+  assert.equal(reply.result.completeness.byteSize, bytes)
+  assert.equal(reply.result.completeness.nodeCount, entries)
+})
+
+test('Bridge counts maxBytes in UTF-8 bytes, not string length', async () => {
+  const p = await connectedBridgePlugin({ characters: 'Đặt hàng ngay hôm nay để nhận ưu đãi. '.repeat(400) })
+  const reply = await readNode(p, p.target.id, { maxBytes: 4096 })
+  const bytes = Buffer.byteLength(JSON.stringify(reply.result.payload))
+
+  assert.equal(reply.result.truncated, true)
+  assert.ok(bytes <= 4096, `${bytes} bytes`)
+  assert.equal(reply.result.completeness.byteSize, bytes)
+  assert.ok(reply.result.payload.characters.length > 1000)
+})
+
 test('Bridge document index is lightweight and document changes invalidate only the connected file', async () => {
   const p = bridgePlugin()
   await p.ready()
@@ -460,6 +559,7 @@ function ui(fetch) {
     send: () => onMessage({ data: { pluginMessage: {
       type: 'sync', requestId: 7, data: { type: 'page', nodes: [], nodeCount: 0 },
     } } }),
+    post: message => onMessage({ data: { pluginMessage: message } }),
   }
 }
 
@@ -494,6 +594,39 @@ test('UI reports HTTP errors and network failures, releasing the request for ret
     assert.equal(panel.time.timers.size, 0)
     assert.equal(panel.element('syncBtn').disabled, false)
   }
+})
+
+test('UI turns a refused bridge reply into an error reply instead of dropping the session', async () => {
+  const calls = []
+  let replies = 0
+  const respond = body => ({ ok: true, status: 200, text: async () => JSON.stringify(body) })
+  const panel = ui(async (url, options = {}) => {
+    calls.push({ url, body: options.body ? JSON.parse(options.body) : null })
+    if (url.endsWith('/bridge/session')) return respond({ sessionId: 'sess-1', sessionSecret: 'secret-1' })
+    if (url.includes('/poll')) return new Promise(() => {})
+    if (url.endsWith('/reply') && ++replies === 1) throw new TypeError('Failed to fetch')
+    return respond({ accepted: true })
+  })
+  const settle = async () => { for (let i = 0; i < 5; i++) await new Promise(resolve => setImmediate(resolve)) }
+  const lastStatus = () => panel.messages.filter(message => message.type === 'bridge-status').at(-1)
+
+  await panel.post({
+    type: 'bridge-start',
+    config: { url: 'http://localhost:3456', token: 'pairing-token', fileKey: 'AAAAfileKeyAAAA', fileName: 'File', pluginInstanceId: 'plugin-1' },
+  })
+  await settle()
+  assert.equal(lastStatus().connected, true)
+
+  await panel.post({ type: 'bridge-result', sessionId: 'sess-1', requestId: 'request-9', ok: true, result: { payload: {} } })
+  await settle()
+
+  const replyCalls = calls.filter(call => call.url.endsWith('/reply'))
+  assert.equal(replyCalls.length, 2)
+  assert.equal(replyCalls[1].body.requestId, 'request-9')
+  assert.equal(replyCalls[1].body.ok, false)
+  assert.match(replyCalls[1].body.error, /did not accept the plugin reply: Failed to fetch/)
+  assert.equal(lastStatus().connected, true)
+  assert.equal(calls.filter(call => call.url.endsWith('/bridge/session')).length, 1)
 })
 
 test('UI aborts a stalled upload and reports a timeout instead of hanging', async () => {

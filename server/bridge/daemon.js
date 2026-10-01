@@ -116,6 +116,7 @@ async function createDaemon(options = {}) {
     now = () => Date.now(),
     log = defaultLog,
     fallback = null,
+    createFallback = null,
   } = options
 
   if (typeof dataDir !== 'string' || !dataDir.trim()) {
@@ -141,6 +142,12 @@ async function createDaemon(options = {}) {
     broker, cache, identity, token, protocolVersion, maxBodyBytes, allowedOrigins, now, log,
   })
 
+  // The legacy router authenticates with the daemon's own token, which is only
+  // known here, so a caller can hand over a factory instead of a handler.
+  const fallbackHandler = typeof createFallback === 'function'
+    ? createFallback({ token, dataDir })
+    : fallback
+
   const server = http.createServer((req, res) => {
     let handled
     try {
@@ -153,8 +160,9 @@ async function createDaemon(options = {}) {
     Promise.resolve(handled)
       .then(ok => {
         if (ok) return
-        // Not a bridge route. P2 passes the legacy router in as `fallback`.
-        if (typeof fallback === 'function') return fallback(req, res)
+        // Not a bridge route. The MCP adapter passes the legacy router in, so
+        // the Figma plugin's /design syncs reach this daemon too.
+        if (typeof fallbackHandler === 'function') return fallbackHandler(req, res)
         endJSON(res, 404, { error: 'Not found', code: 'NOT_FOUND' })
       })
       .catch(error => {

@@ -420,6 +420,49 @@ test('a body over the limit is refused with 413 and never reaches the broker', a
   assert.equal(ctx.cache.calls.puts.length, 0)
 })
 
+function replyWithPayload(characters) {
+  return {
+    requestId: 'req-42',
+    ok: true,
+    result: { ...defaultResult(), payload: { id: '12:34', name: 'Copy', type: 'TEXT', characters } },
+  }
+}
+
+test('a plugin reply is bounded by the reply limit, not the request limit', async t => {
+  const ctx = await withServer(t, { routeOptions: { maxBodyBytes: 256, maxReplyBodyBytes: 4096 } })
+  const session = await ctx.register()
+  const reply = {
+    method: 'POST',
+    path: `/bridge/session/${session.sessionId}/reply`,
+    headers: { 'x-session-secret': session.sessionSecret },
+  }
+
+  const accepted = await ctx.authed({ ...reply, body: replyWithPayload('x'.repeat(1500)) })
+  assert.equal(accepted.status, 200)
+  assert.equal(ctx.broker.calls.replies.length, 1)
+
+  const refused = await ctx.authed({ ...reply, body: replyWithPayload('x'.repeat(6000)) })
+  assert.equal(refused.status, 413)
+  assert.equal(refused.body.code, 'PAYLOAD_TOO_LARGE')
+  assert.equal(ctx.broker.calls.replies.length, 1)
+})
+
+test('by default a reply larger than the 2 MB request limit still reaches the broker', async t => {
+  const ctx = await withServer(t)
+  const session = await ctx.register()
+
+  const res = await ctx.authed({
+    method: 'POST',
+    path: `/bridge/session/${session.sessionId}/reply`,
+    headers: { 'x-session-secret': session.sessionSecret },
+    body: replyWithPayload('x'.repeat(2_500_000)),
+  })
+
+  assert.equal(res.status, 200)
+  assert.equal(res.body.accepted, true)
+  assert.equal(ctx.broker.calls.replies[0].payload.result.payload.characters.length, 2_500_000)
+})
+
 test('malformed JSON is refused with 400 rather than a 500', async t => {
   const ctx = await withServer(t)
   const res = await ctx.authed({ method: 'POST', path: '/bridge/read', body: '{"source": ' })
@@ -573,6 +616,19 @@ test('read options change the representation so cache entries cannot collide', a
 
   const representations = ctx.cache.calls.puts.map(entry => entry.representation)
   assert.deepEqual(representations, ['node-subtree+d2', 'node-subtree+d3'])
+})
+
+test('only includeHidden false changes the representation, because hidden layers are included by default', async t => {
+  const ctx = await withServer(t)
+  await ctx.register('FILE1', 'plugin-a')
+
+  for (const options of [undefined, { includeHidden: true }, { includeHidden: false }]) {
+    const body = options ? { source: FILE_URL, options } : { source: FILE_URL }
+    await ctx.authed({ method: 'POST', path: '/bridge/read', body })
+  }
+
+  const representations = ctx.cache.calls.puts.map(entry => entry.representation)
+  assert.deepEqual(representations, ['node-subtree', 'node-subtree', 'node-subtree+visible-only'])
 })
 
 test('a truncated plugin result is reported as truncated', async t => {

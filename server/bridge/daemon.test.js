@@ -163,6 +163,26 @@ test('a started daemon serves health, authenticates and falls through for other 
   assert.deepEqual(fellThrough, ['/design/summary'])
 })
 
+test('createFallback builds the legacy handler with the daemon token', async t => {
+  const seen = []
+  const daemon = await startDaemon(t, {
+    createFallback: ({ token, dataDir }) => {
+      seen.push({ token, dataDir })
+      return (req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ authorized: req.headers.authorization === `Bearer ${token}` }))
+      }
+    },
+  })
+
+  assert.equal(seen.length, 1)
+  assert.equal(seen[0].token, daemon.token)
+
+  const response = await fetch(`${daemon.url}/design`, { headers: { authorization: `Bearer ${daemon.token}` } })
+  assert.equal(response.status, 200)
+  assert.deepEqual(await response.json(), { authorized: true })
+})
+
 test('a daemon without a fallback answers non-bridge paths with a JSON 404', async t => {
   const daemon = await startDaemon(t)
   const response = await fetch(`${daemon.url}/design`)

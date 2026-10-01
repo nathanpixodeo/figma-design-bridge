@@ -15,6 +15,8 @@ const { fetchFigmaDesign } = figmaApi;
 const require = createRequire(import.meta.url);
 const { startOrReuse } = require("./bridge/daemon.js");
 const { createClient } = require("./bridge/client.js");
+const createSnapshotStore = require("./snapshot-store.js");
+const createLegacyRoutes = require("./legacy-routes.js");
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 let fileConfig = {};
@@ -26,8 +28,8 @@ const PORT = parseInt(process.env.FIGMA_BRIDGE_PORT || fileConfig.port || "3456"
 const HOST = process.env.FIGMA_BRIDGE_HOST || fileConfig.host || "127.0.0.1";
 const DATA_DIR = process.env.FIGMA_BRIDGE_DATA_DIR || fileConfig.dataDir || path.join(__dirname, "data");
 const MAX_SNAPSHOTS = parseInt(process.env.FIGMA_BRIDGE_MAX_SNAPSHOTS || fileConfig.maxSnapshots || "50", 10);
-const snapsDir = path.join(DATA_DIR, "snapshots");
-const latestPath = path.join(DATA_DIR, "latest.json");
+const MAX_BODY_BYTES = parseInt(process.env.FIGMA_BRIDGE_MAX_BODY_BYTES || fileConfig.maxBodyBytes || "50000000", 10);
+const ALLOW_ANONYMOUS_LEGACY = process.env.FIGMA_BRIDGE_ALLOW_ANONYMOUS_LEGACY === "1";
 
 function log(...args) {
   process.stderr.write(`[${new Date().toISOString()}] ${args.join(" ")}\n`);
@@ -35,37 +37,13 @@ function log(...args) {
 
 // ── Snapshot store ─────────────────────────────────────────
 
-function ensureDirs() {
-  fs.mkdirSync(snapsDir, { recursive: true });
-}
-
-function saveSnapshot(design) {
-  ensureDirs();
-  const now = new Date().toISOString().replace(/:/g, "-");
-  const fp = path.join(snapsDir, `${now}.json`);
-  const snap = { ...design, savedAt: new Date().toISOString() };
-  fs.writeFileSync(fp, JSON.stringify(snap, null, 2));
-  fs.writeFileSync(latestPath, JSON.stringify(snap, null, 2));
-  try {
-    const files = fs.readdirSync(snapsDir).filter(f => f.endsWith(".json")).sort();
-    while (files.length > MAX_SNAPSHOTS) {
-      const oldest = files.shift();
-      fs.unlinkSync(path.join(snapsDir, oldest));
-    }
-  } catch (e) { /* ignore */ }
-  return fp;
-}
-
-function loadLatest() {
-  try {
-    if (fs.existsSync(latestPath)) {
-      const d = JSON.parse(fs.readFileSync(latestPath, "utf8"));
-      log(`Restored snapshot: "${d.pageName}" (${d.nodeCount} nodes)`);
-      return d;
-    }
-  } catch (e) { log("No snapshot to restore:", e.message); }
-  return null;
-}
+// Shared with the legacy routes below and with any `npm start` server using the
+// same data directory: a sync written by either is visible to these tools.
+const store = createSnapshotStore({
+  dataDir: DATA_DIR,
+  maxSnapshots: MAX_SNAPSHOTS,
+  log: (level, ...args) => log(...args),
+});
 
 // ── Design analysis ────────────────────────────────────────
 
@@ -153,38 +131,110 @@ function summary(data) {
   return md;
 }
 
-// ── State ──────────────────────────────────────────────────
-
-let currentDesign = loadLatest();
-let bridgeDescriptor = null;
-let bridgeClient = null;
-let bridgeStartup = null;
-
 // ── Shared bridge client ────────────────────────────────────
 
+let bridge = null; // { descriptor, client } once the bridge was started or reused
+let bridgeStartup = null;
+let takeoverPending = false; // a reused bridge went away and has not been replaced yet
+
+// When this process ends up owning the port, the Figma plugin's legacy Sync
+// commands post to it as well, so it serves /design next to /bridge/*.
+function legacyRoutesFor({ token }) {
+  if (ALLOW_ANONYMOUS_LEGACY) {
+    log("FIGMA_BRIDGE_ALLOW_ANONYMOUS_LEGACY=1: /design and /snapshots accept unauthenticated requests. "
+      + "Any web page open in a browser on this machine can read, overwrite, or delete the cached design. "
+      + "Unset it to require the token.");
+  }
+  return createLegacyRoutes({
+    store,
+    token,
+    allowAnonymous: ALLOW_ANONYMOUS_LEGACY,
+    maxBodyBytes: MAX_BODY_BYTES,
+    fetchFigmaDesign,
+    log: (level, ...args) => log(`[legacy:${level}]`, ...args),
+  });
+}
+
+// A failed start is not cached: the next tool call tries again, so the server
+// recovers once the port frees up or the data directories are aligned.
 async function ensureBridge() {
-  if (bridgeClient) return bridgeClient;
+  if (bridge) return bridge.client;
   if (!bridgeStartup) {
     bridgeStartup = startOrReuse({
       port: PORT,
       host: HOST,
       dataDir: DATA_DIR,
       log: (level, ...args) => log(`[bridge:${level}]`, ...args),
+      createFallback: legacyRoutesFor,
     }).then(descriptor => {
       if (!descriptor.token) {
-        const error = new Error(`Bridge token is unavailable in ${DATA_DIR}. Run the bridge once to create pairing data.`);
+        const error = new Error(
+          `A Figma Design Bridge is already running at ${descriptor.url}, but its pairing token is not in ${DATA_DIR}, `
+          + "so it was started with a different data directory. Start both with the same FIGMA_BRIDGE_DATA_DIR, "
+          + "or stop the other bridge so this server can start its own.",
+        );
         error.code = "NO_TOKEN";
         throw error;
       }
-      bridgeDescriptor = descriptor;
-      bridgeClient = createClient({ url: descriptor.url, token: descriptor.token });
-      return bridgeClient;
-    }).catch(error => {
+      bridge = { descriptor, client: createClient({ url: descriptor.url, token: descriptor.token }) };
+      takeoverPending = false;
+      return bridge.client;
+    }).finally(() => {
       bridgeStartup = null;
-      throw error;
     });
   }
   return bridgeStartup;
+}
+
+// A bridge reused from another process can exit with it, even in the middle of
+// a call, or be replaced by one holding a different token. Forget that
+// connection and resolve the bridge again once (taking the port over if it is
+// free) instead of failing every later call. Reads and status are idempotent.
+const RECONNECT_CODES = new Set(["UNREACHABLE", "UNAUTHORIZED", "ECONNRESET", "EPIPE", "UND_ERR_SOCKET"]);
+
+async function withBridge(call) {
+  const client = await ensureBridge();
+  try {
+    return await call(client);
+  } catch (error) {
+    const stale = bridge && bridge.client === client ? bridge : null;
+    if (!RECONNECT_CODES.has(error.code) || (stale && stale.descriptor.owned)) throw error;
+    if (stale) {
+      bridge = null;
+      takeoverPending = true;
+    }
+    return call(await ensureBridge());
+  }
+}
+
+// The owner going away is also noticed between calls, and a failed takeover is
+// retried, so the Figma plugin has a bridge to reconnect to before the next
+// tool call comes in.
+setInterval(async () => {
+  if (bridgeStartup) return;
+  const current = bridge;
+  if (current) {
+    if (current.descriptor.owned) return;
+    try {
+      await current.client.health({ timeout: 2000 });
+      return;
+    } catch {
+      if (bridge !== current) return;
+      bridge = null;
+      takeoverPending = true;
+    }
+  }
+  if (takeoverPending) ensureBridge().catch(() => { /* tried again on the next tick */ });
+}, 10_000).unref();
+
+function describeError(error) {
+  const prefix = error.code ? `${error.code}: ` : "";
+  let hint = "";
+  if (error.code === "UNAUTHORIZED") {
+    hint = ` The bridge on port ${PORT} rejected the token stored in ${DATA_DIR}. It is probably running with a `
+      + "different data directory; start both with the same FIGMA_BRIDGE_DATA_DIR.";
+  }
+  return `${prefix}${error.message}${hint}`;
 }
 
 function readOptionsFromArgs(args = {}) {
@@ -214,15 +264,15 @@ function bridgeResultToDesign(result) {
 
 async function resolveDesign(args = {}) {
   if (args?.source) {
-    const client = await ensureBridge();
-    const result = await client.read({
+    const result = await withBridge(client => client.read({
       source: args.source,
       mode: args.mode || "live",
       timeoutMs: args.timeout_ms,
       options: readOptionsFromArgs(args),
-    });
+    }));
     return bridgeResultToDesign(result);
   }
+  const currentDesign = store.getCurrent();
   if (currentDesign) return currentDesign;
   const error = new Error('No design source provided. Pass "source" with a Figma URL/file key, or explicitly import a legacy REST snapshot first.');
   error.code = "NO_DESIGN_SOURCE";
@@ -234,8 +284,8 @@ const SOURCE_PROPERTIES = {
   mode: { type: "string", enum: ["live", "cached"], description: "Live by default. Cached mode is explicit opt-in to unverified stale data." },
   depth: { type: "integer", minimum: 0, maximum: 50 },
   maxNodes: { type: "integer", minimum: 1, maximum: 200000 },
-  maxBytes: { type: "integer", minimum: 1024, maximum: 50000000 },
-  includeHidden: { type: "boolean" },
+  maxBytes: { type: "integer", minimum: 1024, maximum: 50000000, description: "Payload limit in UTF-8 bytes (default 2000000)" },
+  includeHidden: { type: "boolean", description: "Include hidden layers (default true)" },
 };
 
 // ── MCP server ─────────────────────────────────────────────
@@ -251,6 +301,9 @@ async function startMCP() {
       {
         name: "get_design_context",
         description: "Read a Figma file or exact node through the connected Figma plugin. A node URL returns that node and subtree; a file URL returns a lightweight document index. Live mode never silently falls back to REST or stale cache.",
+        // Design payloads are large by nature. Let Claude Code show up to its
+        // per-tool ceiling inline instead of diverting the result to a file.
+        _meta: { "anthropic/maxResultSizeChars": 500000 },
         inputSchema: {
           type: "object",
           properties: {
@@ -258,8 +311,8 @@ async function startMCP() {
             mode: { type: "string", enum: ["live", "cached"], description: "Use live unless the user explicitly asks for cached/offline data." },
             depth: { type: "integer", minimum: 0, maximum: 50 },
             maxNodes: { type: "integer", minimum: 1, maximum: 200000 },
-            maxBytes: { type: "integer", minimum: 1024, maximum: 50000000 },
-            includeHidden: { type: "boolean" },
+            maxBytes: { type: "integer", minimum: 1024, maximum: 50000000, description: "Payload limit in UTF-8 bytes (default 2000000)" },
+            includeHidden: { type: "boolean", description: "Include hidden layers (default true)" },
           },
           required: ["source"],
         },
@@ -321,7 +374,7 @@ async function startMCP() {
     ],
   }));
 
-  mcp.setRequestHandler(CallToolRequestSchema, async req => {
+  const callTool = async req => {
     const { name, arguments: args } = req.params;
 
     const err = msg => ({ content: [{ type: "text", text: `Error: ${msg}` }], isError: true });
@@ -331,24 +384,23 @@ async function startMCP() {
       case "get_design_context": {
         if (!args?.source) return err('Missing required parameter "source"');
         try {
-          const client = await ensureBridge();
-          const result = await client.read({
+          const result = await withBridge(client => client.read({
             source: args.source,
             mode: args.mode || "live",
             options: readOptionsFromArgs(args),
-          });
-          return ok(JSON.stringify(result, null, 2));
+          }));
+          // Compact: indentation alone made a 150 KB payload 3.7 times larger.
+          return ok(JSON.stringify(result));
         } catch (error) {
-          return err(`${error.code ? `${error.code}: ` : ""}${error.message}`);
+          return err(describeError(error));
         }
       }
 
       case "get_bridge_status": {
         try {
-          const client = await ensureBridge();
-          return ok(JSON.stringify(await client.status(), null, 2));
+          return ok(JSON.stringify(await withBridge(client => client.status()), null, 2));
         } catch (error) {
-          return err(`${error.code ? `${error.code}: ` : ""}${error.message}`);
+          return err(describeError(error));
         }
       }
 
@@ -357,8 +409,7 @@ async function startMCP() {
         if (!source) return err('Missing required parameter "source"');
         try {
           const design = await fetchFigmaDesign(source, { nodeIds: args?.node_ids });
-          currentDesign = design;
-          const filepath = saveSnapshot(design);
+          const filepath = store.save(design);
           return ok(`Imported **${design.pageName}** from Figma REST API.\n\n- File: ${design.fileName || design.pageName}\n- Nodes: ${design.nodeCount}\n- Source: ${design.source}\n- Snapshot: ${path.basename(filepath)}\n- Synced at: ${design.syncedAt}`);
         } catch (error) {
           return err(error.message);
@@ -367,7 +418,7 @@ async function startMCP() {
 
       case "get_design_summary": {
         try { return ok(summary(await resolveDesign(args))); }
-        catch (error) { return err(`${error.code ? `${error.code}: ` : ""}${error.message}`); }
+        catch (error) { return err(describeError(error)); }
       }
 
       case "get_design_tree": {
@@ -376,7 +427,7 @@ async function startMCP() {
           let tree = (design.pageName || "Design") + "\n";
           for (const n of design.nodes || []) tree += treeNode(n);
           return ok(tree);
-        } catch (error) { return err(`${error.code ? `${error.code}: ` : ""}${error.message}`); }
+        } catch (error) { return err(describeError(error)); }
       }
 
       case "get_design_texts": {
@@ -387,7 +438,7 @@ async function startMCP() {
           let r = `# Text Content (${texts.length} nodes)\n\n| Path | Text | Font | Size |\n|---|---|---|---|\n`;
           texts.forEach(t => { r += `| ${t.path.replace(/\|/g, "\\|")} | ${(t.characters || "").replace(/\|/g, "\\|")} | ${t.fontFamily || "-"} | ${t.fontSize || "-"} |\n`; });
           return ok(r);
-        } catch (error) { return err(`${error.code ? `${error.code}: ` : ""}${error.message}`); }
+        } catch (error) { return err(describeError(error)); }
       }
 
       case "get_design_colors": {
@@ -400,7 +451,7 @@ async function startMCP() {
           let r = `# Color Palette (${keys.length} unique)\n\n| Color | Count | Examples |\n|---|---|---|\n`;
           for (const color of sorted) { const ex = [...new Set(palette[color].map(u => u.node))].slice(0, 3).join(", "); r += `| ${color} | ${palette[color].length} | ${ex} |\n`; }
           return ok(r);
-        } catch (error) { return err(`${error.code ? `${error.code}: ` : ""}${error.message}`); }
+        } catch (error) { return err(describeError(error)); }
       }
 
       case "search_design": {
@@ -422,20 +473,30 @@ async function startMCP() {
             r += "\n";
           });
           return ok(r);
-        } catch (error) { return err(`${error.code ? `${error.code}: ` : ""}${error.message}`); }
+        } catch (error) { return err(describeError(error)); }
       }
 
       case "get_design_info": {
         try {
           const design = await resolveDesign(args);
           return ok(`**Page:** ${design?.pageName || "—"}\n**File:** ${design?.fileName || "—"}\n**Type:** ${design?.type || "—"}\n**Source:** ${design?.source || "legacy-plugin"}\n**Nodes:** ${design?.nodeCount ?? 0}\n**Synced at:** ${design?.syncedAt || design?.savedAt || "Never"}\n**Data dir:** ${DATA_DIR}`);
-        } catch (error) { return err(`${error.code ? `${error.code}: ` : ""}${error.message}`); }
+        } catch (error) { return err(describeError(error)); }
       }
 
       default:
         return err(`Unknown tool: ${name}`);
     }
+  };
+
+  mcp.setRequestHandler(CallToolRequestSchema, async req => {
+    callsInFlight += 1;
+    try {
+      return await callTool(req);
+    } finally {
+      callsInFlight -= 1;
+    }
   });
+  mcp.oninitialized = () => { clientConnected = true; };
 
   const transport = new StdioServerTransport();
   await mcp.connect(transport);
@@ -444,14 +505,47 @@ async function startMCP() {
 
 // ── Entry ──────────────────────────────────────────────────
 
-async function shutdown() {
-  log("Shutting down...");
-  try { if (bridgeDescriptor?.owned) await bridgeDescriptor.close(); } catch {}
+let clientConnected = false;
+let callsInFlight = 0;
+let shuttingDown = false;
+
+async function shutdown(reason) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  log(`Shutting down: ${reason}`);
+  // Answer the tool calls already running, including ones that arrived with the
+  // last stdin data and have not started yet, then let the transport write.
+  const deadline = Date.now() + 5000;
+  do {
+    await new Promise(resolve => setTimeout(resolve, 50));
+  } while (callsInFlight > 0 && Date.now() < deadline);
+  await new Promise(resolve => setTimeout(resolve, 50));
+  try { if (bridge?.descriptor.owned) await bridge.descriptor.close(); } catch {}
   process.exit(0);
 }
-process.on("SIGINT", shutdown);
-process.on("SIGTERM", shutdown);
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));
 
-ensureDirs();
-await ensureBridge();
+// An MCP client ends a stdio server by closing its stdin; the bridge listener
+// would otherwise keep this process, and the port, alive as an orphan. A
+// process started with no client at all (stdin already closed) is hosting the
+// bridge on purpose, so it keeps running.
+let stdinClosed = false;
+function onStdinClosed() {
+  if (stdinClosed) return;
+  stdinClosed = true;
+  if (clientConnected) {
+    shutdown("the MCP client closed stdin");
+  } else {
+    log("stdin closed before any MCP client connected; hosting the bridge until stopped. `npm start` does this without the MCP server.");
+  }
+}
+process.stdin.on("end", onStdinClosed);
+process.stdin.on("close", onStdinClosed);
+
 await startMCP();
+
+// Start or reuse the bridge right away so the Figma plugin can connect before
+// the first tool call. A failure is not fatal: the snapshot tools work without
+// the bridge, and the bridge tools report the reason and try again.
+ensureBridge().catch(error => log(`Bridge unavailable: ${describeError(error)}`));
