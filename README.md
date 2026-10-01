@@ -33,6 +33,28 @@ open Figma document, with no REST token and no manual Sync click. It is wired up
 but not yet proven end to end in Figma, so it is not a supported path yet — see
 [Request-Driven Plugin Bridge](#request-driven-plugin-bridge-phase-1).
 
+## Fastest setup: Claude Code + Figma, nothing to copy
+
+1. Install the Claude Code plugin. It runs the bridge for you:
+   ```bash
+   claude plugin marketplace add nathanpixodeo/figma-design-bridge
+   claude plugin install figma-bridge@figma-design-bridge
+   ```
+2. In Figma desktop, import `plugin/manifest.json` from a clone of this repository
+   once (**Plugins → Development → Import plugin from manifest…**). Open your file
+   and run **Plugins → Development → Design Bridge → Open Design Bridge**.
+3. Press **Pair with bridge**. The panel shows a 6-digit code. In Claude Code, run
+   `/figma-bridge:pair <code>`. The panel saves the token and connects.
+
+From then on, opening the panel connects by itself, and you can paste any node
+link of that file into Claude Code. Figma tells the plugin which file it is in,
+so no link has to be pasted into the panel; if your Figma account does not, the
+panel asks for the file's link once per document.
+
+Without Claude Code, start the bridge with `npm start` and approve the code with
+`npm run bridge:pair -- <code>` instead. Copying the token by hand
+(`npm run bridge:token`) still works, under **Advanced** in the panel.
+
 ---
 
 ## Architecture
@@ -172,8 +194,15 @@ controls apply to every route, and all three are on by default — see
 ### 3. Pair with the Bridge Token
 
 Everything that reads or writes design data needs a local token. The server
-creates one on first start and keeps it in `<dataDir>/bridge-token.json`. Print
-it with:
+creates one on first start and keeps it in `<dataDir>/bridge-token.json`.
+
+**The Figma plugin pairs by itself.** Press **Pair with bridge** in its panel and
+approve the 6-digit code it shows, with `/figma-bridge:pair <code>` in Claude
+Code or `npm run bridge:pair -- <code>` in this folder. The plugin then receives
+the token and remembers it per Figma user. The code expires after two minutes,
+and nothing is handed out until someone who already has the token approves it.
+
+For scripts and `curl`, print the token with:
 
 ```bash
 npm run bridge:token
@@ -191,9 +220,8 @@ export BRIDGE_TOKEN="$(npm run --silent bridge:token)"
 `npm run import:figma` finds the token by itself, from `FIGMA_BRIDGE_TOKEN` if
 that is set and otherwise from the data directory.
 
-The Figma plugin has a **Bridge token** field in its panel: paste the value
-there once and it is remembered per Figma user, so subsequent syncs authenticate
-themselves.
+The plugin also has a **Bridge token** field under **Advanced**, if you prefer to
+paste the value there yourself.
 
 > **Breaking change in 1.1.0.** `/design`, `/snapshots` and the rest used to
 > answer without a token. Scripts written against 1.0.x get `401` until they
@@ -205,10 +233,11 @@ themselves.
 ### 4a. Sync from the plugin (no Figma token)
 
 Install `plugin/` as a local development plugin (see
-[Figma Plugin](#figma-plugin-token-free-path)), open the file you want, paste the
-bridge token into the plugin's **Bridge token** field, then run
-**Plugins → Development → Design Bridge → Sync Full Page**. The plugin posts the
-page straight to the running server.
+[Figma Plugin](#figma-plugin-token-free-path)), open the file you want and run
+**Plugins → Development → Design Bridge → Open Design Bridge**. Pair it once (see
+step 3), then press **Sync page** or **Sync selection**; the panel posts straight
+to the running server. **Quick Sync → Sync Full Page** does the same without
+opening the panel, once the plugin is paired.
 
 ### 4b. Import a Design from Chrome (REST path, Figma token required)
 
@@ -510,9 +539,10 @@ The server validates all incoming request payloads and returns appropriate HTTP 
 
 > **Status: phase 1 complete, phase 2 in progress.** The modules under
 > `server/bridge/` are covered by tests, both the HTTP server and the MCP server
-> mount them under `/bridge/`, and the Figma plugin's **Connect On-Demand
-> Bridge** command opens a session and answers polls. What is still missing is
-> the manual Figma acceptance run described under
+> mount them under `/bridge/`, and the Figma plugin's **Open Design Bridge**
+> panel pairs, opens a session and answers polls. Live reads against a real
+> Figma file have worked; what is still missing is the full manual acceptance
+> run described under
 > [Known gaps](#known-gaps-before-this-works-end-to-end), so treat this path as
 > unproven end to end and keep using the two paths above for real work.
 
@@ -591,9 +621,13 @@ the same command on Linux and Windows against Node 20, 22 and 24.
 
 ### Known gaps before this works end to end
 
-- No manual Figma acceptance run has been performed against the `/bridge/*`
-  routes yet. The plugin's **Connect On-Demand Bridge** command speaks them; its
-  Sync commands still post to `POST /design`.
+- The full manual acceptance checklist in
+  [docs/PLAN_PLUGIN_ON_DEMAND_MCP.md](docs/PLAN_PLUGIN_ON_DEMAND_MCP.md) has not
+  been run against the `/bridge/*` routes yet, although live reads of a real
+  Figma file have worked. The panel's live reads use them; its Sync buttons
+  still post to `POST /design`.
+- The first read after opening a large file can take longer than the 30-second
+  read timeout, while Figma loads its pages for the first time. Retrying is fast.
 
 ---
 
@@ -634,30 +668,33 @@ Use the REST path instead if you cannot install local plugins, or if you need to
 read a file you do not have open. The two paths write to the same cache and are
 never both required.
 
+### The Panel
+
+**Plugins → Development → Design Bridge → Open Design Bridge** opens one panel for everything:
+
+- **Pair with bridge** (first time only) shows a 6-digit code. Approve it in Claude Code with `/figma-bridge:pair <code>`, or in a terminal with `npm run bridge:pair -- <code>`. The plugin then saves the token per Figma user.
+- **Connect / Disconnect.** Once paired, the panel connects by itself whenever it opens. While it is open, agents can read any node of this file by its link, on any page, without changing your selection. Keep the panel open.
+- **Sync page / Sync selection** post the current page, or the selected nodes and their descendants, to the bridge's snapshot cache.
+- **Auto-sync page changes** is off by default. When on, edits and page switches re-sync the current page, debounced for 800 ms. Only one upload runs at a time; changes made during an upload are coalesced into one fresh snapshot.
+- **Advanced** holds the bridge URL, the bridge token (to paste it by hand) and, only when Figma does not tell the plugin which file it is in, the file's link, remembered per document.
+
+The panel shows the file, the last node an agent read and the last sync. HTTP and network errors are shown, and a stalled upload times out after 30 seconds.
+
 ### Menu Commands
 
 | Command | Action |
 |---------|--------|
-| **Connect On-Demand Bridge** | Opens a session with the bridge for the current file and answers live reads from MCP clients, on any page, without changing the selection. See [Request-Driven Plugin Bridge](#request-driven-plugin-bridge-phase-1). |
-| **Sync Full Page** | Serializes the whole current page, including descendants, regardless of the current selection |
-| **Sync Selected Nodes** | Serializes selected nodes and their descendants; requires a non-empty selection |
-| **Watch Mode (Auto-Sync)** | Syncs the whole current page on opening, then automatically after design edits or page switches. Includes Sync Now and an Auto-sync toggle. |
+| **Open Design Bridge** | The panel above: pairing, live reads, sync buttons and auto-sync |
+| **Quick Sync → Sync Full Page** | Serializes the whole current page, including descendants, regardless of the current selection, then closes |
+| **Quick Sync → Sync Selected Nodes** | Serializes selected nodes and their descendants, then closes; requires a non-empty selection |
 
-### Watch Mode
+The Quick Sync commands use the token saved by pairing.
 
-Watch Mode sends every frame and nested layer on the **current page**; you do not need to select or click each node. It sends an initial snapshot as soon as its panel opens, then watches document edits and page switches. Selecting a different layer does not shrink the synced data to that selection.
+Syncing is **current-page sync, not whole-file sync**. Syncing another page replaces the server's current design; previous snapshots remain subject to the server's retention limit. Closing the panel stops live reads and auto-sync, but cached data remains readable. The sync path posts directly to your local bridge and never calls Figma's REST API.
 
-- Start the local bridge server, open the editable Figma copy on the page you want, then run **Plugins → Development → Design Bridge → Watch Mode (Auto-Sync)**. Keep the panel open.
-- **Auto-sync toggle** — pauses future automatic updates (an upload already in progress may finish). Re-enabling sends a fresh page snapshot.
-- **Sync Now button** — manually sends the whole current page, even when auto-sync is disabled.
-- **Debounce and queue** — edits/page switches are debounced for 800 ms. Only one upload runs at a time; changes during an upload are coalesced into a fresh snapshot afterward.
-- **Status** — the panel shows the last successfully synced page, recursive node count, and sync time. HTTP/network errors are shown; a stalled upload times out after 30 seconds. Use **Sync Now** to retry.
+The plugin uses Figma's [`documentchange` and `currentpagechange` events](https://developers.figma.com/docs/plugins/api/properties/figma-on/) with the legacy document-access manifest. If migrating the manifest to `dynamic-page`, load pages before subscribing to `documentchange` or migrate to page-scoped events. Very large pages may exceed the standalone server's 50 MB request limit; use **Sync selection** on a containing frame or section in that case (its descendants are included).
 
-This is **current-page sync, not whole-file sync**. Moving to another page replaces the server's current design; previous snapshots remain subject to the server's retention limit. Closing the plugin stops live updates, but cached data remains readable. In Watch Mode a Figma URL alone does not fetch an unsynced node; reading a node by its URL is what **Connect On-Demand Bridge** does. This plugin path posts directly to your local bridge and does not invoke Figma's REST import endpoint.
-
-The plugin uses Figma's [`documentchange` and `currentpagechange` events](https://developers.figma.com/docs/plugins/api/properties/figma-on/) with the existing legacy document-access manifest. If migrating the manifest to `dynamic-page`, load pages before subscribing to `documentchange` or migrate to page-scoped events. Very large pages may exceed the standalone server's 50 MB request limit; use **Sync Selected Nodes** on a containing frame/section in that case (its descendants are included).
-
-The plugin menu lists **Connect On-Demand Bridge**, a separator, a **Sync Design** submenu with **Sync Full Page** and **Sync Selected Nodes**, a separator, then **Watch Mode (Auto-Sync)**.
+`plugin/manifest.json` sets `enablePrivatePluginApi`, which lets a development plugin read `figma.fileKey`, so the panel knows which file it is in. Changing the manifest requires **Plugins → Development → Import plugin from manifest…** again. A menu imported before 1.2.0 keeps working until then: **Connect On-Demand Bridge** opens the new panel, and **Watch Mode (Auto-Sync)** still opens the old watch panel.
 
 ### What Gets Serialized
 
@@ -697,7 +734,7 @@ npm install
 
 ### Install as a Claude Code plugin (recommended)
 
-The repository is also a Claude Code plugin marketplace. Installing it registers the MCP server and three slash commands in one step, for every project on the machine:
+The repository is also a Claude Code plugin marketplace. Installing it registers the MCP server and four slash commands in one step, for every project on the machine:
 
 ```bash
 claude plugin marketplace add nathanpixodeo/figma-design-bridge
@@ -709,6 +746,7 @@ claude plugin install figma-bridge@figma-design-bridge
 | `/figma-bridge:verify <node-url> <paths...>` | Compares front-end code against the design and reports every mismatch |
 | `/figma-bridge:page [summary\|tree\|texts\|colors]` | Shows what is currently in the cache, and how stale it is |
 | `/figma-bridge:sync <figma-url>` | Pulls a file or node through the REST API (needs a Figma token) |
+| `/figma-bridge:pair <code>` | Approves the Figma plugin that shows this 6-digit pairing code, so it receives the bridge token without anyone copying it |
 
 The plugin resolves its own paths through `${CLAUDE_PLUGIN_ROOT}`, so nothing breaks when the clone moves, and it caches designs in `${CLAUDE_PLUGIN_DATA}`, which survives plugin updates.
 
@@ -776,7 +814,8 @@ Restart the MCP client after changing its environment configuration.
 | Tool | Description |
 |------|-------------|
 | `get_design_context` | Read a Figma file or exact node through the connected plugin (`source` required; live by default) |
-| `get_bridge_status` | Show bridge readiness, live plugin sessions, cache statistics, and setup hints |
+| `get_bridge_status` | Show bridge readiness, live plugin sessions, how many plugins wait for pairing approval, cache statistics, and setup hints |
+| `approve_figma_pairing` | Approve the Figma plugin that shows this 6-digit pairing code (`code` required). Use only a code the user reads from the plugin |
 | `sync_figma_design` | Explicitly fetch a Figma URL/file key, normalize it, and cache it locally |
 | `get_design_summary` | Full markdown summary for an explicit `source` or the legacy snapshot |
 | `get_design_tree` | ASCII tree for an explicit `source` or the legacy snapshot |
@@ -832,7 +871,9 @@ claude -p "Based on these text nodes, write better copy for the landing page: $T
 
 | Problem | Solution |
 |---------|----------|
-| HTTP `401` from `/design` or `/snapshots` | Send the bridge token: `npm run bridge:token`, then `-H "Authorization: Bearer <token>"`. In the Figma plugin, paste it into the **Bridge token** field. |
+| HTTP `401` from `/design` or `/snapshots` | Send the bridge token: `npm run bridge:token`, then `-H "Authorization: Bearer <token>"`. In the Figma plugin, press **Pair with bridge**, or paste the token under **Advanced**. |
+| The plugin says "No bridge is running at http://localhost:3456" | Open Claude Code with the figma-bridge plugin, or run `npm start`, then press **Pair with bridge** again. |
+| "No Figma plugin is waiting with that code" | The pairing code expired (codes last two minutes) or was mistyped. Press **Pair with bridge** again and approve the new code. |
 | HTTP `403` "addressed to a loopback host" | Reach the server as `localhost` or `127.0.0.1`, not through another host name or a reverse proxy that rewrites `Host`. |
 | HTTP `403` "origin is not allowed" | The request came from a web page on a real origin. Only the Figma plugin iframe (`Origin: null`) and loopback origins are allowed. |
 | `Missing FIGMA_ACCESS_TOKEN` | Export the token before starting the HTTP/MCP process, then restart it. |
@@ -851,8 +892,8 @@ claude -p "Based on these text nodes, write better copy for the landing page: $T
 ```
 figma-bridge/
 ├── plugin/
-│   ├── manifest.json          # Figma plugin manifest (declares networkAccess)
-│   └── code.js                # Plugin sandbox code — Sync posts to /design, the bridge answers /bridge/* reads
+│   ├── manifest.json          # Figma plugin manifest (networkAccess, enablePrivatePluginApi)
+│   └── code.js                # Plugin panel: pairing, live /bridge/* reads, Sync to /design
 ├── server/
 │   ├── data/                  # latest.json + snapshots + bridge-token.json (gitignored)
 │   ├── config.json            # Auto-created config (port, dataDir, maxSnapshots, logLevel)
@@ -860,6 +901,7 @@ figma-bridge/
 │   ├── figma-api.test.js      # Normalizer/import tests
 │   ├── import-figma.mjs       # CLI importer
 │   ├── bridge-token.js        # Prints/rotates the bridge token
+│   ├── bridge-pair.js         # Approves a Figma plugin pairing code from the terminal
 │   ├── data-dir.js            # Read-only data-directory resolution
 │   ├── package.json           # Server metadata
 │   ├── index.js               # HTTP server
@@ -873,6 +915,7 @@ figma-bridge/
 │       ├── cache.js           # Content-addressed cache, atomic writes
 │       ├── broker.js          # Session registry, request queue, timeouts
 │       ├── token.js           # Local bridge token
+│       ├── pairing.js         # Pairing codes that hand the token to the plugin
 │       ├── routes.js          # /bridge/* HTTP surface
 │       ├── daemon.js          # Loopback daemon, safe start-or-reuse
 │       ├── client.js          # Thin client for MCP adapters

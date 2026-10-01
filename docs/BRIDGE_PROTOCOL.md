@@ -37,7 +37,7 @@ to the Figma REST API, and never substitutes cached data for a live read.
 
 ## Authentication
 
-Every route except `GET /bridge/health` requires the **bridge token**:
+Every route except `GET /bridge/health` and the two pairing routes a plugin uses to obtain the token (see [Pairing](#pairing)) requires the **bridge token**:
 
 ```
 Authorization: Bearer <bridge token>
@@ -89,6 +89,9 @@ of envelope. Every route rejects unknown fields rather than ignoring them.
 | `DELETE` | `/bridge/session/:id` | token + session secret |
 | `POST` | `/bridge/read` | token |
 | `GET` | `/bridge/status` | token |
+| `POST` | `/bridge/pair` | none (see [Pairing](#pairing)) |
+| `GET` | `/bridge/pair/:id` | pairing secret |
+| `POST` | `/bridge/pair/approve` | token |
 
 ---
 
@@ -403,6 +406,7 @@ Readiness and actionable setup errors. Never connection secrets.
       "alive": true
     }
   ],
+  "pairing": { "pending": 0 },
   "cache": { "entries": 12, "bytes": 402118 },
   "setupHints": []
 }
@@ -414,6 +418,83 @@ connected, `setupHints` explains what to do.
 
 ---
 
+### Pairing
+
+How the Figma plugin obtains the bridge token without anyone copying it. The
+plugin asks to pair and shows the 6-digit code it gets back. Someone who already
+holds the token approves that code (`approve_figma_pairing` in an MCP client, or
+`npm run bridge:pair -- <code>` in a terminal), and the plugin then collects the
+token once.
+
+Asking and collecting cannot require the token, so they rely on the code
+instead. Anything can ask, including a web page through a sandboxed iframe whose
+origin is the same `null` as the plugin's, which is why nothing is handed out
+before a person approves the code they see in Figma. A code is shown only to its
+requester: never in a log line, and never in `GET /bridge/status`, which reports
+only how many pairings are waiting.
+
+#### `POST /bridge/pair`
+
+No credentials. A request whose `Origin` header is outside the allowlist gets
+`403 FORBIDDEN_ORIGIN`, and one with an unknown field or a name over its limit
+gets `400 BAD_REQUEST`.
+
+```json
+{ "clientName": "Figma Design Bridge plugin", "fileName": "Website" }
+```
+
+Both fields are optional (`clientName` up to 60 characters, `fileName` up to
+200); the approver sees them.
+
+**Response `201 Created`:**
+
+```json
+{
+  "pairingId": "9f2a…",
+  "pairingSecret": "41b0…",
+  "code": "482913",
+  "expiresAt": "2026-09-17T10:02:00.000Z",
+  "protocolVersion": "1.0"
+}
+```
+
+The code expires after two minutes. At most three pairings wait at once and at
+most ten may be requested per minute; beyond that the answer is
+`429 PAIRING_LIMIT`.
+
+#### `GET /bridge/pair/:id`
+
+Requires the pairing secret in the `X-Pairing-Secret` header. Poll it until the
+code is approved or expires.
+
+| Answer | Meaning |
+|--------|---------|
+| `200 { "status": "pending", "expiresAt": "…" }` | Not approved yet |
+| `200 { "status": "approved", "token": "…", "protocolVersion": "1.0" }` | Approved: the bridge token, handed out exactly once |
+| `410 PAIRING_EXPIRED` | The code expired before anyone approved it |
+| `404 PAIRING_NOT_FOUND` | Unknown pairing, or one already collected |
+| `403 FORBIDDEN_ORIGIN` | The request came from a browser origin outside the allowlist |
+| `401 UNAUTHORIZED` | Missing or wrong pairing secret |
+
+#### `POST /bridge/pair/approve`
+
+Requires the bridge token. Spaces and dashes in the code are ignored.
+
+```json
+{ "code": "482913" }
+```
+
+**Response `200 OK`:**
+
+```json
+{ "approved": true, "clientName": "Figma Design Bridge plugin", "fileName": "Website" }
+```
+
+`404 PAIRING_NOT_FOUND` when no pairing is waiting with that code (expired,
+mistyped or already approved); `400 BAD_REQUEST` when the code is not six digits.
+
+---
+
 ## Error codes
 
 Errors are distinguishable by design: an agent can tell "plugin offline" from
@@ -422,6 +503,7 @@ Errors are distinguishable by design: an agent can tell "plugin offline" from
 | Code | Status | Meaning |
 |------|--------|---------|
 | `FORBIDDEN_HOST` | 403 | The `Host` header was not a loopback host |
+| `FORBIDDEN_ORIGIN` | 403 | A browser origin outside the allowlist asked to pair |
 | `BAD_REQUEST` | 400 | Schema violation or unknown field |
 | `INVALID_JSON` | 400 | Body was not valid JSON |
 | `INVALID_SOURCE` | 400 | Source was not a resolvable Figma URL or file key |
@@ -429,9 +511,12 @@ Errors are distinguishable by design: an agent can tell "plugin offline" from
 | `FILE_MISMATCH` | 403 | A session tried to act on another file |
 | `NODE_NOT_FOUND` | 404 | The plugin could not find that node in that file |
 | `NO_CACHED_DATA` | 404 | `mode: "cached"` with nothing cached |
+| `PAIRING_NOT_FOUND` | 404 | No pairing is waiting with that code or id |
 | `SESSION_NOT_FOUND` | 404 | The session is no longer registered |
 | `NO_SESSION_FOR_FILE` | 409 | No plugin session is connected for that file |
+| `PAIRING_EXPIRED` | 410 | The pairing code expired before it was approved |
 | `PAYLOAD_TOO_LARGE` | 413 | Body exceeded the route's limit: 2,000,000 bytes, or 51,000,000 for a plugin reply |
+| `PAIRING_LIMIT` | 429 | Too many pairings waiting or requested |
 | `QUEUE_FULL` | 429 | That session's queue is at its limit |
 | `TOO_MANY_PENDING` | 429 | The bridge-wide pending limit was reached |
 | `INTERNAL_ERROR` | 500 | Unmapped failure |

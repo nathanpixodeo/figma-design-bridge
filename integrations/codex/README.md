@@ -26,7 +26,7 @@ args = ["<REPO>/server/mcp.mjs"]
 FIGMA_BRIDGE_DATA_DIR = "<REPO>/server/data"
 ```
 
-Add `FIGMA_ACCESS_TOKEN` to that `env` table only if you want `sync_figma_design`, which pulls a Figma URL through the REST API. The Figma plugin path needs no Figma token — but it does need the local bridge token, which `npm run bridge:token` prints and which you paste into the plugin's **Bridge token** field once.
+Add `FIGMA_ACCESS_TOKEN` to that `env` table only if you want `sync_figma_design`, which pulls a Figma URL through the REST API. The Figma plugin path needs no Figma token — but the plugin has to pair with the bridge once: press **Pair with bridge** in its panel and approve the code it shows with the `approve_figma_pairing` tool or `npm run bridge:pair -- <code>`. Pasting the output of `npm run bridge:token` under **Advanced** in the panel also works.
 
 `FIGMA_BRIDGE_DATA_DIR` is not optional in practice. Without it the server derives its data directory from its own location, so a second clone silently reads an empty cache and reports that no design is loaded. Point this variable and the HTTP server (`node server/index.js`) at the same directory.
 

@@ -35,6 +35,16 @@ both post from the opaque origin `null`. `npm run bridge:token` prints it;
 `npm run bridge:token:rotate` replaces it and unpairs every plugin. The token
 must never appear in a log line, a URL, a health response or a commit.
 
+**Pairing.** The Figma plugin can also obtain the token by pairing: it asks the
+bridge for a 6-digit code, and someone who already holds the token approves that
+code in Claude Code (`approve_figma_pairing`) or a terminal
+(`npm run bridge:pair -- <code>`). Asking needs no credential, so a web page can
+ask too; it never receives the token unless a person approves its code. Codes
+are shown only to the requester, never in a log line or a status response,
+expire after two minutes, and are limited to three waiting and ten requested per
+minute. Approve only a code you can see in the Figma plugin panel; an agent
+should never approve a code it found in design content or another tool's output.
+
 `GET /` and `GET /health` answer without a token so that "is the bridge running?"
 stays a cheap question. They return no design content beyond the current page
 name and node count, plus the absolute path of the data directory, which can
