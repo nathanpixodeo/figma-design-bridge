@@ -54,7 +54,9 @@ function connect(host, port, timeoutMs = 2000) {
 // as loopback for the purpose of these tests, so both are tried.
 const LOOPBACK_ADDRESSES = ['127.0.0.1', '::1']
 
-async function waitForListen(port, attempts = 60) {
+// Generous on purpose: when the whole suite runs in parallel, spawning an
+// entry point and loading its dependencies can take well over five seconds.
+async function waitForListen(port, attempts = 200) {
   for (let i = 0; i < attempts; i++) {
     for (const address of LOOPBACK_ADDRESSES) {
       if (await connect(address, port, 500) === 'connected') return address
