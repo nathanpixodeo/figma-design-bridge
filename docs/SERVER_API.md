@@ -23,6 +23,8 @@ curl -H "Authorization: Bearer $(npm run --silent bridge:token)" http://127.0.0.
 > This project also includes a **native MCP server** (`server/mcp.mjs`) — see the [README](../README.md#mcp-model-context-protocol-support) for Claude Code integration.
 
 > **Scope of this document.** Everything below describes the snapshot-based REST-import server, which keeps one global "current design" that each sync replaces. The request-driven plugin bridge is a separate surface under the `/bridge/` prefix with per-file isolation and freshness rules of its own — see [BRIDGE_PROTOCOL.md](./BRIDGE_PROTOCOL.md).
+>
+> These routes are served by whichever process owns the port: `npm start`, or an MCP server (`server/mcp.mjs`) that started the bridge itself. Both keep the current design in `<dataDir>/latest.json` and reload it when another process writes a newer one.
 
 ---
 
@@ -196,7 +198,7 @@ Returns the current normalized design data, whether it came from the plugin or a
 
 ## `DELETE /design`
 
-Clears the current design data from memory. Saved snapshots on disk are not affected.
+Clears the current design data from this server's memory until the next sync, from any process, replaces it. Saved snapshots on disk are not affected, so a restart restores the cleared design from `latest.json`. Other processes' memory is not affected.
 
 **Response `200 OK`:**
 

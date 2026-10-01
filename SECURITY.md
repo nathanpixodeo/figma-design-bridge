@@ -37,7 +37,8 @@ must never appear in a log line, a URL, a health response or a commit.
 
 `GET /` and `GET /health` answer without a token so that "is the bridge running?"
 stays a cheap question. They return no design content beyond the current page
-name and node count, and the Host and Origin checks still apply.
+name and node count, plus the absolute path of the data directory, which can
+include your user name. The Host and Origin checks still apply.
 
 ## Known weakening you can opt into
 

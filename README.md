@@ -274,20 +274,21 @@ curl http://localhost:3456/health
   "hasDesign": true,
   "pageName": "Page 1",
   "nodeCount": 142,
+  "snapshotCount": 5,
+  "dataDir": "/path/to/figma-design-bridge/server/data",
   "endpoints": [
-    "GET     /",
-    "POST   /figma/import",
-    "POST   /design",
+    "GET  /health",
+    "POST /figma/import",
+    "POST /design",
+    "GET  /design",
     "DELETE /design",
-    "GET    /design",
-    "GET    /design/summary",
-    "GET    /design/tree",
-    "GET    /design/texts",
-    "GET    /design/colors",
-    "GET    /design/search?q=",
-    "GET    /snapshots",
-    "GET    /snapshots/:filename",
-    "GET    /health"
+    "GET  /design/summary",
+    "GET  /design/tree",
+    "GET  /design/texts",
+    "GET  /design/colors",
+    "GET  /design/search?q=",
+    "GET  /snapshots",
+    "GET  /snapshots/:filename"
   ]
 }
 ```
@@ -430,14 +431,16 @@ curl -H "Authorization: Bearer $BRIDGE_TOKEN" "http://localhost:3456/design/sear
 
 ### `DELETE /design`
 
-Clears the current design from the server memory.
+Clears the current design from this server's memory until the next sync, from
+any process, replaces it. Snapshots stay on disk, so a restart restores the
+cleared design from `latest.json`. Other processes' memory is not affected.
 
 ```bash
 curl -H "Authorization: Bearer $BRIDGE_TOKEN" -X DELETE http://localhost:3456/design
 ```
 
 ```json
-{ "status": "ok", "message": "Design cleared" }
+{ "message": "Design data cleared from memory. Snapshots remain on disk." }
 ```
 
 ### `GET /snapshots`
@@ -469,10 +472,10 @@ Newest first. A snapshot whose contents cannot be read still appears, with an
 
 ### `GET /snapshots/:filename`
 
-Loads a specific snapshot into memory, replacing the current design.
+Returns one saved snapshot. The current design is not changed.
 
 ```bash
-curl -H "Authorization: Bearer $BRIDGE_TOKEN" http://localhost:3456/snapshots/design-2026-06-15T10-30-00.json
+curl -H "Authorization: Bearer $BRIDGE_TOKEN" http://localhost:3456/snapshots/2026-06-15T10-30-00.000Z.json
 ```
 
 ---
@@ -483,9 +486,11 @@ curl -H "Authorization: Bearer $BRIDGE_TOKEN" http://localhost:3456/snapshots/de
 
 Design snapshots are automatically saved to `server/data/snapshots/` after each sync. On restart, the server loads the latest snapshot from disk, so your design survives server restarts. The server keeps a maximum of 50 snapshots, pruning the oldest automatically.
 
+`latest.json` is shared: when another process — the MCP server or a second `npm start` on the same data directory — writes a newer one, the next read picks it up without a restart.
+
 ### Graceful Shutdown
 
-The server handles SIGINT and SIGTERM signals, saving the current design to disk before shutting down.
+Every sync is written to disk when it arrives, so nothing is lost on exit. SIGINT and SIGTERM close the listener, and the process is forced to exit after 5 seconds.
 
 ### Logging
 
@@ -504,9 +509,10 @@ The server validates all incoming request payloads and returns appropriate HTTP 
 ## Request-Driven Plugin Bridge (Phase 1)
 
 > **Status: phase 1 complete, phase 2 in progress.** The modules under
-> `server/bridge/` are covered by tests and the HTTP server mounts them under
-> `/bridge/`, and the Figma plugin now opens a session and answers polls. What is
-> still missing is the manual Figma acceptance run described under
+> `server/bridge/` are covered by tests, both the HTTP server and the MCP server
+> mount them under `/bridge/`, and the Figma plugin's **Connect On-Demand
+> Bridge** command opens a session and answers polls. What is still missing is
+> the manual Figma acceptance run described under
 > [Known gaps](#known-gaps-before-this-works-end-to-end), so treat this path as
 > unproven end to end and keep using the two paths above for real work.
 
@@ -559,7 +565,9 @@ Design rules it enforces:
   rebinding, and CORS is an explicit origin allowlist, never `*`.
 - **Limits are explicit.** Truncation is reported as
   `completeness: { nodeCount, byteSize, limitHit, truncatedNodeIds }`, so a
-  bounded response never claims to be the whole design.
+  bounded response never claims to be the whole design. `maxBytes` counts UTF-8
+  bytes, and a cut keeps the subtree in document order up to the limit rather
+  than collapsing it to the requested node.
 
 The token lives in `<dataDir>/bridge-token.json`, which `.gitignore` excludes. It
 is never included in a health response, a session listing, a snapshot or a log
@@ -583,8 +591,9 @@ the same command on Linux and Windows against Node 20, 22 and 24.
 
 ### Known gaps before this works end to end
 
-- No manual Figma acceptance run has been performed against the new `/bridge/*`
-  routes yet. The plugin still targets `POST /design`.
+- No manual Figma acceptance run has been performed against the `/bridge/*`
+  routes yet. The plugin's **Connect On-Demand Bridge** command speaks them; its
+  Sync commands still post to `POST /design`.
 
 ---
 
@@ -629,6 +638,7 @@ never both required.
 
 | Command | Action |
 |---------|--------|
+| **Connect On-Demand Bridge** | Opens a session with the bridge for the current file and answers live reads from MCP clients, on any page, without changing the selection. See [Request-Driven Plugin Bridge](#request-driven-plugin-bridge-phase-1). |
 | **Sync Full Page** | Serializes the whole current page, including descendants, regardless of the current selection |
 | **Sync Selected Nodes** | Serializes selected nodes and their descendants; requires a non-empty selection |
 | **Watch Mode (Auto-Sync)** | Syncs the whole current page on opening, then automatically after design edits or page switches. Includes Sync Now and an Auto-sync toggle. |
@@ -643,11 +653,11 @@ Watch Mode sends every frame and nested layer on the **current page**; you do no
 - **Debounce and queue** — edits/page switches are debounced for 800 ms. Only one upload runs at a time; changes during an upload are coalesced into a fresh snapshot afterward.
 - **Status** — the panel shows the last successfully synced page, recursive node count, and sync time. HTTP/network errors are shown; a stalled upload times out after 30 seconds. Use **Sync Now** to retry.
 
-This is **current-page sync, not whole-file sync**. Moving to another page replaces the server's current design; previous snapshots remain subject to the server's retention limit. Closing the plugin stops live updates, but cached data remains readable. A Figma URL alone does not yet make this plugin open another file or fetch an unsynced node. This plugin path posts directly to your local bridge and does not invoke Figma's REST import endpoint.
+This is **current-page sync, not whole-file sync**. Moving to another page replaces the server's current design; previous snapshots remain subject to the server's retention limit. Closing the plugin stops live updates, but cached data remains readable. In Watch Mode a Figma URL alone does not fetch an unsynced node; reading a node by its URL is what **Connect On-Demand Bridge** does. This plugin path posts directly to your local bridge and does not invoke Figma's REST import endpoint.
 
 The plugin uses Figma's [`documentchange` and `currentpagechange` events](https://developers.figma.com/docs/plugins/api/properties/figma-on/) with the existing legacy document-access manifest. If migrating the manifest to `dynamic-page`, load pages before subscribing to `documentchange` or migrate to page-scoped events. Very large pages may exceed the standalone server's 50 MB request limit; use **Sync Selected Nodes** on a containing frame/section in that case (its descendants are included).
 
-The plugin menu now includes a **Sync Design** submenu with **Full Page** and **Selected Nodes**, a separator, then **Watch Mode (Auto-Sync)**.
+The plugin menu lists **Connect On-Demand Bridge**, a separator, a **Sync Design** submenu with **Sync Full Page** and **Sync Selected Nodes**, a separator, then **Watch Mode (Auto-Sync)**.
 
 ### What Gets Serialized
 
@@ -702,7 +712,7 @@ claude plugin install figma-bridge@figma-design-bridge
 
 The plugin resolves its own paths through `${CLAUDE_PLUGIN_ROOT}`, so nothing breaks when the clone moves, and it caches designs in `${CLAUDE_PLUGIN_DATA}`, which survives plugin updates.
 
-That data directory is the one thing worth understanding before you sync. The MCP server also tries to listen on port 3456, and when it succeeds it is itself the endpoint the Figma plugin posts to — install, sync from Figma, done. But if a standalone `node server/index.js` already holds 3456, that process receives the sync and writes it to *its* data directory, and the plugin's tools will correctly report that nothing is loaded. Either let the plugin's MCP server own the port, or start the standalone server against the same directory:
+That data directory is the one thing worth understanding before you sync. The MCP server also tries to listen on port 3456, and when it succeeds it is itself the endpoint the Figma plugin posts to — it serves both the Sync commands' `/design` and the `/bridge/*` routes, so install, sync from Figma, done. But if a standalone `node server/index.js` already holds 3456 with its own data directory, that process receives the sync and writes it there: the plugin's snapshot tools report that nothing is loaded, and its bridge tools fail with `NO_TOKEN` or `UNAUTHORIZED`, naming the fix. Either let the plugin's MCP server own the port, or start the standalone server against the same directory:
 
 ```bash
 # print the directory the plugin's MCP server is reading
@@ -741,12 +751,23 @@ If you would rather not install the plugin, add to your `claude.json` or MCP con
 whole `env` block if you feed the bridge from the plugin — every other tool
 reads the local cache and needs no credential.
 
-The MCP server communicates with Claude Code via stdio and also tries to start a
-local HTTP endpoint on port 3456 for plugin syncs. If another process already
-holds that port — typically `node server/index.js` — the MCP server logs the
-clash, skips the listener and keeps serving over stdio, reading snapshots from
-the same data directory. Running both is therefore safe. Restart the MCP client
-after changing its environment configuration.
+The MCP server communicates with Claude Code via stdio and also starts the local
+bridge on port 3456 — `/bridge/*` plus the `/design` routes the plugin's Sync
+commands post to — or reuses the one already running there:
+
+- `node server/index.js` on the **same** data directory is reused, so running
+  both is safe.
+- Anything else on that port — another program, or a bridge on a different data
+  directory — does not stop the MCP server. The snapshot tools keep reading the
+  data directory, and `get_bridge_status` and `get_design_context` report
+  `PORT_OCCUPIED`, `NO_TOKEN` or `UNAUTHORIZED` with the fix.
+- When the process that owns the port exits, another running MCP server takes
+  the port over within about 10 seconds, or at its next bridge call.
+- When its MCP client closes stdin, the server answers the calls in flight,
+  exits and frees the port. Started without any client (stdin already closed),
+  it keeps hosting the bridge; `npm start` is the usual way to do that.
+
+Restart the MCP client after changing its environment configuration.
 
 > **Note:** Use the absolute path to `server/mcp.mjs` in your MCP config.
 
@@ -831,7 +852,7 @@ claude -p "Based on these text nodes, write better copy for the landing page: $T
 figma-bridge/
 ├── plugin/
 │   ├── manifest.json          # Figma plugin manifest (declares networkAccess)
-│   └── code.js                # Plugin sandbox code — POSTs the page to /design
+│   └── code.js                # Plugin sandbox code — Sync posts to /design, the bridge answers /bridge/* reads
 ├── server/
 │   ├── data/                  # latest.json + snapshots + bridge-token.json (gitignored)
 │   ├── config.json            # Auto-created config (port, dataDir, maxSnapshots, logLevel)
@@ -842,9 +863,12 @@ figma-bridge/
 │   ├── data-dir.js            # Read-only data-directory resolution
 │   ├── package.json           # Server metadata
 │   ├── index.js               # HTTP server
+│   ├── legacy-routes.js       # /design, /figma/import, /snapshots (shared by both servers)
+│   ├── snapshot-store.js      # latest.json + snapshots, reloaded when another process writes
 │   ├── legacy-auth.test.js    # Access control on the snapshot routes
 │   ├── mcp.mjs                # MCP server (requires @modelcontextprotocol/sdk)
-│   └── bridge/                # Request-driven plugin bridge (phase 1, not yet wired in)
+│   ├── mcp.test.mjs           # MCP server over stdio: bridge startup, reuse, takeover, shutdown
+│   └── bridge/                # Request-driven plugin bridge, mounted under /bridge/
 │       ├── identity.js        # Figma URL/node-id parsing and cache keys
 │       ├── cache.js           # Content-addressed cache, atomic writes
 │       ├── broker.js          # Session registry, request queue, timeouts

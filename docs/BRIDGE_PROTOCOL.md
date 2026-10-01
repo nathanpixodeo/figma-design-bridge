@@ -1,11 +1,10 @@
 # Bridge Protocol (`/bridge/*`)
 
-Status: **phase 1 implemented, not yet wired into `npm start`.** The modules in
-`server/bridge/` are complete and tested in isolation. The Figma plugin and the
-MCP adapter that consume them land in phase 2, so nothing below is reachable
-from the currently running server yet. See
-[the implementation plan](./PLAN_PLUGIN_ON_DEMAND_MCP.md) for the phase
-breakdown.
+Status: **implemented, not yet accepted in a manual Figma run.** Both
+`npm start` and the MCP server mount these routes, and the Figma plugin's
+**Connect On-Demand Bridge** command opens a session and answers reads. See
+[the implementation plan](./PLAN_PLUGIN_ON_DEMAND_MCP.md) for the remaining
+acceptance work.
 
 This document describes the request-driven bridge: a shared loopback daemon that
 lets an MCP client paste a Figma node URL and read that node live, out of the
@@ -70,8 +69,10 @@ Two further guards apply to every `/bridge/*` request:
   from. A wildcard `*` is filtered out of the allowlist and is never sent on an
   authenticated route.
 
-Request bodies are capped at 2,000,000 bytes (`413 PAYLOAD_TOO_LARGE`). Every
-route rejects unknown fields rather than ignoring them.
+Request bodies are capped at 2,000,000 bytes (`413 PAYLOAD_TOO_LARGE`), except
+a plugin reply (`POST /bridge/session/:id/reply`), which may carry up to
+51,000,000 bytes: the largest `maxBytes` a read can ask for plus 1,000,000 bytes
+of envelope. Every route rejects unknown fields rather than ignoring them.
 
 ---
 
@@ -280,13 +281,13 @@ The route an MCP adapter calls with the URL a user pasted.
 | `timeoutMs` | No | 1–120000, default 30000 |
 | `options` | No | See below |
 
-| Option | Range |
-|--------|-------|
-| `representation` | short identifier, `[A-Za-z0-9_.+-]{1,40}` |
-| `depth` | integer 0–50 |
-| `maxNodes` | integer 1–200000 |
-| `maxBytes` | integer 1–50000000 |
-| `includeHidden` | boolean |
+| Option | Range | Plugin default |
+|--------|-------|----------------|
+| `representation` | short identifier, `[A-Za-z0-9_.+-]{1,40}` | `node-subtree` or `document-index` |
+| `depth` | integer 0–50; the plugin serializes at most 30 levels | 12 |
+| `maxNodes` | integer 1–200000 | 5000 |
+| `maxBytes` | integer 1024–50000000, in UTF-8 bytes of the serialized payload | 2000000 |
+| `includeHidden` | boolean; hidden layers come back with `visible: false` | `true` |
 
 A URL `node-id` in dash form (`1-23`) is canonicalized to colon form (`1:23`).
 A source with no node id asks for a lightweight document index rather than a
@@ -294,7 +295,17 @@ whole-file dump.
 
 Options that change the payload also change the `representation` string, so they
 are part of the cache key — a `depth: 12` read can never be served from a
-`depth: 3` entry.
+`depth: 3` entry. Because hidden layers are included by default, only
+`includeHidden: false` changes the key (`+visible-only`); `true` shares the
+default entry.
+
+When a limit cuts the payload, the plugin keeps the subtree in document order
+and drops what comes last. A node whose children were cut carries
+`truncated: true`, and `completeness` describes what was returned: `nodeCount`
+counts the node objects in the payload (placeholders included), `byteSize` is
+its UTF-8 size, and `truncatedNodeIds` lists the ids of nodes whose content or
+children were cut (for a document index, the entries that were dropped). A
+listed node may itself have been removed by a later cut.
 
 **Response `200 OK`:**
 
@@ -420,7 +431,7 @@ Errors are distinguishable by design: an agent can tell "plugin offline" from
 | `NO_CACHED_DATA` | 404 | `mode: "cached"` with nothing cached |
 | `SESSION_NOT_FOUND` | 404 | The session is no longer registered |
 | `NO_SESSION_FOR_FILE` | 409 | No plugin session is connected for that file |
-| `PAYLOAD_TOO_LARGE` | 413 | Body exceeded 2,000,000 bytes |
+| `PAYLOAD_TOO_LARGE` | 413 | Body exceeded the route's limit: 2,000,000 bytes, or 51,000,000 for a plugin reply |
 | `QUEUE_FULL` | 429 | That session's queue is at its limit |
 | `TOO_MANY_PENDING` | 429 | The bridge-wide pending limit was reached |
 | `INTERNAL_ERROR` | 500 | Unmapped failure |
@@ -434,7 +445,7 @@ An error body is **flat**: `error` is the human-readable message string and
 
 ```json
 {
-  "error": "No Figma plugin session is connected for file abc123DEF456. Open that file in Figma, run Plugins → Design Bridge and press Start, then retry. Pass mode \"cached\" to read explicitly unverified data instead.",
+  "error": "No Figma plugin session is connected for file abc123DEF456. Open that file in Figma, run Plugins → Development → Design Bridge → Connect On-Demand Bridge, press Start, then retry. Pass mode \"cached\" to read explicitly unverified data instead.",
   "code": "NO_SESSION_FOR_FILE"
 }
 ```
@@ -503,21 +514,24 @@ re-probes and reuses the winner.
 
 ## Known limitations
 
-- **Not yet wired in.** `server/index.js` and `server/mcp.mjs` do not mount
-  these routes yet; that is phase 2 work. The plugin still speaks to the legacy
-  `POST /design` route.
+- **No manual acceptance run yet.** The plugin's Connect On-Demand Bridge
+  command speaks this protocol, and its Sync commands still post to the legacy
+  `POST /design` route. Neither has been accepted in a real Figma session.
 - **`networkAccess` pins the bridge to port 3456.** `plugin/manifest.json`
   declares `allowedDomains: ["none"]` with `http://localhost:3456` in
   `devAllowedDomains`. Moving the bridge with `FIGMA_BRIDGE_PORT` therefore
   requires editing both the manifest entry and `SERVER_URL` in
-  `plugin/code.js`, then re-importing the plugin. A phase 2 plugin that talks
-  to `/bridge/*` will need the same origin declared.
-- **Port 3456 is shared, not contended.** `server/index.js` and `server/mcp.mjs`
-  both try to bind it, but `mcp.mjs` now treats `EADDRINUSE` as a normal
-  condition: it logs the clash, skips its HTTP ingest listener, and serves MCP
-  over stdio from the same `DATA_DIR` the other process writes to. Running both
-  at once is therefore safe. Making the MCP server a real client of the shared
-  daemon is still phase 2 work.
+  `plugin/code.js`, then re-importing the plugin. The plugin's Bridge URL field
+  has to stay on that declared origin too.
+- **One process owns port 3456.** `server/index.js` and `server/mcp.mjs` both
+  serve `/bridge/*` and the legacy routes. An MCP server that finds this bridge
+  already running reuses it, which works only when both use the same data
+  directory, because the token lives there. When it finds another program, or
+  a bridge on a different data directory, it keeps serving the snapshot tools
+  and its bridge tools report `PORT_OCCUPIED`, `NO_TOKEN` or `UNAUTHORIZED`
+  with the fix. When the process that owns the port exits, a remaining MCP
+  server takes the port over within about 10 seconds, or at its next bridge
+  call.
 - **Token file permissions are best-effort on Windows.** `chmod 0o600` is
   honoured on macOS and Linux; on NTFS the inherited ACL wins and the mode is a
   no-op. The real protection there is that the token lives in the git-ignored
