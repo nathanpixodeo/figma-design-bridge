@@ -10,6 +10,7 @@
     "import:figma": "node server/import-figma.mjs",
     "bridge:token": "node server/bridge-token.js",
     "bridge:token:rotate": "node server/bridge-token.js --rotate",
+    "bridge:pair": "node server/bridge-pair.js",
     "test": "node --test",
     "inspect": "node server/index.js --inspect"
   },

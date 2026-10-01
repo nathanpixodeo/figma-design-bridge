@@ -5,22 +5,21 @@
   "main": "code.js",
   "editorType": ["figma"],
   "capabilities": [],
+  "enablePrivatePluginApi": true,
   "networkAccess": {
     "allowedDomains": ["none"],
     "devAllowedDomains": ["http://localhost:3456"],
-    "reasoning": "The plugin sends the current page or selection to a Design Bridge server the user runs on their own machine. It contacts no external service, so production network access is 'none' and the loopback origin is declared for development only."
+    "reasoning": "The plugin pairs with, answers reads from and syncs pages to a Design Bridge server the user runs on their own machine. It contacts no external service, so production network access is 'none' and the loopback origin is declared for development only."
   },
   "menu": [
-    { "command": "bridge", "name": "Connect On-Demand Bridge" },
+    { "command": "open", "name": "Open Design Bridge" },
     { "separator": true },
     {
-      "name": "Sync Design",
+      "name": "Quick Sync",
       "menu": [
         { "command": "sync-page", "name": "Sync Full Page" },
         { "command": "sync-selection", "name": "Sync Selected Nodes" }
       ]
-    },
-    { "separator": true },
-    { "command": "watch", "name": "Watch Mode (Auto-Sync)" }
+    }
   ]
 }

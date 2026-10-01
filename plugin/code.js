@@ -23,6 +23,7 @@ body{
 .info-grid .label{color:#8E8E93;white-space:nowrap}
 .info-grid .value{color:#F5F5F7;word-break:break-all;min-width:0}
 .actions{display:flex;flex-direction:column;gap:8px}
+.section{margin-bottom:12px}
 .btn-sync{
   background:#007AFF;color:white;border:none;border-radius:7px;
   padding:9px 16px;font-size:13px;font-weight:500;cursor:pointer;
@@ -31,115 +32,153 @@ body{
 .btn-sync:hover{background:#0056CC}
 .btn-sync:active{background:#004499}
 .btn-sync:disabled{opacity:.5;cursor:not-allowed}
-.btn-sync.spinning{pointer-events:none}
-.btn-sync.spinning::after{
-  content:'';width:12px;height:12px;
-  border:2px solid rgba(255,255,255,.3);border-top-color:#fff;
-  border-radius:50%;animation:spin .6s linear infinite
-}
-@keyframes spin{to{transform:rotate(360deg)}}
 .checkbox-row{display:flex;align-items:center;gap:7px;font-size:12px;color:#AEAEB2;cursor:pointer;user-select:none}
 .checkbox-row input{accent-color:#007AFF;cursor:pointer}
 .field{display:flex;flex-direction:column;gap:4px}
 .field label{font-size:11px;color:#8E8E93}
 .field input{background:#1C1C1E;border:1px solid #48484A;color:#F5F5F7;border-radius:6px;padding:7px 8px;font-size:12px;outline:none}
 .field input:focus{border-color:#0A84FF}
-.row{display:flex;gap:8px}
+.row{display:flex;gap:8px;align-items:center}
 .row>*{flex:1}
 .btn-stop{background:#3A3A3C;color:#F5F5F7;border:1px solid #545458;border-radius:7px;padding:9px 16px;font-size:13px;font-weight:500;cursor:pointer}
+.btn-stop:disabled{opacity:.5;cursor:not-allowed}
 .hint{font-size:11px;color:#8E8E93;line-height:1.5}
-.error{color:#FF453A;font-size:11px;margin-top:6px;line-height:1.4;padding:6px 8px;background:rgba(255,69,58,0.08);border-radius:5px}
+.pair{display:flex;flex-direction:column;gap:6px;padding:10px;border-radius:7px;background:#1C1C1E;border:1px solid #3A3A3C}
+.pair-code{font:600 26px/1.3 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;letter-spacing:4px;text-align:center}
+.pair code{display:block;font:11px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:#2C2C2E;border-radius:5px;padding:5px 7px;color:#D1D1D6;user-select:all;word-break:break-all}
+details{margin-top:4px;font-size:12px}
+summary{cursor:pointer;color:#8E8E93;user-select:none;margin-bottom:8px}
+.error{color:#FF453A;font-size:11px;margin-top:10px;line-height:1.4;padding:6px 8px;background:rgba(255,69,58,0.08);border-radius:5px;white-space:pre-line}
 .hidden{display:none!important}
 </style>
 <div id="app">
-  <div class="header">\uD83C\uDFA8 Design Bridge</div>
+  <div class="header">🎨 Design Bridge</div>
   <div id="statusBar" class="status-bar connecting">
     <span class="dot yellow"></span>
     <span id="statusText">Starting...</span>
   </div>
   <div class="info-grid">
     <span class="label" id="pageLabel">Synced page</span>
-    <span class="value" id="pageName">\u2014</span>
+    <span class="value" id="pageName">—</span>
     <span class="label" id="nodeLabel">Nodes</span>
-    <span class="value" id="nodeCount">\u2014</span>
+    <span class="value" id="nodeCount">—</span>
     <span class="label" id="timeLabel">Last sync</span>
-    <span class="value" id="lastSync">\u2014</span>
+    <span class="value" id="lastSync">—</span>
   </div>
-  <div class="actions" id="authActions">
-    <div class="field"><label>Pairing token</label><input id="bridgeToken" type="password" autocomplete="off" placeholder="Run npm run bridge:token"></div>
-  </div>
-  <div class="actions hidden" id="bridgeActions">
-    <div class="field"><label>Bridge URL</label><input id="bridgeUrl" value="${SERVER_URL}"></div>
-    <div class="field"><label>Current file URL or file key</label><input id="fileSource" placeholder="https://www.figma.com/design/..."></div>
-    <div class="row">
-      <button class="btn-sync" id="startBtn">Start</button>
-      <button class="btn-stop" id="stopBtn" disabled>Stop</button>
+  <div class="actions section hidden" id="pairSection">
+    <button class="btn-sync" id="pairBtn">Pair with bridge</button>
+    <div class="pair hidden" id="pairInfo">
+      <div class="pair-code" id="pairCode">—</div>
+      <p class="hint">Approve this code in Claude Code:</p>
+      <code id="pairCommand">/figma-bridge:pair</code>
+      <p class="hint">or in a terminal, in the bridge folder:</p>
+      <code id="pairCli">npm run bridge:pair --</code>
+      <div class="row"><span class="hint" id="pairExpiry"></span><button class="btn-stop" id="cancelPairBtn">Cancel</button></div>
     </div>
-    <p class="hint">Keep this panel open. Live MCP reads resolve the requested node directly, including nodes on other pages, without changing your selection.</p>
   </div>
-  <div class="actions" id="legacyActions">
-    <button class="btn-sync" id="syncBtn">\u27F3 Sync Now</button>
+  <div class="actions section hidden" id="connectSection">
+    <div class="row">
+      <button class="btn-sync" id="startBtn">Connect</button>
+      <button class="btn-stop" id="stopBtn" disabled>Disconnect</button>
+    </div>
+    <p class="hint">Keep this panel open. Agents can then read any node of this file by its link, on any page, without changing your selection.</p>
+  </div>
+  <div class="actions section" id="legacyActions">
+    <div class="row">
+      <button class="btn-sync" id="syncBtn">⟳ Sync page</button>
+      <button class="btn-stop hidden" id="syncSelectionBtn">Sync selection</button>
+    </div>
     <label class="checkbox-row">
       <input type="checkbox" id="autoSync" checked>
       Auto-sync page changes
     </label>
-    <p class="hint">Syncs the whole current page, including nested layers. Keep this panel open. Switching pages syncs the new page.</p>
   </div>
+  <details id="advanced">
+    <summary>Advanced</summary>
+    <div class="actions">
+      <div class="field"><label>Bridge token (pairing fills it in)</label><input id="bridgeToken" type="password" autocomplete="off" placeholder="or paste the output of npm run bridge:token"></div>
+      <div class="actions hidden" id="bridgeActions">
+        <div class="field"><label>Bridge URL</label><input id="bridgeUrl" value="${SERVER_URL}"></div>
+        <div class="field hidden" id="fileField"><label>This file's link (Share → Copy link)</label><input id="fileSource" placeholder="https://www.figma.com/design/..."></div>
+      </div>
+    </div>
+  </details>
   <div id="errorMsg" class="error hidden"></div>
 </div>
 <script>
 const SERVER_URL = '${SERVER_URL}'
 function q(s){return document.getElementById(s)}
+function toggle(id,visible){const el=q(id);if(visible)el.classList.remove('hidden');else el.classList.add('hidden')}
+let mode='watch',fileKeyKnown=false,connectedNow=false
 let bridgeWanted=false,bridgeConfig=null,sessionId=null,sessionSecret=null,pollController=null,heartbeatTimer=null,reconnectTimer=null,reconnectDelay=750
+let pairing=null,pairTimer=null
+function bridgeBase(){return ((q('bridgeUrl').value||'').trim()||SERVER_URL).replace(new RegExp('/+$'),'')}
+function hasToken(){return Boolean((q('bridgeToken').value||'').trim())}
+function timeOf(iso){try{return iso?new Date(iso).toLocaleTimeString():''}catch{return ''}}
 function setStatus(type,text){
   const bar=q('statusBar'),el=q('statusText'),dot=bar.querySelector('.dot')
   bar.className='status-bar '+type
   dot.className='dot '+(type==='connected'?'green':type==='disconnected'?'red':'yellow')
   el.textContent=text
 }
+function refreshSections(){
+  const panel=mode==='open'
+  toggle('pairSection',!hasToken()&&!connectedNow)
+  toggle('connectSection',panel&&hasToken())
+  toggle('bridgeActions',panel)
+  toggle('fileField',panel&&!fileKeyKnown)
+  toggle('syncSelectionBtn',panel)
+}
 function updateInfo(d){
-  if(d.mode==='bridge'){
-    q('bridgeActions').classList.remove('hidden');q('legacyActions').classList.add('hidden')
-    q('pageLabel').textContent='Connected file';q('nodeLabel').textContent='Last node';q('timeLabel').textContent='Last request'
-  }
-  if(d.pageName) q('pageName').textContent=d.pageName
-  if(d.nodeCount!==undefined) q('nodeCount').textContent=d.nodeCount.toString()
-  if(d.lastNode!==undefined) q('nodeCount').textContent=d.lastNode||'\u2014'
-  if(d.lastSync){try{q('lastSync').textContent=new Date(d.lastSync).toLocaleTimeString()}catch{}}
-  if(d.lastRequest){try{q('lastSync').textContent=new Date(d.lastRequest).toLocaleTimeString()}catch{}}
-  if(d.autoSync!==undefined) q('autoSync').checked=d.autoSync
+  if(d.mode) mode=d.mode
+  if(d.fileKeyKnown!==undefined) fileKeyKnown=Boolean(d.fileKeyKnown)
   if(d.bridgeUrl) q('bridgeUrl').value=d.bridgeUrl
-  if(d.bridgeToken) q('bridgeToken').value=d.bridgeToken
+  if(typeof d.bridgeToken==='string') q('bridgeToken').value=d.bridgeToken
   if(d.fileSource) q('fileSource').value=d.fileSource
-  if(d.mode==='bridge'){
-    q('startBtn').disabled=Boolean(d.connected);q('stopBtn').disabled=!d.connected
+  if(d.autoSync!==undefined) q('autoSync').checked=d.autoSync
+  connectedNow=Boolean(d.connected)
+  if(mode==='open'){
+    q('pageLabel').textContent='File';q('nodeLabel').textContent='Last read';q('timeLabel').textContent='Last sync'
+    if(d.fileName) q('pageName').textContent=d.fileName
+    if(d.lastNode!==undefined) q('nodeCount').textContent=d.lastNode&&d.lastNode!=='—'?d.lastNode+(d.lastRequest?' · '+timeOf(d.lastRequest):''):'—'
+    if(d.lastSyncPage!==undefined) q('lastSync').textContent=d.lastSyncPage?d.lastSyncPage+(d.lastSync?' · '+timeOf(d.lastSync):''):'—'
+    q('startBtn').disabled=connectedNow;q('stopBtn').disabled=!connectedNow
+    // While the panel is reconnecting, keep saying so.
+    if(!bridgeWanted||connectedNow) setStatus(connectedNow?'connected':hasToken()?'disconnected':'connecting',connectedNow?'Connected':hasToken()?'Not connected':'Not paired yet')
+  }else{
+    if(d.pageName) q('pageName').textContent=d.pageName
+    if(d.nodeCount!==undefined) q('nodeCount').textContent=d.nodeCount.toString()
+    if(d.lastSync) q('lastSync').textContent=timeOf(d.lastSync)
+    setStatus(d.connected?'connected':'disconnected',d.connected?'Connected':'Disconnected')
   }
-  setStatus(d.connected?'connected':'disconnected',d.connected?'Connected':'Disconnected')
+  refreshSections()
 }
 function hideError(){q('errorMsg').classList.add('hidden')}
 function showError(m){q('errorMsg').textContent=m;q('errorMsg').classList.remove('hidden')}
+function setSyncing(busy){q('syncBtn').disabled=busy;q('syncSelectionBtn').disabled=busy}
 async function sendToServer(data,requestId){
   hideError()
   setStatus('connecting','Syncing...')
-  q('syncBtn').disabled=true
+  setSyncing(true)
+  const base=bridgeBase()
   const controller=new AbortController()
   const timeout=setTimeout(()=>controller.abort(),30000)
   try{
     const headers={'Content-Type':'application/json'}
     const token=(q('bridgeToken').value||'').trim()
     if(token) headers['Authorization']='Bearer '+token
-    const r=await fetch(SERVER_URL+'/design',{method:'POST',headers,body:JSON.stringify(data),signal:controller.signal})
-    if(r.status===401) throw new Error('The server rejected the pairing token. Run npm run bridge:token and paste the value above.')
+    const r=await fetch(base+'/design',{method:'POST',headers,body:JSON.stringify(data),signal:controller.signal})
+    if(r.status===401) throw new Error('The bridge needs pairing first. Press Pair with bridge, or paste the token under Advanced.')
     if(!r.ok) throw new Error('Server returned HTTP '+r.status+' '+r.statusText)
     const result=await r.json()
     parent.postMessage({pluginMessage:{type:'done',requestId,success:true,serverMessage:result.message}},'*')
   }catch(err){
-    const message=err.name==='AbortError'?'Sync timed out after 30 seconds. Try Sync Now again.':err.message
-    showError(message+'\\nCheck the bridge server at '+SERVER_URL+'.')
+    const message=err.name==='AbortError'?'Sync timed out after 30 seconds. Try Sync page again.':err.message
+    showError(message+'\\nCheck the bridge at '+base+'.')
     parent.postMessage({pluginMessage:{type:'done',requestId,success:false,error:message}},'*')
   }finally{
     clearTimeout(timeout)
-    q('syncBtn').disabled=false
+    setSyncing(false)
   }
 }
 function bridgeHeaders(includeSession=true){
@@ -156,10 +195,12 @@ async function bridgeFetch(path,options={},includeSession=true){
   return body
 }
 function bridgeStatus(connected,error){
+  connectedNow=connected
   parent.postMessage({pluginMessage:{type:'bridge-status',connected,error:error||null}},'*')
   q('startBtn').disabled=connected;q('stopBtn').disabled=!connected
   setStatus(connected?'connected':bridgeWanted?'connecting':'disconnected',connected?'Connected':bridgeWanted?'Reconnecting...':'Disconnected')
   if(error) showError(error); else hideError()
+  refreshSections()
 }
 async function closeBridgeSession(reason){
   if(!sessionId||!bridgeConfig) return
@@ -227,6 +268,66 @@ async function invalidateBridge(msg){
   if(!bridgeWanted||!sessionId) return
   try{await bridgeFetch('/bridge/session/'+encodeURIComponent(sessionId)+'/invalidate',{method:'POST',body:{fileKey:msg.fileKey,reason:msg.reason||'documentchange'}})}catch(err){handleBridgeDisconnect(err)}
 }
+// Pairing: the bridge hands this panel its token once someone who already has
+// it approves the code shown here, in Claude Code or in a terminal.
+function showExpiry(){
+  if(!pairing) return
+  const left=Math.max(0,Math.round((pairing.expiresAt-Date.now())/1000))
+  q('pairExpiry').textContent='Expires in '+Math.floor(left/60)+':'+String(left%60).padStart(2,'0')
+}
+function cancelPairing(){
+  pairing=null
+  if(pairTimer){clearTimeout(pairTimer);pairTimer=null}
+  toggle('pairInfo',false)
+  q('pairBtn').disabled=false
+}
+async function startPairing(){
+  hideError()
+  cancelPairing()
+  const base=bridgeBase()
+  let r=null,body=null
+  try{
+    r=await fetch(base+'/bridge/pair',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({clientName:'Figma Design Bridge plugin',fileName:(q('pageName').textContent||'').slice(0,200)})})
+    try{body=await r.json()}catch{}
+  }catch(err){
+    showError('No bridge is running at '+base+'. Open Claude Code with the figma-bridge plugin, or run npm start, then press Pair with bridge again.')
+    return
+  }
+  if(!r.ok||!body||!body.code){showError((body&&body.error)||('Bridge HTTP '+r.status));return}
+  pairing={id:body.pairingId,secret:body.pairingSecret,code:body.code,expiresAt:Date.parse(body.expiresAt)||Date.now()+120000,base}
+  q('pairCode').textContent=pairing.code.slice(0,3)+' '+pairing.code.slice(3)
+  q('pairCommand').textContent='/figma-bridge:pair '+pairing.code
+  q('pairCli').textContent='npm run bridge:pair -- '+pairing.code
+  toggle('pairInfo',true)
+  q('pairBtn').disabled=true
+  showExpiry()
+  pairTimer=setTimeout(pollPairing,1500)
+}
+async function pollPairing(){
+  pairTimer=null
+  const current=pairing
+  if(!current) return
+  let r=null,body=null
+  try{
+    r=await fetch(current.base+'/bridge/pair/'+current.id,{headers:{'X-Pairing-Secret':current.secret}})
+    try{body=await r.json()}catch{}
+  }catch{}
+  if(pairing!==current) return
+  if(r&&r.ok&&body&&body.status==='approved'&&body.token){
+    cancelPairing()
+    q('bridgeToken').value=body.token
+    refreshSections()
+    parent.postMessage({pluginMessage:{type:'paired',token:body.token,serverUrl:current.base,fileSource:q('fileSource').value}},'*')
+    return
+  }
+  if(r&&(r.status===404||r.status===410)){
+    cancelPairing()
+    showError('The pairing code expired. Press Pair with bridge for a new one.')
+    return
+  }
+  showExpiry()
+  pairTimer=setTimeout(pollPairing,1500)
+}
 window.addEventListener('message',async e=>{
   const msg=e.data.pluginMessage
   if(!msg) return
@@ -237,14 +338,17 @@ window.addEventListener('message',async e=>{
     case 'bridge-start': await beginBridge(msg.config); break
     case 'bridge-result': await sendBridgeReply(msg); break
     case 'bridge-invalidate': await invalidateBridge(msg); break
-    case 'bridge-stop': await stopBridge(msg.reason); break
+    case 'bridge-stop': cancelPairing(); await stopBridge(msg.reason); break
   }
 })
-q('syncBtn').addEventListener('click',()=>parent.postMessage({pluginMessage:{type:'request-sync'}},'*'))
+q('syncBtn').addEventListener('click',()=>parent.postMessage({pluginMessage:{type:'request-sync',scope:'page'}},'*'))
+q('syncSelectionBtn').addEventListener('click',()=>parent.postMessage({pluginMessage:{type:'request-sync',scope:'selection'}},'*'))
 q('autoSync').addEventListener('change',e=>parent.postMessage({pluginMessage:{type:'set-auto-sync',enabled:e.target.checked}},'*'))
-q('bridgeToken').addEventListener('change',e=>parent.postMessage({pluginMessage:{type:'set-token',token:e.target.value}},'*'))
+q('bridgeToken').addEventListener('change',e=>{parent.postMessage({pluginMessage:{type:'set-token',token:e.target.value}},'*');refreshSections()})
 q('startBtn').addEventListener('click',()=>parent.postMessage({pluginMessage:{type:'connect-bridge',serverUrl:q('bridgeUrl').value,token:q('bridgeToken').value,fileSource:q('fileSource').value}},'*'))
 q('stopBtn').addEventListener('click',()=>{stopBridge('plugin-stop');parent.postMessage({pluginMessage:{type:'bridge-stopped'}},'*')})
+q('pairBtn').addEventListener('click',()=>{startPairing()})
+q('cancelPairBtn').addEventListener('click',()=>{cancelPairing();hideError()})
 parent.postMessage({pluginMessage:{type:'ui-ready'}},'*')
 <\/script>`
 
@@ -760,12 +864,18 @@ async function handleBridgeRequest(sessionId, request) {
   }
 }
 
+// clientStorage is per Figma user, not per document, so a file link is kept per
+// document name: another document never inherits it. Links saved by 1.1 under
+// a single `fileSource` key are ignored for that reason.
 async function loadBridgePreferences() {
-  const defaults = { bridgeUrl: SERVER_URL, bridgeToken: '', fileSource: figma.fileKey || '' }
+  const defaults = { bridgeUrl: SERVER_URL, bridgeToken: '', fileSources: {} }
   if (!figma.clientStorage || typeof figma.clientStorage.getAsync !== 'function') return defaults
   try {
     const saved = await figma.clientStorage.getAsync('design-bridge-pairing')
-    return { ...defaults, ...(saved && typeof saved === 'object' ? saved : {}) }
+    const { fileSource, ...rest } = saved && typeof saved === 'object' ? saved : {}
+    const merged = { ...defaults, ...rest }
+    if (!merged.fileSources || typeof merged.fileSources !== 'object') merged.fileSources = {}
+    return merged
   } catch {
     return defaults
   }
@@ -776,9 +886,45 @@ async function saveBridgePreferences(preferences) {
   try { await figma.clientStorage.setAsync('design-bridge-pairing', preferences) } catch {}
 }
 
+function documentName() {
+  return (figma.root && figma.root.name) || (figma.currentPage && figma.currentPage.name) || 'Figma file'
+}
+
+// With enablePrivatePluginApi in the manifest, Figma tells a development plugin
+// which file it runs in, and nobody has to paste a link.
+function knownFileKey() {
+  return typeof figma.fileKey === 'string' && figma.fileKey ? figma.fileKey : null
+}
+
+function savedFileSource(prefs) {
+  if (knownFileKey()) return ''
+  const source = prefs.fileSources[documentName()]
+  return typeof source === 'string' ? source : ''
+}
+
+async function startBridgeSession(serverUrl, token, fileKey, fileSource) {
+  state.bridgeFileKey = fileKey
+  state.bridgeFileName = documentName()
+  state.bridgeToken = token
+  const prefs = await loadBridgePreferences()
+  const fileSources = { ...prefs.fileSources }
+  if (!knownFileKey() && fileSource) fileSources[documentName()] = String(fileSource).trim()
+  await saveBridgePreferences({ bridgeUrl: serverUrl, bridgeToken: token, fileSources })
+  figma.ui.postMessage({
+    type: 'bridge-start',
+    config: { url: serverUrl, token, fileKey, fileName: state.bridgeFileName, pluginInstanceId: state.pluginInstanceId },
+  })
+}
+
+// 'open' is the panel; 'bridge' is what it was called before 1.2.0, and a menu
+// imported back then still sends it.
+function isOpenCommand() {
+  return figma.command === 'open' || figma.command === 'bridge'
+}
+
 const state = {
   autoSync: true, lastNodeCount: 0, lastSyncTime: null, lastPageName: null,
-  connected: false, ready: false, inFlight: null, pendingSync: null, nextRequestId: 0,
+  connected: false, ready: false, inFlight: null, pendingSync: null, pendingScope: null, nextRequestId: 0,
   bridgeFileKey: null, bridgeFileName: null, bridgeConnected: false, bridgeToken: '',
   lastBridgeNode: null, lastBridgeRequest: null,
   pluginInstanceId: `plugin-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
@@ -800,25 +946,30 @@ function debouncedSync() {
   }, 800)
 }
 
-function triggerSync(reason = 'manual') {
+function triggerSync(reason = 'manual', scope = 'page') {
   if (!state.ready || (reason === 'auto' && !state.autoSync)) return
   if (state.inFlight) {
     // Coalesce changes while sending. Build the next snapshot only when this one finishes.
-    if (state.pendingSync !== 'manual') state.pendingSync = reason
+    if (state.pendingSync !== 'manual') {
+      state.pendingSync = reason
+      state.pendingScope = scope
+    }
     return
   }
   cancelDebounce()
   state.pendingSync = null
+  state.pendingScope = null
   try {
     // Mixed Figma properties are Symbols, which cannot cross the UI message boundary.
-    const data = sanitizeForMessage(buildDesignData(figma.command === 'sync-selection'))
+    const selectionOnly = scope === 'selection' || figma.command === 'sync-selection'
+    const data = sanitizeForMessage(buildDesignData(selectionOnly))
     const requestId = ++state.nextRequestId
     state.inFlight = { requestId, data }
     figma.ui.postMessage({ type: 'sync', requestId, data })
   } catch (error) {
     state.inFlight = null
     figma.notify(`Sync failed: ${error.message}`, { error: true })
-    if (figma.command === 'watch') {
+    if (figma.command === 'watch' || isOpenCommand()) {
       updateUIStatus()
       figma.ui.postMessage({ type: 'error', error: error.message })
     } else {
@@ -827,12 +978,15 @@ function triggerSync(reason = 'manual') {
   }
 }
 
-function updateUIStatus() {
-  if (figma.command === 'bridge') {
+function updateUIStatus(extra = {}) {
+  if (isOpenCommand()) {
     figma.ui.postMessage({
-      type: 'status', mode: 'bridge', connected: state.bridgeConnected,
-      pageName: state.bridgeFileName || '\u2014', lastNode: state.lastBridgeNode || '\u2014',
-      lastRequest: state.lastBridgeRequest?.toISOString(),
+      type: 'status', mode: 'open', connected: state.bridgeConnected,
+      fileName: documentName(), fileKeyKnown: Boolean(knownFileKey()),
+      lastNode: state.lastBridgeNode || '\u2014', lastRequest: state.lastBridgeRequest?.toISOString(),
+      lastSyncPage: state.lastPageName || '', lastSync: state.lastSyncTime?.toISOString(),
+      nodeCount: state.lastNodeCount, autoSync: state.autoSync, bridgeToken: state.bridgeToken,
+      ...extra,
     })
     return
   }
@@ -850,16 +1004,20 @@ function updateUIStatus() {
 }
 
 function main() {
-  const isBridge = figma.command === 'bridge'
+  const isOpen = isOpenCommand()
   const isWatch = figma.command === 'watch'
   const isSync = figma.command === 'sync-page' || figma.command === 'sync-selection'
+  const isPanel = isOpen || isWatch
 
-  if (!isBridge && !isWatch && !isSync) {
+  if (!isPanel && !isSync) {
     figma.closePlugin()
     return
   }
 
-  figma.showUI(UI_HTML, { visible: isWatch || isBridge, width: 320, height: isBridge ? 520 : 390 })
+  // The panel serves agents first; sending the whole page on every edit is opt-in.
+  if (isOpen) state.autoSync = false
+
+  figma.showUI(UI_HTML, { visible: isPanel, width: 320, height: isOpen ? 560 : 440 })
 
   if (isWatch) {
     // This development plugin uses legacy document access (no dynamic-page manifest).
@@ -873,12 +1031,20 @@ function main() {
     })
   }
 
-  if (isBridge) {
+  if (isOpen) {
+    // One handler per event: an edit invalidates what the bridge cached for this
+    // file, and re-syncs the page as well when auto-sync is on.
     figma.on('documentchange', () => {
-      if (!state.bridgeConnected || !state.bridgeFileKey) return
-      figma.ui.postMessage({ type: 'bridge-invalidate', fileKey: state.bridgeFileKey, reason: 'documentchange' })
+      if (state.bridgeConnected && state.bridgeFileKey) {
+        figma.ui.postMessage({ type: 'bridge-invalidate', fileKey: state.bridgeFileKey, reason: 'documentchange' })
+      }
+      debouncedSync()
     })
+    figma.on('currentpagechange', debouncedSync)
     figma.on('close', () => {
+      cancelDebounce()
+      state.ready = false
+      state.pendingSync = null
       state.bridgeConnected = false
       figma.ui.postMessage({ type: 'bridge-stop', reason: 'plugin-close' })
     })
@@ -886,27 +1052,33 @@ function main() {
 
   figma.ui.onmessage = async msg => {
     switch (msg.type) {
-      case 'ui-ready':
+      case 'ui-ready': {
         if (state.ready) break
         state.ready = true
-        if (isBridge) {
-          const prefs = await loadBridgePreferences()
-          figma.ui.postMessage({
-            type: 'status', mode: 'bridge', connected: false,
-            pageName: figma.root?.name || '\u2014', lastNode: '\u2014',
-            bridgeUrl: prefs.bridgeUrl, bridgeToken: prefs.bridgeToken, fileSource: prefs.fileSource,
-          })
+        const prefs = await loadBridgePreferences()
+        state.bridgeToken = prefs.bridgeToken || ''
+        if (isOpen) {
+          const fileSource = savedFileSource(prefs)
+          updateUIStatus({ bridgeUrl: prefs.bridgeUrl, fileSource })
+          // Paired before and the file is known: connect without a click.
+          const fileKey = knownFileKey() || parseFileKey(fileSource)
+          if (state.bridgeToken && fileKey) {
+            try {
+              await startBridgeSession(normalizeBridgeUrl(prefs.bridgeUrl), state.bridgeToken, fileKey, fileSource)
+            } catch (error) {
+              figma.ui.postMessage({ type: 'error', error: error.message || String(error) })
+            }
+          }
         } else {
           // The legacy sync needs the pairing token in the field before it
           // fires, so the stored value goes out first and the sync follows.
-          const prefs = await loadBridgePreferences()
-          state.bridgeToken = prefs.bridgeToken || ''
           updateUIStatus()
           triggerSync()
         }
         break
+      }
 
-      case 'done':
+      case 'done': {
         if (!state.inFlight || msg.requestId !== state.inFlight.requestId) break
         const completed = state.inFlight.data
         state.inFlight = null
@@ -919,12 +1091,14 @@ function main() {
           state.connected = false
         }
 
-        if (isWatch) {
+        if (isPanel) {
           updateUIStatus()
           if (!msg.success) {
             figma.notify(`Sync failed: ${msg.error}`, { error: true })
+          } else if (isOpen) {
+            figma.notify(`Synced ${completed.nodeCount} nodes to the bridge`)
           }
-          if (state.pendingSync) triggerSync(state.pendingSync)
+          if (state.pendingSync) triggerSync(state.pendingSync, state.pendingScope || 'page')
         } else {
           if (msg.success) {
             figma.notify(`Synced ${completed.nodeCount} nodes to server`)
@@ -934,9 +1108,10 @@ function main() {
           figma.closePlugin()
         }
         break
+      }
 
       case 'request-sync':
-        if (isWatch) triggerSync()
+        if (isPanel) triggerSync('manual', msg.scope === 'selection' ? 'selection' : 'page')
         break
 
       case 'set-token': {
@@ -947,8 +1122,33 @@ function main() {
         break
       }
 
+      case 'paired': {
+        // The UI collected the token through pairing: keep it, then use it.
+        const token = String(msg.token || '').trim()
+        if (!token) break
+        state.bridgeToken = token
+        const prefs = await loadBridgePreferences()
+        let serverUrl = SERVER_URL
+        try { serverUrl = normalizeBridgeUrl(msg.serverUrl || prefs.bridgeUrl) } catch {}
+        await saveBridgePreferences({ ...prefs, bridgeUrl: serverUrl, bridgeToken: token })
+        figma.notify('Paired with the bridge')
+        updateUIStatus()
+        if (isOpen) {
+          const fileSource = String(msg.fileSource || '').trim() || savedFileSource(prefs)
+          const fileKey = knownFileKey() || parseFileKey(fileSource)
+          if (fileKey) {
+            await startBridgeSession(serverUrl, token, fileKey, fileSource)
+          } else {
+            figma.ui.postMessage({ type: 'error', error: "Paired. Paste this file's link under Advanced, then press Connect." })
+          }
+        } else if (isWatch) {
+          triggerSync()
+        }
+        break
+      }
+
       case 'set-auto-sync':
-        if (isWatch) {
+        if (isPanel) {
           state.autoSync = Boolean(msg.enabled)
           if (state.autoSync) {
             triggerSync('auto')
@@ -960,26 +1160,18 @@ function main() {
         break
 
       case 'connect-bridge':
-        if (!isBridge) break
+        if (!isOpen) break
         try {
-          const fileKey = parseFileKey(msg.fileSource)
-          if (!fileKey) throw new Error('Enter the current Figma file URL or file key before connecting.')
-          if (figma.fileKey && figma.fileKey !== fileKey) {
+          const entered = parseFileKey(msg.fileSource)
+          const fileKey = knownFileKey() || entered
+          if (!fileKey) throw new Error("Paste this file's link under Advanced before connecting.")
+          if (knownFileKey() && entered && entered !== knownFileKey()) {
             throw new Error('The entered file does not match the Figma file currently open in this plugin.')
           }
           const serverUrl = normalizeBridgeUrl(msg.serverUrl)
           const token = String(msg.token || '').trim()
-          if (!token) throw new Error('Enter the bridge pairing token before connecting.')
-          state.bridgeFileKey = fileKey
-          state.bridgeFileName = figma.root?.name || figma.currentPage?.name || 'Figma file'
-          await saveBridgePreferences({ bridgeUrl: serverUrl, bridgeToken: token, fileSource: String(msg.fileSource || '').trim() })
-          figma.ui.postMessage({
-            type: 'bridge-start',
-            config: {
-              url: serverUrl, token, fileKey, fileName: state.bridgeFileName,
-              pluginInstanceId: state.pluginInstanceId,
-            },
-          })
+          if (!token) throw new Error('Pair with the bridge first, or paste the bridge token under Advanced.')
+          await startBridgeSession(serverUrl, token, fileKey, msg.fileSource)
         } catch (error) {
           state.bridgeConnected = false
           figma.ui.postMessage({ type: 'error', error: error.message || String(error) })
@@ -988,18 +1180,18 @@ function main() {
         break
 
       case 'bridge-status':
-        if (!isBridge) break
+        if (!isOpen) break
         state.bridgeConnected = Boolean(msg.connected)
         updateUIStatus()
         if (msg.error) figma.ui.postMessage({ type: 'error', error: msg.error })
         break
 
       case 'bridge-request':
-        if (isBridge) await handleBridgeRequest(msg.sessionId, msg.request)
+        if (isOpen) await handleBridgeRequest(msg.sessionId, msg.request)
         break
 
       case 'bridge-stopped':
-        if (isBridge) {
+        if (isOpen) {
           state.bridgeConnected = false
           updateUIStatus()
         }

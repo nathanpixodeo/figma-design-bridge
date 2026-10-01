@@ -52,14 +52,18 @@ function plugin(command = 'watch', currentPage = page()) {
   }
 }
 
-function bridgePlugin({ characters = 'Hello from another page' } = {}) {
+function bridgePlugin({
+  characters = 'Hello from another page', command = 'bridge', fileKey = 'AAAAfileKeyAAAA',
+  rootName = 'Bridge Test File', saved,
+} = {}) {
   const time = clock()
-  const sent = [], notifications = [], events = new Map(), storage = new Map()
+  const sent = [], notifications = [], events = new Map()
+  const storage = new Map(saved ? [['design-bridge-pairing', saved]] : [])
   const activePage = { id: '0:1', name: 'Screens', type: 'PAGE', selection: [], children: [] }
   const otherPage = { id: '0:2', name: 'Archive', type: 'PAGE', selection: [], children: [] }
   const target = { id: '2:2', name: 'Archived copy', type: 'TEXT', characters }
   const frame = { id: '2:1', name: 'Archived screen', type: 'FRAME', children: [target] }
-  const root = { id: '0:0', name: 'Bridge Test File', type: 'DOCUMENT', children: [activePage, otherPage] }
+  const root = { id: '0:0', name: rootName, type: 'DOCUMENT', children: [activePage, otherPage] }
   activePage.parent = root
   otherPage.parent = root
   frame.parent = otherPage
@@ -67,7 +71,7 @@ function bridgePlugin({ characters = 'Hello from another page' } = {}) {
   otherPage.children = [frame]
   const nodes = new Map([[root.id, root], [activePage.id, activePage], [otherPage.id, otherPage], [frame.id, frame], [target.id, target]])
   const figma = {
-    command: 'bridge', currentPage: activePage, root, fileKey: 'AAAAfileKeyAAAA', closed: false,
+    command, currentPage: activePage, root, fileKey, closed: false,
     ui: { postMessage(message) { sent.push(structuredClone(message)) } },
     showUI(html) { this.html = html },
     on(event, callback) { events.set(event, callback) },
@@ -81,7 +85,7 @@ function bridgePlugin({ characters = 'Hello from another page' } = {}) {
   }
   vm.runInNewContext(source, { figma, setTimeout: time.setTimeout, clearTimeout: time.clearTimeout })
   return {
-    figma, time, sent, notifications, target, activePage, otherPage,
+    figma, time, sent, notifications, target, activePage, otherPage, storage,
     emit: event => events.get(event)?.(),
     message: message => figma.ui.onmessage(message),
     ready: () => figma.ui.onmessage({ type: 'ui-ready' }),
@@ -533,16 +537,82 @@ test('Bridge document index is lightweight and document changes invalidate only 
   assert.equal(invalidation.fileKey, 'AAAAfileKeyAAAA')
 })
 
+test('Open Design Bridge connects by itself once paired, with the file key Figma provides', async () => {
+  const p = bridgePlugin({ command: 'open', saved: { bridgeUrl: 'http://localhost:3456', bridgeToken: 'pairing-token' } })
+  await p.ready()
+
+  const start = p.sent.find(message => message.type === 'bridge-start')
+  assert.ok(start, 'no bridge-start after the panel opened')
+  assert.equal(start.config.fileKey, 'AAAAfileKeyAAAA')
+  assert.equal(start.config.token, 'pairing-token')
+  const status = p.sent.find(message => message.type === 'status')
+  assert.equal(status.mode, 'open')
+  assert.equal(status.fileKeyKnown, true)
+  // The panel serves agents; uploading the whole page is opt-in.
+  assert.equal(p.sent.filter(message => message.type === 'sync').length, 0)
+})
+
+test('without a file key from Figma, a saved link applies only to the document it was saved for', async () => {
+  const saved = {
+    bridgeUrl: 'http://localhost:3456', bridgeToken: 'pairing-token',
+    fileSources: { 'Studio (Copy)': 'https://www.figma.com/design/COPYKEY123/Studio-Copy' },
+    // What 1.1 saved: one link for every document. It must not be reused.
+    fileSource: 'https://www.figma.com/design/OLDKEY456/Other',
+  }
+  const other = bridgePlugin({ command: 'open', fileKey: null, rootName: 'Studio', saved })
+  await other.ready()
+  assert.equal(other.sent.some(message => message.type === 'bridge-start'), false)
+  assert.equal(other.sent.find(message => message.type === 'status').fileKeyKnown, false)
+
+  const copy = bridgePlugin({ command: 'open', fileKey: null, rootName: 'Studio (Copy)', saved })
+  await copy.ready()
+  assert.equal(copy.sent.find(message => message.type === 'bridge-start').config.fileKey, 'COPYKEY123')
+})
+
+test('a pairing approval is saved and connects the panel', async () => {
+  const p = bridgePlugin({ command: 'open' })
+  await p.ready()
+  assert.equal(p.sent.some(message => message.type === 'bridge-start'), false)
+
+  await p.message({ type: 'paired', token: 'fresh-token', serverUrl: 'http://localhost:3456' })
+
+  const start = p.sent.find(message => message.type === 'bridge-start')
+  assert.equal(start.config.token, 'fresh-token')
+  assert.equal(start.config.fileKey, 'AAAAfileKeyAAAA')
+  assert.equal(p.storage.get('design-bridge-pairing').bridgeToken, 'fresh-token')
+  assert.ok(p.notifications.includes('Paired with the bridge'))
+})
+
+test('the panel syncs the selection or the page on request and stays open', async () => {
+  const p = bridgePlugin({ command: 'open' })
+  const hero = { id: '9:1', name: 'Hero', type: 'FRAME', width: 10, height: 10, parent: p.activePage, children: [] }
+  p.activePage.children = [hero]
+  p.activePage.selection = [hero]
+  await p.ready()
+
+  await p.message({ type: 'request-sync', scope: 'selection' })
+  const selection = p.sent.filter(message => message.type === 'sync').at(-1)
+  assert.equal(selection.data.type, 'selection')
+  await p.message({ type: 'done', requestId: selection.requestId, success: true })
+
+  await p.message({ type: 'request-sync', scope: 'page' })
+  const page = p.sent.filter(message => message.type === 'sync').at(-1)
+  assert.equal(page.data.type, 'page')
+  assert.equal(p.figma.closed, false)
+})
+
 function ui(fetch) {
   const time = clock(), elements = new Map(), messages = []
   let onMessage
   function element(id) {
     if (!elements.has(id)) {
       const classes = new Set(['hidden'])
+      const listeners = {}
       elements.set(id, {
-        textContent: '', className: '', disabled: false, checked: true,
+        textContent: '', className: '', disabled: false, checked: true, value: '', listeners,
         classList: { add: name => classes.add(name), remove: name => classes.delete(name) },
-        querySelector: () => element('dot'), addEventListener() {},
+        isHidden: () => classes.has('hidden'),
+        querySelector: () => element('dot'), addEventListener: (type, callback) => { listeners[type] = callback },
       })
     }
     return elements.get(id)
@@ -560,6 +630,7 @@ function ui(fetch) {
       type: 'sync', requestId: 7, data: { type: 'page', nodes: [], nodeCount: 0 },
     } } }),
     post: message => onMessage({ data: { pluginMessage: message } }),
+    click: id => element(id).listeners.click(),
   }
 }
 
@@ -627,6 +698,66 @@ test('UI turns a refused bridge reply into an error reply instead of dropping th
   assert.match(replyCalls[1].body.error, /did not accept the plugin reply: Failed to fetch/)
   assert.equal(lastStatus().connected, true)
   assert.equal(calls.filter(call => call.url.endsWith('/bridge/session')).length, 1)
+})
+
+function respondWith(status, body) {
+  return { ok: status < 400, status, json: async () => body, text: async () => JSON.stringify(body) }
+}
+
+const settleUi = async () => { for (let i = 0; i < 5; i++) await new Promise(resolve => setImmediate(resolve)) }
+
+test('the panel shows a pairing code, collects the token once approved and hands it over', async () => {
+  const calls = []
+  let checks = 0
+  const panel = ui(async (url, options = {}) => {
+    calls.push({ url, method: options.method || 'GET', headers: options.headers || {} })
+    if (url.endsWith('/bridge/pair')) {
+      return respondWith(201, {
+        pairingId: 'a'.repeat(32), pairingSecret: 'b'.repeat(64), code: '482913',
+        expiresAt: new Date(Date.now() + 120000).toISOString(),
+      })
+    }
+    if (url.includes('/bridge/pair/')) {
+      return ++checks < 2 ? respondWith(200, { status: 'pending' }) : respondWith(200, { status: 'approved', token: 'fresh-token' })
+    }
+    return respondWith(200, {})
+  })
+
+  panel.click('pairBtn')
+  await settleUi()
+  assert.equal(calls[0].method, 'POST')
+  assert.equal(panel.element('pairCode').textContent, '482 913')
+  assert.equal(panel.element('pairCommand').textContent, '/figma-bridge:pair 482913')
+  assert.equal(panel.element('pairCli').textContent, 'npm run bridge:pair -- 482913')
+
+  panel.time.flush()
+  await settleUi()
+  assert.equal(panel.messages.some(message => message.type === 'paired'), false)
+
+  panel.time.flush()
+  await settleUi()
+  const paired = panel.messages.find(message => message.type === 'paired')
+  assert.equal(paired.token, 'fresh-token')
+  assert.equal(panel.element('bridgeToken').value, 'fresh-token')
+  const checksSent = calls.filter(call => call.url.includes('/bridge/pair/'))
+  assert.equal(checksSent.length, 2)
+  assert.ok(checksSent.every(call => call.headers['X-Pairing-Secret'] === 'b'.repeat(64)))
+  assert.equal(panel.time.timers.size, 0)
+})
+
+test('an expired pairing code asks the user to pair again', async () => {
+  const panel = ui(async url => url.endsWith('/bridge/pair')
+    ? respondWith(201, { pairingId: 'a'.repeat(32), pairingSecret: 'b'.repeat(64), code: '111222', expiresAt: new Date().toISOString() })
+    : respondWith(410, { code: 'PAIRING_EXPIRED', error: 'expired' }))
+
+  panel.click('pairBtn')
+  await settleUi()
+  panel.time.flush()
+  await settleUi()
+
+  assert.match(panel.element('errorMsg').textContent, /expired\. Press Pair with bridge/)
+  assert.equal(panel.element('pairBtn').disabled, false)
+  assert.equal(panel.messages.some(message => message.type === 'paired'), false)
 })
 
 test('UI aborts a stalled upload and reports a timeout instead of hanging', async () => {

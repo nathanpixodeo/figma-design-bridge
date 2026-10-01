@@ -142,6 +142,38 @@ test("the bridge an MCP server starts accepts the plugin's /design sync, and the
   assert.match(textOf(info), /\*\*Page:\*\* Checkout/);
 });
 
+test("approve_figma_pairing hands the bridge token to the plugin showing that code", async t => {
+  const dataDir = tempDataDir(t);
+  const port = await freePort();
+  const client = await connectMcp(t, { FIGMA_BRIDGE_DATA_DIR: dataDir, FIGMA_BRIDGE_PORT: String(port) });
+  await waitFor(() => bridgeHealthy(port));
+
+  // What the plugin does when the user presses "Pair with bridge".
+  const asked = await (await fetch(`http://127.0.0.1:${port}/bridge/pair`, {
+    method: "POST",
+    headers: { "content-type": "application/json", origin: "null" },
+    body: JSON.stringify({ clientName: "Figma Design Bridge plugin", fileName: "Checkout" }),
+  })).json();
+
+  const status = await client.callTool({ name: "get_bridge_status", arguments: {} });
+  assert.match(textOf(status), /"pending": 1/);
+  assert.equal(textOf(status).includes(asked.code), false);
+
+  const approved = await client.callTool({ name: "approve_figma_pairing", arguments: { code: asked.code } });
+  assert.equal(approved.isError, undefined, textOf(approved));
+  assert.match(textOf(approved), /Paired the Figma plugin for "Checkout"/);
+
+  const collected = await (await fetch(`http://127.0.0.1:${port}/bridge/pair/${asked.pairingId}`, {
+    headers: { "x-pairing-secret": asked.pairingSecret },
+  })).json();
+  assert.equal(collected.status, "approved");
+  assert.equal(collected.token, tokenIn(dataDir));
+
+  const unknown = await client.callTool({ name: "approve_figma_pairing", arguments: { code: asked.code } });
+  assert.equal(unknown.isError, true);
+  assert.match(textOf(unknown), /PAIRING_NOT_FOUND/);
+});
+
 test("snapshot tools pick up a sync another process wrote, without a restart", async t => {
   const dataDir = tempDataDir(t);
   const port = await freePort();

@@ -121,6 +121,11 @@ function createClient(options = {}) {
       const timeout = readTimeoutMs ? readTimeoutMs + 5000 : timeoutMs
       return send('POST', '/bridge/read', { body, signal, timeout })
     },
+
+    // Hands the token to the Figma plugin showing this code.
+    approvePairing(code, { signal } = {}) {
+      return send('POST', '/bridge/pair/approve', { body: { code: String(code) }, signal })
+    },
   }
 }
 

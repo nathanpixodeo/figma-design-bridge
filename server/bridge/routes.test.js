@@ -942,6 +942,78 @@ test('GET /bridge/status offers setup hints when no plugin is connected', async 
   assert.equal(res.raw.includes(TOKEN), false)
 })
 
+// ── Pairing ───────────────────────────────────────────────
+
+test('a plugin pairs without the token, and gets it only after an approval that needs it', async t => {
+  const ctx = await withServer(t)
+
+  const asked = await ctx.call({
+    method: 'POST', path: '/bridge/pair',
+    headers: { origin: 'null', 'content-type': 'application/json' },
+    body: { clientName: 'Figma Design Bridge plugin', fileName: 'App' },
+  })
+  assert.equal(asked.status, 201)
+  assert.match(asked.body.code, /^\d{6}$/)
+  assert.equal(asked.headers['access-control-allow-origin'], 'null')
+  assert.equal(asked.raw.includes(TOKEN), false)
+  const check = () => ctx.call({ path: `/bridge/pair/${asked.body.pairingId}`, headers: { 'x-pairing-secret': asked.body.pairingSecret } })
+
+  const pending = await check()
+  assert.equal(pending.status, 200)
+  assert.equal(pending.body.status, 'pending')
+  assert.equal(pending.raw.includes(TOKEN), false)
+
+  const anonymous = await ctx.call({ method: 'POST', path: '/bridge/pair/approve', body: { code: asked.body.code } })
+  assert.equal(anonymous.status, 401)
+  const wrong = await ctx.authed({ method: 'POST', path: '/bridge/pair/approve', body: { code: asked.body.code === '000000' ? '000001' : '000000' } })
+  assert.equal(wrong.status, 404)
+  assert.equal(wrong.body.code, 'PAIRING_NOT_FOUND')
+
+  const approved = await ctx.authed({ method: 'POST', path: '/bridge/pair/approve', body: { code: asked.body.code } })
+  assert.equal(approved.status, 200)
+  assert.deepEqual(approved.body, { approved: true, clientName: 'Figma Design Bridge plugin', fileName: 'App' })
+
+  const collected = await check()
+  assert.equal(collected.status, 200)
+  assert.equal(collected.body.status, 'approved')
+  assert.equal(collected.body.token, TOKEN)
+
+  const again = await check()
+  assert.equal(again.status, 404)
+  assert.equal(again.raw.includes(TOKEN), false)
+})
+
+test('collecting a pairing needs its own secret, and a web origin may not ask to pair', async t => {
+  const ctx = await withServer(t)
+  const asked = await ctx.call({ method: 'POST', path: '/bridge/pair', body: {} })
+  assert.equal(asked.status, 201)
+  await ctx.authed({ method: 'POST', path: '/bridge/pair/approve', body: { code: asked.body.code } })
+
+  const noSecret = await ctx.call({ path: `/bridge/pair/${asked.body.pairingId}` })
+  assert.equal(noSecret.status, 401)
+  const wrongSecret = await ctx.call({ path: `/bridge/pair/${asked.body.pairingId}`, headers: { 'x-pairing-secret': 'ab'.repeat(32) } })
+  assert.equal(wrongSecret.status, 401)
+  assert.equal(wrongSecret.raw.includes(TOKEN), false)
+
+  const foreign = await ctx.call({ method: 'POST', path: '/bridge/pair', headers: { origin: 'https://evil.example' }, body: {} })
+  assert.equal(foreign.status, 403)
+  assert.equal(foreign.body.code, 'FORBIDDEN_ORIGIN')
+
+  const extra = await ctx.call({ method: 'POST', path: '/bridge/pair', body: { token: 'please' } })
+  assert.equal(extra.status, 400)
+})
+
+test('status counts waiting pairings without ever showing their codes', async t => {
+  const ctx = await withServer(t)
+  const asked = await ctx.call({ method: 'POST', path: '/bridge/pair', body: {} })
+
+  const res = await ctx.authed({ method: 'GET', path: '/bridge/status' })
+  assert.deepEqual(res.body.pairing, { pending: 1 })
+  assert.ok(res.body.setupHints.some(hint => /waiting for pairing approval/.test(hint)))
+  assert.equal(res.raw.includes(asked.body.code), false)
+  assert.equal(res.raw.includes(asked.body.pairingSecret), false)
+})
+
 // ── Secret sweep ──────────────────────────────────────────
 
 test('no response body on any route contains the bridge token or a session secret', async t => {
