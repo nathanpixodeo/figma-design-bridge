@@ -43,6 +43,7 @@ body{
 .btn-stop{background:#3A3A3C;color:#F5F5F7;border:1px solid #545458;border-radius:7px;padding:9px 16px;font-size:13px;font-weight:500;cursor:pointer}
 .btn-stop:disabled{opacity:.5;cursor:not-allowed}
 .hint{font-size:11px;color:#8E8E93;line-height:1.5}
+.wait-hint{margin:-4px 0 12px}
 .pair{display:flex;flex-direction:column;gap:6px;padding:10px;border-radius:7px;background:#1C1C1E;border:1px solid #3A3A3C}
 .pair-code{font:600 26px/1.3 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;letter-spacing:4px;text-align:center}
 .pair code{display:block;font:11px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:#2C2C2E;border-radius:5px;padding:5px 7px;color:#D1D1D6;user-select:all;word-break:break-all}
@@ -57,6 +58,7 @@ summary{cursor:pointer;color:#8E8E93;user-select:none;margin-bottom:8px}
     <span class="dot yellow"></span>
     <span id="statusText">Starting...</span>
   </div>
+  <p class="hint wait-hint hidden" id="waitHint">The bridge starts with Claude Code (figma-bridge plugin) or npm start. This panel connects as soon as it is up.</p>
   <div class="info-grid">
     <span class="label" id="pageLabel">Synced page</span>
     <span class="value" id="pageName">—</span>
@@ -112,6 +114,10 @@ function toggle(id,visible){const el=q(id);if(visible)el.classList.remove('hidde
 let mode='watch',fileKeyKnown=false,connectedNow=false
 let bridgeWanted=false,bridgeConfig=null,sessionId=null,sessionSecret=null,pollController=null,heartbeatTimer=null,reconnectTimer=null,reconnectDelay=750
 let pairing=null,pairTimer=null
+// waitingForBridge: nothing answers at the bridge URL yet, which is normal until
+// Claude Code or npm start runs. tokenRejected: the bridge refused the saved
+// token, so only pairing or a new token can help.
+let waitingForBridge=false,tokenRejected=false
 function bridgeBase(){return ((q('bridgeUrl').value||'').trim()||SERVER_URL).replace(new RegExp('/+$'),'')}
 function hasToken(){return Boolean((q('bridgeToken').value||'').trim())}
 function timeOf(iso){try{return iso?new Date(iso).toLocaleTimeString():''}catch{return ''}}
@@ -123,7 +129,8 @@ function setStatus(type,text){
 }
 function refreshSections(){
   const panel=mode==='open'
-  toggle('pairSection',!hasToken()&&!connectedNow)
+  toggle('pairSection',(!hasToken()||tokenRejected)&&!connectedNow)
+  toggle('waitHint',waitingForBridge&&!connectedNow)
   toggle('connectSection',panel&&hasToken())
   toggle('bridgeActions',panel)
   toggle('fileField',panel&&!fileKeyKnown)
@@ -144,7 +151,7 @@ function updateInfo(d){
     if(d.lastSyncPage!==undefined) q('lastSync').textContent=d.lastSyncPage?d.lastSyncPage+(d.lastSync?' · '+timeOf(d.lastSync):''):'—'
     q('startBtn').disabled=connectedNow;q('stopBtn').disabled=!connectedNow
     // While the panel is reconnecting, keep saying so.
-    if(!bridgeWanted||connectedNow) setStatus(connectedNow?'connected':hasToken()?'disconnected':'connecting',connectedNow?'Connected':hasToken()?'Not connected':'Not paired yet')
+    if(!bridgeWanted||connectedNow) setStatus(connectedNow?'connected':hasToken()&&!tokenRejected?'disconnected':'connecting',connectedNow?'Connected':tokenRejected?'Pairing needed':hasToken()?'Not connected':'Not paired yet')
   }else{
     if(d.pageName) q('pageName').textContent=d.pageName
     if(d.nodeCount!==undefined) q('nodeCount').textContent=d.nodeCount.toString()
@@ -173,13 +180,28 @@ async function sendToServer(data,requestId){
     const result=await r.json()
     parent.postMessage({pluginMessage:{type:'done',requestId,success:true,serverMessage:result.message}},'*')
   }catch(err){
-    const message=err.name==='AbortError'?'Sync timed out after 30 seconds. Try Sync page again.':err.message
-    showError(message+'\\nCheck the bridge at '+base+'.')
+    // A failed fetch is either no bridge at all or a bridge that cut the upload off.
+    const failed=err.name==='TypeError',offline=failed&&!(await bridgeAnswers(base))
+    const message=err.name==='AbortError'?'Sync timed out after 30 seconds. Try Sync page again.'
+      :offline?'No bridge is running at '+base+'. Open Claude Code with the figma-bridge plugin, or run npm start, then sync again.'
+      :failed?'The bridge at '+base+' dropped the upload, most likely because it is larger than the bridge accepts (FIGMA_BRIDGE_MAX_BODY_BYTES). Try Sync selection.'
+      :err.message
+    showError(failed?message:message+'\\nCheck the bridge at '+base+'.')
     parent.postMessage({pluginMessage:{type:'done',requestId,success:false,error:message}},'*')
   }finally{
     clearTimeout(timeout)
     setSyncing(false)
   }
+}
+async function bridgeAnswers(base){
+  try{return (await fetch(base+'/bridge/health')).ok}catch{return false}
+}
+function waitingHint(){
+  const url=bridgeConfig?String(bridgeConfig.url||'').replace(new RegExp('/+$'),''):bridgeBase()
+  let text='Nothing answers at '+url+' yet. The bridge starts with Claude Code (figma-bridge plugin) or npm start, and this panel connects as soon as it is up.'
+  // The manifest lets the plugin reach this one address only.
+  if(url!==SERVER_URL) text+=' This plugin can only reach '+SERVER_URL+': reset the Bridge URL under Advanced.'
+  return text
 }
 function bridgeHeaders(includeSession=true){
   const h={'Content-Type':'application/json','Authorization':'Bearer '+bridgeConfig.token}
@@ -191,14 +213,18 @@ async function bridgeFetch(path,options={},includeSession=true){
   const r=await fetch(bridgeConfig.url+path,{method:options.method||'GET',headers:bridgeHeaders(includeSession),body:options.body===undefined?undefined:JSON.stringify(options.body),signal:controller&&controller.signal})
   const text=await r.text();let body=null
   try{body=text?JSON.parse(text):null}catch{}
-  if(!r.ok) throw new Error((body&&body.error)||('Bridge HTTP '+r.status))
+  if(!r.ok){const error=new Error((body&&body.error)||('Bridge HTTP '+r.status));error.status=r.status;throw error}
   return body
 }
 function bridgeStatus(connected,error){
   connectedNow=connected
   parent.postMessage({pluginMessage:{type:'bridge-status',connected,error:error||null}},'*')
   q('startBtn').disabled=connected;q('stopBtn').disabled=!connected
-  setStatus(connected?'connected':bridgeWanted?'connecting':'disconnected',connected?'Connected':bridgeWanted?'Reconnecting...':'Disconnected')
+  if(connected) setStatus('connected','Connected')
+  else if(waitingForBridge) setStatus('connecting','Waiting for the bridge...')
+  else if(bridgeWanted) setStatus('connecting','Reconnecting...')
+  else if(tokenRejected) setStatus('connecting','Pairing needed')
+  else setStatus('disconnected','Disconnected')
   if(error) showError(error); else hideError()
   refreshSections()
 }
@@ -213,7 +239,7 @@ function clearBridgeTimers(){
   if(reconnectTimer){clearTimeout(reconnectTimer);reconnectTimer=null}
 }
 async function stopBridge(reason){
-  bridgeWanted=false;clearBridgeTimers();await closeBridgeSession(reason||'plugin-stop');bridgeStatus(false)
+  bridgeWanted=false;waitingForBridge=false;clearBridgeTimers();await closeBridgeSession(reason||'plugin-stop');bridgeStatus(false)
 }
 function scheduleHeartbeat(){
   if(!bridgeWanted||!sessionId) return
@@ -224,9 +250,19 @@ function scheduleHeartbeat(){
 }
 function handleBridgeDisconnect(err){
   if(!bridgeWanted) return
-  clearBridgeTimers();sessionId=null;sessionSecret=null;bridgeStatus(false,err&&err.message)
+  clearBridgeTimers();sessionId=null;sessionSecret=null
+  if(err&&err.tokenRejected){
+    // Retrying with a token the bridge does not know cannot succeed; pairing can.
+    bridgeWanted=false;waitingForBridge=false;tokenRejected=true
+    bridgeStatus(false,'This bridge did not accept the saved token. Press Pair with bridge, or paste its token under Advanced.')
+    return
+  }
+  // A failed fetch means nothing listens yet: wait quietly and keep trying.
+  waitingForBridge=Boolean(err&&err.name==='TypeError')
+  if(waitingForBridge) q('waitHint').textContent=waitingHint()
+  bridgeStatus(false,waitingForBridge?null:err&&err.message)
   reconnectTimer=setTimeout(()=>connectBridge().catch(handleBridgeDisconnect),reconnectDelay)
-  reconnectDelay=Math.min(reconnectDelay*2,10000)
+  reconnectDelay=Math.min(reconnectDelay*2,waitingForBridge?5000:10000)
 }
 async function pollBridge(){
   while(bridgeWanted&&sessionId){
@@ -241,14 +277,23 @@ async function pollBridge(){
 }
 async function connectBridge(){
   if(!bridgeWanted||!bridgeConfig) return
-  setStatus('connecting','Connecting...')
-  const data=await bridgeFetch('/bridge/session',{method:'POST',body:{fileKey:bridgeConfig.fileKey,fileName:bridgeConfig.fileName,pluginInstanceId:bridgeConfig.pluginInstanceId,capabilities:['read-node','read-document-index']}},false)
+  if(!waitingForBridge) setStatus('connecting','Connecting...')
+  let data
+  try{
+    data=await bridgeFetch('/bridge/session',{method:'POST',body:{fileKey:bridgeConfig.fileKey,fileName:bridgeConfig.fileName,pluginInstanceId:bridgeConfig.pluginInstanceId,capabilities:['read-node','read-document-index']}},false)
+  }catch(err){
+    // Registering checks the token alone, so a 401 here means the token is wrong.
+    if(err.status===401) err.tokenRejected=true
+    throw err
+  }
   if(!bridgeWanted) return
+  waitingForBridge=false;tokenRejected=false
   sessionId=data.sessionId;sessionSecret=data.sessionSecret;reconnectDelay=750;bridgeStatus(true);scheduleHeartbeat()
   pollBridge().catch(err=>{if(bridgeWanted&&err.name!=='AbortError')handleBridgeDisconnect(err)})
 }
 async function beginBridge(config){
-  await stopBridge('reconnect');bridgeConfig=config;bridgeWanted=true;connectBridge().catch(handleBridgeDisconnect)
+  await stopBridge('reconnect');bridgeConfig=config;bridgeWanted=true;tokenRejected=false;reconnectDelay=750
+  connectBridge().catch(handleBridgeDisconnect)
 }
 async function sendBridgeReply(msg){
   if(!bridgeWanted||!sessionId||msg.sessionId!==sessionId) return
@@ -316,6 +361,7 @@ async function pollPairing(){
   if(r&&r.ok&&body&&body.status==='approved'&&body.token){
     cancelPairing()
     q('bridgeToken').value=body.token
+    tokenRejected=false
     refreshSections()
     parent.postMessage({pluginMessage:{type:'paired',token:body.token,serverUrl:current.base,fileSource:q('fileSource').value}},'*')
     return
@@ -344,7 +390,11 @@ window.addEventListener('message',async e=>{
 q('syncBtn').addEventListener('click',()=>parent.postMessage({pluginMessage:{type:'request-sync',scope:'page'}},'*'))
 q('syncSelectionBtn').addEventListener('click',()=>parent.postMessage({pluginMessage:{type:'request-sync',scope:'selection'}},'*'))
 q('autoSync').addEventListener('change',e=>parent.postMessage({pluginMessage:{type:'set-auto-sync',enabled:e.target.checked}},'*'))
-q('bridgeToken').addEventListener('change',e=>{parent.postMessage({pluginMessage:{type:'set-token',token:e.target.value}},'*');refreshSections()})
+q('bridgeToken').addEventListener('change',e=>{
+  // A new token replaces the one the bridge refused: clear what was said about it.
+  if(tokenRejected&&!bridgeWanted){tokenRejected=false;hideError();setStatus(hasToken()?'disconnected':'connecting',hasToken()?'Not connected':'Not paired yet')}
+  parent.postMessage({pluginMessage:{type:'set-token',token:e.target.value}},'*');refreshSections()
+})
 q('startBtn').addEventListener('click',()=>parent.postMessage({pluginMessage:{type:'connect-bridge',serverUrl:q('bridgeUrl').value,token:q('bridgeToken').value,fileSource:q('fileSource').value}},'*'))
 q('stopBtn').addEventListener('click',()=>{stopBridge('plugin-stop');parent.postMessage({pluginMessage:{type:'bridge-stopped'}},'*')})
 q('pairBtn').addEventListener('click',()=>{startPairing()})

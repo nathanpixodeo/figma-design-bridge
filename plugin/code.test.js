@@ -9,9 +9,11 @@ const source = fs.readFileSync(path.join(__dirname, 'code.js'), 'utf8')
 function clock() {
   let id = 0
   const timers = new Map()
+  const delays = []
   return {
     timers,
-    setTimeout(callback) { timers.set(++id, callback); return id },
+    delays,
+    setTimeout(callback, delay) { timers.set(++id, callback); delays.push(delay); return id },
     clearTimeout(timer) { timers.delete(timer) },
     flush() {
       const callbacks = [...timers.values()]
@@ -775,4 +777,111 @@ test('UI aborts a stalled upload and reports a timeout instead of hanging', asyn
   assert.equal(panel.messages.at(-1).success, false)
   assert.match(panel.messages.at(-1).error, /timed out/)
   assert.equal(panel.element('syncBtn').disabled, false)
+})
+
+const savedConfig = { url: 'http://localhost:3456', token: 'saved-token', fileKey: 'AAAAfileKeyAAAA', fileName: 'File', pluginInstanceId: 'plugin-1' }
+const lastBridgeStatus = panel => panel.messages.filter(message => message.type === 'bridge-status').at(-1)
+
+test('the panel waits quietly while no bridge runs, then connects by itself', async () => {
+  let running = false
+  const panel = ui(async url => {
+    if (!running) throw new TypeError('Failed to fetch')
+    if (url.endsWith('/bridge/session')) return respondWith(201, { sessionId: 'sess-1', sessionSecret: 'secret-1' })
+    return new Promise(() => {})
+  })
+
+  await panel.post({ type: 'bridge-start', config: savedConfig })
+  await settleUi()
+  assert.equal(panel.element('statusText').textContent, 'Waiting for the bridge...')
+  assert.equal(panel.element('waitHint').isHidden(), false)
+  assert.match(panel.element('waitHint').textContent, /^Nothing answers at http:\/\/localhost:3456 yet\./)
+  assert.equal(panel.element('errorMsg').isHidden(), true, 'nothing running yet is not an error')
+  assert.equal(lastBridgeStatus(panel).error, null)
+  assert.equal(panel.time.timers.size, 1, 'it stopped trying')
+
+  for (let retry = 0; retry < 4; retry++) {
+    panel.time.flush()
+    await settleUi()
+  }
+  assert.equal(panel.element('statusText').textContent, 'Waiting for the bridge...')
+  assert.deepEqual(panel.time.delays, [750, 1500, 3000, 5000, 5000])
+
+  running = true
+  panel.time.flush()
+  await settleUi()
+  assert.equal(lastBridgeStatus(panel).connected, true)
+  assert.equal(panel.element('statusText').textContent, 'Connected')
+  assert.equal(panel.element('waitHint').isHidden(), true)
+})
+
+test('a token the bridge rejects stops the retries and offers pairing', async () => {
+  const calls = []
+  const panel = ui(async url => {
+    calls.push(url)
+    if (url.endsWith('/bridge/session')) return respondWith(401, { code: 'UNAUTHORIZED', error: 'Missing or invalid bridge token.' })
+    if (url.endsWith('/bridge/pair')) {
+      return respondWith(201, {
+        pairingId: 'a'.repeat(32), pairingSecret: 'b'.repeat(64), code: '482913',
+        expiresAt: new Date(Date.now() + 120000).toISOString(),
+      })
+    }
+    return respondWith(200, { status: 'approved', token: 'fresh-token' })
+  })
+  panel.element('bridgeToken').value = 'saved-token'
+
+  await panel.post({ type: 'bridge-start', config: savedConfig })
+  await settleUi()
+  assert.equal(panel.time.timers.size, 0, 'it kept retrying a token the bridge refuses')
+  assert.equal(calls.filter(url => url.endsWith('/bridge/session')).length, 1)
+  assert.equal(panel.element('statusText').textContent, 'Pairing needed')
+  assert.equal(panel.element('pairSection').isHidden(), false, 'a saved token hid the way out')
+  assert.match(panel.element('errorMsg').textContent, /did not accept the saved token/)
+
+  panel.click('pairBtn')
+  await settleUi()
+  panel.time.flush()
+  await settleUi()
+  assert.equal(panel.messages.find(message => message.type === 'paired').token, 'fresh-token')
+  assert.equal(panel.element('pairSection').isHidden(), true)
+})
+
+test('a sync with no bridge running says how to start one', async () => {
+  const panel = ui(async () => { throw new TypeError('Failed to fetch') })
+  await panel.send()
+  assert.match(panel.element('errorMsg').textContent, /^No bridge is running at http:\/\/localhost:3456\. Open Claude Code/)
+  assert.match(panel.messages.at(-1).error, /No bridge is running/)
+})
+
+test('an upload the running bridge cuts off is not blamed on a missing bridge', async () => {
+  const panel = ui(async url => {
+    if (url.endsWith('/bridge/health')) return respondWith(200, { status: 'ok' })
+    throw new TypeError('Failed to fetch')
+  })
+  await panel.send()
+  assert.match(panel.messages.at(-1).error, /dropped the upload.*FIGMA_BRIDGE_MAX_BODY_BYTES/)
+})
+
+test('a pasted token clears the rejection it replaces', async () => {
+  const panel = ui(async () => respondWith(401, { code: 'UNAUTHORIZED', error: 'Missing or invalid bridge token.' }))
+  await panel.post({ type: 'bridge-start', config: savedConfig })
+  await settleUi()
+  assert.equal(panel.element('statusText').textContent, 'Pairing needed')
+
+  panel.element('bridgeToken').value = 'new-token'
+  panel.element('bridgeToken').listeners.change({ target: panel.element('bridgeToken') })
+  assert.equal(panel.element('statusText').textContent, 'Not connected')
+  assert.equal(panel.element('errorMsg').isHidden(), true)
+  assert.equal(panel.messages.at(-1).type, 'set-token')
+})
+
+test('waiting for the bridge does not reach the panel as an error', async () => {
+  const p = bridgePlugin()
+  await p.ready()
+  p.sent.length = 0
+  await p.message({ type: 'bridge-status', connected: false, error: null })
+  assert.equal(p.sent.some(message => message.type === 'error'), false)
+  assert.equal(p.sent.at(-1).type, 'status')
+
+  await p.message({ type: 'bridge-status', connected: false, error: 'This bridge did not accept the saved token.' })
+  assert.equal(p.sent.at(-1).type, 'error')
 })
