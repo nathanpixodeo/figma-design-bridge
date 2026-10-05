@@ -51,6 +51,11 @@ link of that file into Claude Code. Figma tells the plugin which file it is in,
 so no link has to be pasted into the panel; if your Figma account does not, the
 panel asks for the file's link once per document.
 
+The bridge runs while Claude Code does; nothing has to be started by hand. Opened
+before Claude Code, the panel shows **Waiting for the bridge...** and connects as
+soon as a session starts. A plugin installed during a session starts with the
+next one: restart Claude Code (`claude -c` resumes the conversation).
+
 Without Claude Code, start the bridge with `npm start` and approve the code with
 `npm run bridge:pair -- <code>` instead. Copying the token by hand
 (`npm run bridge:token`) still works, under **Advanced** in the panel.
@@ -92,7 +97,8 @@ full file or the `node-id` embedded in it, using `FIGMA_ACCESS_TOKEN`.
 
 **Both paths converge.** The incoming design is normalized into one compact
 schema — dimensions, text, colors, effects, auto-layout, components and child
-nodes — then saved to `server/data/latest.json` plus timestamped snapshots.
+nodes — then saved to `latest.json` in the [data directory](#where-data-lives)
+plus timestamped snapshots.
 Agents query the cached data; reading and searching never call Figma again.
 
 ---
@@ -156,7 +162,6 @@ To customize settings, edit `server/config.json` before starting:
 ```json
 {
   "port": 3456,
-  "dataDir": "data",
   "maxSnapshots": 50,
   "logLevel": "info"
 }
@@ -164,6 +169,41 @@ To customize settings, edit `server/config.json` before starting:
 
 Every setting also has an environment variable: `FIGMA_BRIDGE_PORT`,
 `FIGMA_BRIDGE_DATA_DIR`, `FIGMA_BRIDGE_MAX_SNAPSHOTS`, `FIGMA_BRIDGE_LOG_LEVEL`.
+
+#### Where data lives
+
+The bridge token, the snapshots and the cache live in one directory per user of
+the machine:
+
+| OS | Directory |
+| --- | --- |
+| Windows | `%LOCALAPPDATA%\figma-design-bridge` |
+| macOS | `~/Library/Application Support/figma-design-bridge` |
+| Linux | `~/.local/share/figma-design-bridge` |
+
+On Linux the path comes from the home directory alone, not from
+`XDG_DATA_HOME`: MCP hosts such as Codex pass a server only a few environment
+variables, and every launcher has to arrive at the same directory.
+
+Every launcher uses it: the Claude Code plugin in any profile, Codex, `npm start`
+and the npm scripts. They share one token, so the Figma plugin pairs once per
+machine, whichever of them holds the port. Set `dataDir` in `server/config.json`
+or `FIGMA_BRIDGE_DATA_DIR` only to keep a setup apart on purpose; every process
+that should share it then needs the same value. Uninstalling the plugin leaves
+this directory in place; delete it to remove the token and the cache.
+
+**Upgrading from 1.2 or earlier.** On its first start, 1.3.0 copies the token,
+the current design, the cache and the ten newest snapshots from the directory
+the previous version used — `server/data`, or the Claude Code plugin's own data
+directory — and leaves that directory as it was, for launchers not updated yet.
+A file that cannot be copied is skipped and named in the log. A `dataDir` in
+`server/config.json` or a `FIGMA_BRIDGE_DATA_DIR` that names `server/data` —
+the default `npm start` used to write, and what the Codex guide used to
+prescribe — counts as unset. Remove any other `FIGMA_BRIDGE_DATA_DIR` you set
+for 1.2 to align launchers, such as `FIGMA_BRIDGE_DATA_DIR=<plugin data> npm start`,
+or that launcher keeps a directory and token of its own.
+`FIGMA_BRIDGE_MIGRATE_FROM` names another directory to copy from; the Claude
+Code plugin sets it to its previous data directory.
 
 ```bash
 FIGMA_BRIDGE_PORT=4567 node server/index.js
@@ -304,7 +344,7 @@ curl http://localhost:3456/health
   "pageName": "Page 1",
   "nodeCount": 142,
   "snapshotCount": 5,
-  "dataDir": "/path/to/figma-design-bridge/server/data",
+  "dataDir": "/home/you/.local/share/figma-design-bridge",
   "endpoints": [
     "GET  /health",
     "POST /figma/import",
@@ -513,7 +553,7 @@ curl -H "Authorization: Bearer $BRIDGE_TOKEN" http://localhost:3456/snapshots/20
 
 ### Persistence
 
-Design snapshots are automatically saved to `server/data/snapshots/` after each sync. On restart, the server loads the latest snapshot from disk, so your design survives server restarts. The server keeps a maximum of 50 snapshots, pruning the oldest automatically.
+Design snapshots are automatically saved to `snapshots/` in the [data directory](#where-data-lives) after each sync. On restart, the server loads the latest snapshot from disk, so your design survives server restarts. The server keeps a maximum of 50 snapshots, pruning the oldest automatically.
 
 `latest.json` is shared: when another process — the MCP server or a second `npm start` on the same data directory — writes a newer one, the next read picks it up without a restart.
 
@@ -680,6 +720,9 @@ never both required.
 
 The panel shows the file, the last node an agent read and the last sync. HTTP and network errors are shown, and a stalled upload times out after 30 seconds.
 
+- **Waiting for the bridge...** Nothing answers at the bridge URL yet, because neither Claude Code nor `npm start` is running. This is not an error: the panel keeps trying every few seconds and connects as soon as one starts.
+- **Pairing needed.** The bridge refused the saved token: it was rotated, or this bridge keeps its own data directory. The panel stops retrying and shows **Pair with bridge** again.
+
 ### Menu Commands
 
 | Command | Action |
@@ -748,22 +791,11 @@ claude plugin install figma-bridge@figma-design-bridge
 | `/figma-bridge:sync <figma-url>` | Pulls a file or node through the REST API (needs a Figma token) |
 | `/figma-bridge:pair <code>` | Approves the Figma plugin that shows this 6-digit pairing code, so it receives the bridge token without anyone copying it |
 
-The plugin resolves its own paths through `${CLAUDE_PLUGIN_ROOT}`, so nothing breaks when the clone moves, and it caches designs in `${CLAUDE_PLUGIN_DATA}`, which survives plugin updates.
+The plugin resolves its own paths through `${CLAUDE_PLUGIN_ROOT}`, so nothing breaks when the clone moves. Its MCP server keeps the token and the cached designs in the [shared data directory](#where-data-lives), the same one `npm start` and Codex use, and on its first start copies over what earlier versions kept in `${CLAUDE_PLUGIN_DATA}`.
 
-That data directory is the one thing worth understanding before you sync. The MCP server also tries to listen on port 3456, and when it succeeds it is itself the endpoint the Figma plugin posts to — it serves both the Sync commands' `/design` and the `/bridge/*` routes, so install, sync from Figma, done. But if a standalone `node server/index.js` already holds 3456 with its own data directory, that process receives the sync and writes it there: the plugin's snapshot tools report that nothing is loaded, and its bridge tools fail with `NO_TOKEN` or `UNAUTHORIZED`, naming the fix. Either let the plugin's MCP server own the port, or start the standalone server against the same directory:
+The MCP server tries to listen on port 3456, and when it succeeds it is itself the endpoint the Figma plugin talks to — it serves both the Sync commands' `/design` and the `/bridge/*` routes — so install, open the panel in Figma, pair, done. It hosts the bridge while Claude Code runs; in between, the panel waits and reconnects by itself. When `npm start` or another session already holds the port, the MCP server reuses that bridge: they share the token, so it makes no difference to the Figma plugin which of them runs.
 
-```bash
-# print the directory the plugin's MCP server is reading
-# (also shown by /figma-bridge:page)
-FIGMA_BRIDGE_DATA_DIR="<that path>" node server/index.js
-```
-
-The bridge token lives in that same directory, so the token the Figma plugin has
-to be paired with is the one belonging to whichever process owns port 3456:
-
-```bash
-FIGMA_BRIDGE_DATA_DIR="<that path>" npm run bridge:token
-```
+Only a bridge that keeps its own data directory gets in the way — one older than 1.3.0, or one started with `FIGMA_BRIDGE_DATA_DIR`. If it holds port 3456, the plugin's bridge tools fail with `NO_TOKEN` or `UNAUTHORIZED`, naming the fix: update or stop that bridge. `/figma-bridge:page` shows the directory the MCP server reads.
 
 For Codex CLI, see [`integrations/codex/README.md`](integrations/codex/README.md).
 
@@ -793,7 +825,8 @@ The MCP server communicates with Claude Code via stdio and also starts the local
 bridge on port 3456 — `/bridge/*` plus the `/design` routes the plugin's Sync
 commands post to — or reuses the one already running there:
 
-- `node server/index.js` on the **same** data directory is reused, so running
+- `node server/index.js` is reused: both use the [shared data
+  directory](#where-data-lives) unless one of them is given another, so running
   both is safe.
 - Anything else on that port — another program, or a bridge on a different data
   directory — does not stop the MCP server. The snapshot tools keep reading the
@@ -873,6 +906,8 @@ claude -p "Based on these text nodes, write better copy for the landing page: $T
 |---------|----------|
 | HTTP `401` from `/design` or `/snapshots` | Send the bridge token: `npm run bridge:token`, then `-H "Authorization: Bearer <token>"`. In the Figma plugin, press **Pair with bridge**, or paste the token under **Advanced**. |
 | The plugin says "No bridge is running at http://localhost:3456" | Open Claude Code with the figma-bridge plugin, or run `npm start`, then press **Pair with bridge** again. |
+| The panel stays on **Waiting for the bridge...** | Nothing runs at the bridge URL. Open Claude Code with the figma-bridge plugin — restart it if the plugin was installed during the session, and check that `/mcp` lists it — or run `npm start`. The panel connects by itself. |
+| The panel says **Pairing needed** | The bridge refused the saved token: it was rotated, or the bridge keeps its own data directory (older than 1.3.0, or started with `FIGMA_BRIDGE_DATA_DIR`). Press **Pair with bridge**. |
 | "No Figma plugin is waiting with that code" | The pairing code expired (codes last two minutes) or was mistyped. Press **Pair with bridge** again and approve the new code. |
 | HTTP `403` "addressed to a loopback host" | Reach the server as `localhost` or `127.0.0.1`, not through another host name or a reverse proxy that rewrites `Host`. |
 | HTTP `403` "origin is not allowed" | The request came from a web page on a real origin. Only the Figma plugin iframe (`Origin: null`) and loopback origins are allowed. |
@@ -895,14 +930,14 @@ figma-bridge/
 │   ├── manifest.json          # Figma plugin manifest (networkAccess, enablePrivatePluginApi)
 │   └── code.js                # Plugin panel: pairing, live /bridge/* reads, Sync to /design
 ├── server/
-│   ├── data/                  # latest.json + snapshots + bridge-token.json (gitignored)
-│   ├── config.json            # Auto-created config (port, dataDir, maxSnapshots, logLevel)
+│   ├── data/                  # Data of versions before 1.3.0, copied to the shared directory (gitignored)
+│   ├── config.json            # Auto-created config (port, maxSnapshots, logLevel; dataDir only if you set one)
 │   ├── figma-api.js           # Figma REST client + schema normalizer
 │   ├── figma-api.test.js      # Normalizer/import tests
 │   ├── import-figma.mjs       # CLI importer
 │   ├── bridge-token.js        # Prints/rotates the bridge token
 │   ├── bridge-pair.js         # Approves a Figma plugin pairing code from the terminal
-│   ├── data-dir.js            # Read-only data-directory resolution
+│   ├── data-dir.js            # Shared data-directory resolution + one-time migration
 │   ├── package.json           # Server metadata
 │   ├── index.js               # HTTP server
 │   ├── legacy-routes.js       # /design, /figma/import, /snapshots (shared by both servers)

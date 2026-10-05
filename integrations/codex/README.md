@@ -10,9 +10,7 @@ plugin.
 Replace `<REPO>` with the absolute path to your clone.
 
 ```bash
-codex mcp add figma-bridge \
-  --env FIGMA_BRIDGE_DATA_DIR=<REPO>/server/data \
-  -- node <REPO>/server/mcp.mjs
+codex mcp add figma-bridge -- node <REPO>/server/mcp.mjs
 ```
 
 Or write it into `~/.codex/config.toml` directly:
@@ -21,14 +19,11 @@ Or write it into `~/.codex/config.toml` directly:
 [mcp_servers.figma-bridge]
 command = "node"
 args = ["<REPO>/server/mcp.mjs"]
-
-[mcp_servers.figma-bridge.env]
-FIGMA_BRIDGE_DATA_DIR = "<REPO>/server/data"
 ```
 
-Add `FIGMA_ACCESS_TOKEN` to that `env` table only if you want `sync_figma_design`, which pulls a Figma URL through the REST API. The Figma plugin path needs no Figma token — but the plugin has to pair with the bridge once: press **Pair with bridge** in its panel and approve the code it shows with the `approve_figma_pairing` tool or `npm run bridge:pair -- <code>`. Pasting the output of `npm run bridge:token` under **Advanced** in the panel also works.
+Add an `[mcp_servers.figma-bridge.env]` table with `FIGMA_ACCESS_TOKEN` only if you want `sync_figma_design`, which pulls a Figma URL through the REST API. The Figma plugin path needs no Figma token — but the plugin has to pair with the bridge once: press **Pair with bridge** in its panel and approve the code it shows with the `approve_figma_pairing` tool or `npm run bridge:pair -- <code>`. Pasting the output of `npm run bridge:token` under **Advanced** in the panel also works.
 
-`FIGMA_BRIDGE_DATA_DIR` is not optional in practice. Without it the server derives its data directory from its own location, so a second clone silently reads an empty cache and reports that no design is loaded. Point this variable and the HTTP server (`node server/index.js`) at the same directory.
+No data directory needs configuring. Codex, the Claude Code plugin and `npm start` all keep the token and the cache in the same per-user directory (see [Where data lives](../../README.md#where-data-lives)), so the Figma plugin stays paired whichever of them runs the bridge. Before 1.3.0 this setup needed `FIGMA_BRIDGE_DATA_DIR=<REPO>/server/data`. That value now counts as unset, so it does no harm, but you can remove it; any other value keeps the Codex server on a directory and a token apart from the others. While the shared directory is still empty, the first start copies the token and the cache from `server/data`.
 
 Check it with `codex mcp list`.
 

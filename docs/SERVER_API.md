@@ -42,7 +42,7 @@ Server health check and endpoint discovery.
   "pageName": "Page 1",
   "nodeCount": 142,
   "snapshotCount": 5,
-  "dataDir": "./server/data",
+  "dataDir": "/home/you/.local/share/figma-design-bridge",
   "endpoints": [
     "GET  /",
     "POST /figma/import",

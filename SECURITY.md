@@ -29,7 +29,12 @@ rebinding, and refuses any request carrying a cross-origin `Origin`. No response
 ever carries `Access-Control-Allow-Origin: *`.
 
 **The token.** Reading or writing design data requires the bridge token, a
-32-byte random value in `<dataDir>/bridge-token.json`. It is the one control that
+32-byte random value in `<dataDir>/bridge-token.json`. By default `<dataDir>` is
+one directory per user that every launcher shares, outside any repository:
+`%LOCALAPPDATA%\figma-design-bridge`, `~/Library/Application Support/figma-design-bridge`
+or `~/.local/share/figma-design-bridge`. Upgrading to 1.3.0 copies the token
+there from the previous directory and leaves the old copy in place; delete the
+old directory once nothing older than 1.3.0 uses it. The token is the one control that
 separates the Figma plugin's iframe from a hostile page's sandboxed iframe, since
 both post from the opaque origin `null`. `npm run bridge:token` prints it;
 `npm run bridge:token:rotate` replaces it and unpairs every plugin. The token

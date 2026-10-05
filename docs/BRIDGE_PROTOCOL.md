@@ -610,16 +610,17 @@ re-probes and reuses the winner.
   has to stay on that declared origin too.
 - **One process owns port 3456.** `server/index.js` and `server/mcp.mjs` both
   serve `/bridge/*` and the legacy routes. An MCP server that finds this bridge
-  already running reuses it, which works only when both use the same data
-  directory, because the token lives there. When it finds another program, or
-  a bridge on a different data directory, it keeps serving the snapshot tools
+  already running reuses it. That needs both to use the same data directory,
+  because the token lives there, and by default they do: every launcher shares
+  one directory per user. When it finds another program, or a bridge on a
+  different data directory, it keeps serving the snapshot tools
   and its bridge tools report `PORT_OCCUPIED`, `NO_TOKEN` or `UNAUTHORIZED`
   with the fix. When the process that owns the port exits, a remaining MCP
   server takes the port over within about 10 seconds, or at its next bridge
   call.
 - **Token file permissions are best-effort on Windows.** `chmod 0o600` is
   honoured on macOS and Linux; on NTFS the inherited ACL wins and the mode is a
-  no-op. The real protection there is that the token lives in the git-ignored
-  local data directory.
+  no-op. The real protection there is that the token lives in the per-user
+  data directory, outside any repository.
 - **No screenshots.** This protocol returns structured design data, not images.
   A bounded PNG preview is deferred to phase 3.
