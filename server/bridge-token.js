@@ -6,11 +6,12 @@
 // which invalidates every paired plugin and every stored copy.
 
 const { getOrCreateToken, rotateToken } = require('./bridge/token')
-const { resolveDataDir } = require('./data-dir')
+const { prepareDataDir } = require('./data-dir')
 
 function main() {
   const rotate = process.argv.includes('--rotate')
-  const dataDir = resolveDataDir()
+  // Notes go to stderr: stdout carries the token and nothing else.
+  const { dataDir } = prepareDataDir({ log: message => process.stderr.write(`${message}\n`) })
   const result = rotate ? rotateToken(dataDir) : getOrCreateToken(dataDir)
 
   if (rotate) {

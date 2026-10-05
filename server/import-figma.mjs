@@ -4,7 +4,7 @@ import dataDirModule from "./data-dir.js";
 import tokenModule from "./bridge/token.js";
 
 const { fetchFigmaDesign } = figmaApi;
-const { resolveDataDir } = dataDirModule;
+const { prepareDataDir } = dataDirModule;
 const { readToken } = tokenModule;
 const source = process.argv[2];
 
@@ -20,7 +20,8 @@ if (!source || source === "--help" || source === "-h") {
 function resolveBridgeToken() {
   const fromEnv = process.env.FIGMA_BRIDGE_TOKEN;
   if (fromEnv) return fromEnv.trim();
-  const stored = readToken(resolveDataDir());
+  const { dataDir } = prepareDataDir({ log: message => console.error(message) });
+  const stored = readToken(dataDir);
   return stored ? stored.token : null;
 }
 

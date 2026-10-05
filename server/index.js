@@ -9,15 +9,17 @@ const bridgeIdentity = require('./bridge/identity')
 const { getOrCreateToken } = require('./bridge/token')
 const createSnapshotStore = require('./snapshot-store')
 const createLegacyRoutes = require('./legacy-routes')
+const { prepareDataDir } = require('./data-dir')
 
 // ── Config ────────────────────────────────────────────────
 
 const CONFIG_PATH = path.join(__dirname, 'config.json')
 
+// There is no dataDir default here: data-dir.js picks the directory every
+// launcher shares unless config.json or FIGMA_BRIDGE_DATA_DIR names one.
 function loadConfig() {
   const defaults = {
     port: 3456,
-    dataDir: path.join(__dirname, 'data'),
     maxSnapshots: 50,
     logLevel: 'info',
   }
@@ -42,7 +44,6 @@ const port = parseInt(process.env.FIGMA_BRIDGE_PORT || config.port, 10)
 // by default.
 const host = process.env.FIGMA_BRIDGE_HOST || config.host || '127.0.0.1'
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1'])
-const dataDir = process.env.FIGMA_BRIDGE_DATA_DIR || config.dataDir
 const maxSnapshots = parseInt(process.env.FIGMA_BRIDGE_MAX_SNAPSHOTS || config.maxSnapshots, 10)
 const logLevel = process.env.FIGMA_BRIDGE_LOG_LEVEL || config.logLevel
 const maxBodyBytes = parseInt(process.env.FIGMA_BRIDGE_MAX_BODY_BYTES || config.maxBodyBytes || 50_000_000, 10)
@@ -62,6 +63,10 @@ function log(level, ...args) {
   else if (level === 'warn') console.warn(...output)
   else console.log(...output)
 }
+
+// ── Data directory ────────────────────────────────────────
+
+const { dataDir } = prepareDataDir({ log: message => log('info', message) })
 
 // The legacy snapshot API and the request-driven bridge deliberately share one
 // listener. This keeps `npm start` compatible with existing /design consumers

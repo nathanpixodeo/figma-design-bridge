@@ -11,8 +11,10 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import createSnapshotStore from "./snapshot-store.js";
 import daemonModule from "./bridge/daemon.js";
+import dataDirModule from "./data-dir.js";
 
 const { createDaemon } = daemonModule;
+const { describeDataDir, userDataDir } = dataDirModule;
 
 // Every test runs the MCP server the way Claude Code does — a stdio child
 // process — on a free port and a temporary data directory, so the bridge on
@@ -270,4 +272,66 @@ test("an MCP server started with no client keeps hosting the bridge", async t =>
 
   assert.equal(await within(mcp.exited, 1500), "still running");
   assert.equal(await bridgeHealthy(port), true);
+});
+
+// The per-user directory every launcher shares, redirected into a temporary one
+// on every platform, with no data directory set anywhere.
+function sharedDirSetup(t) {
+  const home = tempDataDir(t);
+  return {
+    shared: userDataDir({ env: { LOCALAPPDATA: home }, homedir: home }),
+    env: { LOCALAPPDATA: home, HOME: home, FIGMA_BRIDGE_DATA_DIR: "", FIGMA_BRIDGE_MIGRATE_FROM: "" },
+  };
+}
+
+// The environment .claude-plugin/plugin.json gives the MCP server, with the
+// plugin's own data directory filled in the way Claude Code does.
+function pluginEnv(pluginData) {
+  const manifest = JSON.parse(fs.readFileSync(path.join(repoRoot, ".claude-plugin", "plugin.json"), "utf8"));
+  const env = {};
+  for (const [key, value] of Object.entries(manifest.mcpServers.bridge.env || {})) {
+    env[key] = value.replaceAll("${CLAUDE_PLUGIN_DATA}", pluginData);
+  }
+  return env;
+}
+
+const ownDataDir = describeDataDir({ env: {} }).source === "config" ? "server/config.json names its own dataDir" : false;
+
+test("the plugin's MCP server carries the token and snapshots an earlier version kept over to the shared directory", { skip: ownDataDir }, async t => {
+  const { shared, env } = sharedDirSetup(t);
+  const pluginData = tempDataDir(t);
+  fs.writeFileSync(path.join(pluginData, "bridge-token.json"), JSON.stringify({ token: "f".repeat(64), createdAt: new Date().toISOString() }));
+  createSnapshotStore({ dataDir: pluginData }).save({ pageName: "Synced before 1.3.0", nodes: [], nodeCount: 0 });
+  const port = await freePort();
+
+  const client = await connectMcp(t, { ...env, ...pluginEnv(pluginData), FIGMA_BRIDGE_PORT: String(port) });
+  await waitFor(() => bridgeHealthy(port));
+
+  const info = textOf(await client.callTool({ name: "get_design_info", arguments: {} }));
+  assert.match(info, /Synced before 1\.3\.0/);
+  assert.ok(info.includes(`**Data dir:** ${shared}`), info);
+  const status = await fetch(`http://127.0.0.1:${port}/bridge/status`, { headers: { authorization: `Bearer ${"f".repeat(64)}` } });
+  assert.equal(status.status, 200, "the Figma plugin paired before the update has to stay paired");
+});
+
+test("npm start and the plugin's MCP server share one bridge with no data directory configured", { skip: ownDataDir }, async t => {
+  const { shared, env } = sharedDirSetup(t);
+  // Already set up by an earlier start, so nothing is migrated from server/data.
+  fs.mkdirSync(shared, { recursive: true });
+  fs.writeFileSync(path.join(shared, "bridge-token.json"), JSON.stringify({ token: "9".repeat(64), createdAt: new Date().toISOString() }));
+  const port = await freePort();
+
+  const server = spawn(process.execPath, [path.join(serverDir, "index.js")], {
+    cwd: repoRoot,
+    env: { ...process.env, ...env, FIGMA_BRIDGE_PORT: String(port) },
+    stdio: ["ignore", "ignore", "pipe"],
+  });
+  server.stderr.resume();
+  t.after(() => { if (server.exitCode === null) server.kill(); });
+  await waitFor(() => bridgeHealthy(port));
+
+  const client = await connectMcp(t, { ...env, ...pluginEnv(tempDataDir(t)), FIGMA_BRIDGE_PORT: String(port) });
+  const status = await client.callTool({ name: "get_bridge_status", arguments: {} });
+  assert.equal(status.isError, undefined, textOf(status));
+  assert.doesNotMatch(client.serverLogs(), /bridge daemon listening/);
 });

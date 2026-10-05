@@ -17,6 +17,7 @@ const { startOrReuse } = require("./bridge/daemon.js");
 const { createClient } = require("./bridge/client.js");
 const createSnapshotStore = require("./snapshot-store.js");
 const createLegacyRoutes = require("./legacy-routes.js");
+const { prepareDataDir } = require("./data-dir.js");
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 let fileConfig = {};
@@ -26,7 +27,9 @@ try {
 } catch { /* fall back to defaults */ }
 const PORT = parseInt(process.env.FIGMA_BRIDGE_PORT || fileConfig.port || "3456", 10);
 const HOST = process.env.FIGMA_BRIDGE_HOST || fileConfig.host || "127.0.0.1";
-const DATA_DIR = process.env.FIGMA_BRIDGE_DATA_DIR || fileConfig.dataDir || path.join(__dirname, "data");
+// The directory every launcher shares unless FIGMA_BRIDGE_DATA_DIR or
+// config.json names one; see data-dir.js.
+const { dataDir: DATA_DIR } = prepareDataDir({ log: message => log(message) });
 const MAX_SNAPSHOTS = parseInt(process.env.FIGMA_BRIDGE_MAX_SNAPSHOTS || fileConfig.maxSnapshots || "50", 10);
 const MAX_BODY_BYTES = parseInt(process.env.FIGMA_BRIDGE_MAX_BODY_BYTES || fileConfig.maxBodyBytes || "50000000", 10);
 const ALLOW_ANONYMOUS_LEGACY = process.env.FIGMA_BRIDGE_ALLOW_ANONYMOUS_LEGACY === "1";
@@ -170,8 +173,8 @@ async function ensureBridge() {
       if (!descriptor.token) {
         const error = new Error(
           `A Figma Design Bridge is already running at ${descriptor.url}, but its pairing token is not in ${DATA_DIR}, `
-          + "so it was started with a different data directory. Start both with the same FIGMA_BRIDGE_DATA_DIR, "
-          + "or stop the other bridge so this server can start its own.",
+          + "so it uses a different data directory: it is older than 1.3.0, or it was started with FIGMA_BRIDGE_DATA_DIR. "
+          + "Update or stop that bridge so this server can start its own, or start both with the same FIGMA_BRIDGE_DATA_DIR.",
         );
         error.code = "NO_TOKEN";
         throw error;
@@ -231,8 +234,9 @@ function describeError(error) {
   const prefix = error.code ? `${error.code}: ` : "";
   let hint = "";
   if (error.code === "UNAUTHORIZED") {
-    hint = ` The bridge on port ${PORT} rejected the token stored in ${DATA_DIR}. It is probably running with a `
-      + "different data directory; start both with the same FIGMA_BRIDGE_DATA_DIR.";
+    hint = ` The bridge on port ${PORT} rejected the token stored in ${DATA_DIR}. It probably uses a different `
+      + "data directory: it is older than 1.3.0, or it was started with FIGMA_BRIDGE_DATA_DIR. Update or stop it, "
+      + "or start both with the same FIGMA_BRIDGE_DATA_DIR.";
   }
   return `${prefix}${error.message}${hint}`;
 }

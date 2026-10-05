@@ -1,9 +1,10 @@
 // Local bridge token: the single shared secret that authenticates every
 // mutating and design-reading route on the loopback daemon.
 //
-// The token is written to <dataDir>/bridge-token.json, which lives inside the
-// git-ignored server data directory. It must never appear in a health response,
-// a session listing, a log line, an error message or a URL.
+// The token is written to <dataDir>/bridge-token.json; by default <dataDir> is
+// the per-user directory every launcher shares, outside any repository (see
+// data-dir.js). It must never appear in a health response, a session listing, a
+// log line, an error message or a URL.
 
 const crypto = require('crypto')
 const fs = require('fs')
@@ -27,7 +28,7 @@ function tokenPath(dataDir) {
 
 // Best effort only. POSIX modes are honoured on macOS/Linux; on Windows the
 // inherited NTFS ACL wins and 0o600 is a no-op, so the real protection there is
-// that the token lives in the git-ignored local data directory.
+// that the token lives in the per-user data directory.
 function restrictPermissions(filePath) {
   try { fs.chmodSync(filePath, 0o600) } catch {}
 }
