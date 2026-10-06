@@ -110,6 +110,7 @@ async function createDaemon(options = {}) {
     host = DEFAULT_HOST,
     dataDir,
     maxEntries,
+    maxBytes,
     maxBodyBytes,
     allowedOrigins,
     protocolVersion = PROTOCOL_VERSION,
@@ -134,7 +135,7 @@ async function createDaemon(options = {}) {
 
   const identity = options.identity || loadSibling('identity')
   const cache = options.cache
-    || factoryFrom(loadSibling('cache'), 'createCache', 'cache')({ dataDir, maxEntries, now })
+    || factoryFrom(loadSibling('cache'), 'createCache', 'cache')({ dataDir, maxEntries, maxBytes, now })
   const broker = options.broker
     || factoryFrom(loadSibling('broker'), 'createBroker', 'broker')({ now, log, identity })
 

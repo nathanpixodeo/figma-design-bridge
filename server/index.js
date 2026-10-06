@@ -47,6 +47,7 @@ const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1'])
 const maxSnapshots = parseInt(process.env.FIGMA_BRIDGE_MAX_SNAPSHOTS || config.maxSnapshots, 10)
 const logLevel = process.env.FIGMA_BRIDGE_LOG_LEVEL || config.logLevel
 const maxBodyBytes = parseInt(process.env.FIGMA_BRIDGE_MAX_BODY_BYTES || config.maxBodyBytes || 50_000_000, 10)
+const cacheMaxBytes = parseInt(process.env.FIGMA_BRIDGE_CACHE_MAX_BYTES || config.cacheMaxBytes || createBridgeCache.DEFAULT_MAX_BYTES, 10)
 const allowAnonymousLegacy = process.env.FIGMA_BRIDGE_ALLOW_ANONYMOUS_LEGACY === '1'
 
 // ── Logger ────────────────────────────────────────────────
@@ -72,7 +73,7 @@ const { dataDir } = prepareDataDir({ log: message => log('info', message) })
 // listener. This keeps `npm start` compatible with existing /design consumers
 // while allowing MCP adapters to safely probe/reuse the same process.
 const bridgeToken = getOrCreateToken(dataDir).token
-const bridgeCache = createBridgeCache({ dataDir })
+const bridgeCache = createBridgeCache({ dataDir, maxBytes: cacheMaxBytes })
 const bridgeBroker = createBridgeBroker({ identity: bridgeIdentity, log })
 const bridgeRouter = createBridgeRoutes({
   broker: bridgeBroker,

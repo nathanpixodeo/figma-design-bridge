@@ -10,6 +10,37 @@ const ENTRY_FILENAME_RE = /^[0-9a-f]{64}\.json$/
 
 const VALID_SOURCES = ['plugin', 'rest', 'legacy']
 
+const DEFAULT_MAX_ENTRIES = 500
+const DEFAULT_MAX_BYTES = 200_000_000
+
+// An entry keeps its payload last, and the metadata in front of it is small
+// (truncatedNodeIds, its longest part, comes capped at 500 ids), so this much
+// of the head is enough to index one. An entry whose metadata runs longer is
+// read whole.
+const HEAD_BYTES = 64 * 1024
+
+// Windows refuses to replace a file that any process has open, even only to
+// read it, and reports EPERM, EACCES or EBUSY. Antivirus and indexers open a
+// file right after it is written.
+const RENAME_RETRY_CODES = new Set(['EPERM', 'EACCES', 'EBUSY'])
+
+function pause(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
+}
+
+// Retried for about a second before the write is given up on.
+function renameWithRetry(from, to) {
+  for (let attempt = 0, delay = 10; ; attempt++, delay = Math.min(delay * 2, 200)) {
+    try {
+      fs.renameSync(from, to)
+      return
+    } catch (error) {
+      if (!RENAME_RETRY_CODES.has(error.code) || attempt >= 8) throw error
+      pause(delay)
+    }
+  }
+}
+
 // ── Stale marking (freshness helper) ────────────────────────
 
 // markStale(entry) => shallow copy with verifiedFresh forced false and a
@@ -21,11 +52,29 @@ function markStale(entry) {
 
 // ── Cache factory ────────────────────────────────────────────
 
-function createCache({ dataDir, maxEntries = 500, now = () => Date.now() } = {}) {
+function createCache({
+  dataDir,
+  maxEntries = DEFAULT_MAX_ENTRIES,
+  maxBytes = DEFAULT_MAX_BYTES,
+  now = () => Date.now(),
+} = {}) {
   if (typeof dataDir !== 'string' || !dataDir) {
     throw new Error('createCache requires a dataDir path')
   }
-  fs.mkdirSync(dataDir, { recursive: true })
+  // A limit that is not a positive number (NaN from a mistyped setting) would
+  // switch eviction off without a word.
+  if (!(maxEntries > 0) || !(maxBytes > 0)) {
+    throw new Error(`createCache requires a positive maxEntries and maxBytes (got ${maxEntries} and ${maxBytes})`)
+  }
+  fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 })
+
+  // What eviction, invalidation and stats need to know about each entry, so
+  // that none of them reads an entry back: filename -> { fileKey, fileName,
+  // nodeId, size }, from the oldest entry to the newest. Entries this process
+  // writes are added as it writes them. The ones an earlier owner of the
+  // bridge left are indexed from disk once, on first use rather than at
+  // startup.
+  let index = null
 
   function entryPath(filename) {
     return path.join(dataDir, filename)
@@ -34,12 +83,19 @@ function createCache({ dataDir, maxEntries = 500, now = () => Date.now() } = {})
   // Every write goes to a temp file in the same directory, then an atomic
   // rename onto the target. A crash between these two steps leaves either
   // nothing (readdir/get never see the temp file) or the old file untouched
-  // — never a half-written entry at the final path.
+  // — never a half-written entry at the final path. When the rename fails for
+  // good, the temp file is removed rather than left behind. Returns the size
+  // of the entry written.
   function writeEntryAtomic(filename, data) {
-    const finalPath = entryPath(filename)
+    const text = JSON.stringify(data)
     const tmpPath = path.join(dataDir, `.${filename}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`)
-    fs.writeFileSync(tmpPath, JSON.stringify(data))
-    fs.renameSync(tmpPath, finalPath)
+    try {
+      fs.writeFileSync(tmpPath, text)
+      renameWithRetry(tmpPath, entryPath(filename))
+    } finally {
+      try { fs.unlinkSync(tmpPath) } catch { /* renamed into place, or never written */ }
+    }
+    return Buffer.byteLength(text, 'utf8')
   }
 
   function readEntryFile(filename) {
@@ -59,6 +115,36 @@ function createCache({ dataDir, maxEntries = 500, now = () => Date.now() } = {})
     }
   }
 
+  // An entry's metadata, everything but its payload, from the head of the
+  // file. Cutting the text before the payload and closing the object parses
+  // only when the cut is at the top level, so a parse that succeeds is the
+  // whole metadata. A head that does not (a corrupt file, unusually long
+  // metadata) is read whole instead.
+  function readEntryMeta(filename, buffer) {
+    let head
+    try {
+      const fd = fs.openSync(entryPath(filename), 'r')
+      try {
+        head = buffer.toString('utf8', 0, fs.readSync(fd, buffer, 0, buffer.length, 0))
+      } finally {
+        fs.closeSync(fd)
+      }
+    } catch {
+      return null
+    }
+    const cut = head.indexOf(',"payload":')
+    if (cut !== -1) {
+      try {
+        const meta = JSON.parse(`${head.slice(0, cut)}}`)
+        if (typeof meta.fileKey === 'string') return meta
+      } catch { /* the cut fell inside a nested value */ }
+    }
+    const entry = readEntryFile(filename)
+    if (!entry) return null
+    const { payload, ...meta } = entry
+    return meta
+  }
+
   function listEntryFilenames() {
     let names
     try {
@@ -69,13 +155,50 @@ function createCache({ dataDir, maxEntries = 500, now = () => Date.now() } = {})
     return names.filter(name => ENTRY_FILENAME_RE.test(name))
   }
 
-  function readAllEntries() {
-    const entries = []
-    for (const filename of listEntryFilenames()) {
-      const entry = readEntryFile(filename)
-      if (entry) entries.push({ filename, entry })
+  function indexRecord({ fileKey, fileName, nodeId }, size) {
+    return {
+      fileKey: typeof fileKey === 'string' ? fileKey : null,
+      fileName: fileName ?? null,
+      nodeId: nodeId ?? null,
+      size,
     }
-    return entries
+  }
+
+  function loadIndex() {
+    if (index) return index
+    const found = []
+    const buffer = Buffer.allocUnsafe(HEAD_BYTES)
+    for (const filename of listEntryFilenames()) {
+      let stat
+      try {
+        stat = fs.statSync(entryPath(filename))
+      } catch (error) {
+        if (error.code === 'ENOENT') continue
+        throw error
+      }
+      // One that cannot be read still takes space: indexed under no file, it
+      // ages out with the others.
+      const meta = readEntryMeta(filename, buffer) || {}
+      found.push({ filename, mtimeMs: stat.mtimeMs, record: indexRecord(meta, stat.size) })
+    }
+    found.sort((a, b) => a.mtimeMs - b.mtimeMs)
+    index = new Map(found.map(({ filename, record }) => [filename, record]))
+    return index
+  }
+
+  // Deletes an entry's file and drops it from the index. A file already gone
+  // (deleted by hand) is only dropped. One that cannot be deleted yet (held
+  // open by a scanner) stays indexed, so the next eviction or invalidation
+  // tries it again. Returns whether this call deleted the file.
+  function removeEntry(filename) {
+    try {
+      fs.unlinkSync(entryPath(filename))
+    } catch (error) {
+      if (error.code === 'ENOENT') index.delete(filename)
+      return false
+    }
+    index.delete(filename)
+    return true
   }
 
   function fetchedAtMs(entry) {
@@ -83,16 +206,17 @@ function createCache({ dataDir, maxEntries = 500, now = () => Date.now() } = {})
     return Number.isFinite(ms) ? ms : 0
   }
 
-  // Bounded retention: oldest-first eviction by fetchedAt, globally (not
-  // per-file). Runs after every put so the directory never grows past
-  // maxEntries entries.
-  function enforceMaxEntries() {
-    const all = readAllEntries()
-    if (all.length <= maxEntries) return
-    all.sort((a, b) => fetchedAtMs(a.entry) - fetchedAtMs(b.entry))
-    const overflow = all.length - maxEntries
-    for (const { filename } of all.slice(0, overflow)) {
-      try { fs.unlinkSync(entryPath(filename)) } catch { /* already gone */ }
+  // Bounded retention, global rather than per file: the oldest entries go
+  // first until both the entry count and the byte budget hold. The entry just
+  // written always stays, even when it alone is over the budget.
+  function enforceLimits(keep) {
+    let bytes = 0
+    for (const { size } of index.values()) bytes += size
+    for (const [filename, { size }] of index) {
+      if (index.size <= maxEntries && bytes <= maxBytes) return
+      if (filename === keep) continue
+      removeEntry(filename)
+      if (!index.has(filename)) bytes -= size
     }
   }
 
@@ -165,17 +289,21 @@ function createCache({ dataDir, maxEntries = 500, now = () => Date.now() } = {})
       payload,
     }
 
-    writeEntryAtomic(cacheFilename(key), entry)
-    enforceMaxEntries()
+    const filename = cacheFilename(key)
+    // Indexed before the write, so this entry is never read back to index it.
+    loadIndex()
+    const size = writeEntryAtomic(filename, entry)
+    // Added at the end even when it replaces an entry, so it counts as newest.
+    index.delete(filename)
+    index.set(filename, indexRecord(entry, size))
+    enforceLimits(filename)
     return entry
   }
 
   function invalidateFile(fileKey, _reason) {
     let removed = 0
-    for (const { filename, entry } of readAllEntries()) {
-      if (sameFile(entry.fileKey, fileKey)) {
-        try { fs.unlinkSync(entryPath(filename)); removed++ } catch { /* already gone */ }
-      }
+    for (const [filename, record] of loadIndex()) {
+      if (sameFile(record.fileKey, fileKey) && removeEntry(filename)) removed++
     }
     return removed
   }
@@ -183,42 +311,46 @@ function createCache({ dataDir, maxEntries = 500, now = () => Date.now() } = {})
   function invalidateNode({ fileKey, nodeId } = {}, _reason) {
     const canonicalNode = nodeId === null || nodeId === undefined ? null : canonicalNodeId(nodeId)
     let removed = 0
-    for (const { filename, entry } of readAllEntries()) {
-      const entryNode = entry.nodeId === undefined ? null : entry.nodeId
-      if (sameFile(entry.fileKey, fileKey) && entryNode === canonicalNode) {
-        try { fs.unlinkSync(entryPath(filename)); removed++ } catch { /* already gone */ }
-      }
+    for (const [filename, record] of loadIndex()) {
+      if (sameFile(record.fileKey, fileKey) && record.nodeId === canonicalNode && removeEntry(filename)) removed++
     }
     return removed
   }
 
   function list({ fileKey } = {}) {
-    const entries = readAllEntries()
-      .map(({ entry }) => entry)
-      .filter(entry => !fileKey || sameFile(entry.fileKey, fileKey))
-      .map(({ payload, ...metadata }) => metadata)
+    const buffer = Buffer.allocUnsafe(HEAD_BYTES)
+    const entries = []
+    for (const filename of listEntryFilenames()) {
+      const meta = readEntryMeta(filename, buffer)
+      if (meta && (!fileKey || sameFile(meta.fileKey, fileKey))) entries.push(meta)
+    }
     entries.sort((a, b) => fetchedAtMs(b) - fetchedAtMs(a))
     return entries
   }
 
   function stats() {
+    const entries = loadIndex()
     const byFile = new Map()
     let byteSize = 0
-    let entryCount = 0
-    for (const { filename, entry } of readAllEntries()) {
-      entryCount += 1
-      try { byteSize += fs.statSync(entryPath(filename)).size } catch { /* races with unlink are fine to skip */ }
-      const fileKey = entry.fileKey
-      if (!byFile.has(fileKey)) byFile.set(fileKey, { fileKey, fileName: entry.fileName ?? null, entryCount: 0 })
-      byFile.get(fileKey).entryCount += 1
+    for (const { fileKey, fileName, size } of entries.values()) {
+      byteSize += size
+      // An entry that could not be read names no file, though its bytes count.
+      if (fileKey === null) continue
+      if (!byFile.has(fileKey)) byFile.set(fileKey, { fileKey, fileName: null, entryCount: 0 })
+      const file = byFile.get(fileKey)
+      file.entryCount += 1
+      // The index runs oldest first, so the name a file had last wins.
+      if (fileName !== null) file.fileName = fileName
     }
-    return { entryCount, byteSize, files: Array.from(byFile.values()) }
+    return { entryCount: entries.size, byteSize, files: Array.from(byFile.values()) }
   }
 
   function clear() {
     for (const filename of listEntryFilenames()) {
       try { fs.unlinkSync(entryPath(filename)) } catch { /* already gone */ }
     }
+    // Indexed again on next use, from whatever a file held open left behind.
+    index = null
   }
 
   return { get, put, invalidateFile, invalidateNode, list, stats, clear }
@@ -226,3 +358,5 @@ function createCache({ dataDir, maxEntries = 500, now = () => Date.now() } = {})
 
 module.exports = createCache
 module.exports.markStale = markStale
+module.exports.ENTRY_FILENAME_RE = ENTRY_FILENAME_RE
+module.exports.DEFAULT_MAX_BYTES = DEFAULT_MAX_BYTES
