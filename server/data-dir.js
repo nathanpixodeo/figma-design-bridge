@@ -297,6 +297,7 @@ module.exports = {
   prepareDataDir,
   migrateDataDir,
   userDataDir,
+  samePath,
   DEFAULT_CONFIG_PATH,
   LEGACY_DATA_DIR,
 }

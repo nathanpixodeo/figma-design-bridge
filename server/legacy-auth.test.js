@@ -300,3 +300,23 @@ test('a second npm start on a port the bridge already holds says so and exits cl
   assert.match(output, /already running on port/)
   assert.doesNotMatch(output, /EADDRINUSE/)
 })
+
+test('npm start on a port held by a bridge with another data directory refuses and says why', async t => {
+  const { port } = await withServer(t)
+  const otherDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-auth-other-'))
+  t.after(() => fs.rmSync(otherDir, { recursive: true, force: true }))
+
+  const second = spawn(process.execPath, [path.join(serverDir, 'index.js')], {
+    cwd: repoRoot,
+    env: { ...process.env, FIGMA_BRIDGE_DATA_DIR: otherDir, FIGMA_BRIDGE_PORT: String(port) },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  let output = ''
+  second.stdout.on('data', chunk => { output += chunk })
+  second.stderr.on('data', chunk => { output += chunk })
+  const code = await new Promise(resolve => second.on('close', resolve))
+
+  // Its token is not this setup's, so "not needed" would leave the plugin unable to pair.
+  assert.equal(code, 1, output)
+  assert.match(output, /uses another data directory/)
+})

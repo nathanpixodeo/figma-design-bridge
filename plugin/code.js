@@ -252,7 +252,7 @@ function scheduleHeartbeat(){
   if(!bridgeWanted||!sessionId) return
   heartbeatTimer=setTimeout(async()=>{
     const sid=sessionId
-    try{await bridgeFetch('/bridge/session/'+encodeURIComponent(sid)+'/heartbeat',{method:'POST',body:{}});scheduleHeartbeat()}
+    try{await bridgeFetch('/bridge/session/'+encodeURIComponent(sid)+'/heartbeat',{method:'POST',body:{}});if(sid===sessionId)scheduleHeartbeat()}
     // A failure of a session that was already replaced must not end the new one.
     catch(err){if(sid===sessionId)handleBridgeDisconnect(err)}
   },10000)

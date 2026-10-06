@@ -174,7 +174,9 @@ function createCache({
         stat = fs.statSync(entryPath(filename))
       } catch (error) {
         if (error.code === 'ENOENT') continue
-        throw error
+        // Held or pending deletion (Windows EPERM, EBUSY): one bad entry must not
+        // disable the cache. Indexed as the oldest, it is the first one retried.
+        stat = { mtimeMs: 0, size: 0 }
       }
       // One that cannot be read still takes space: indexed under no file, it
       // ages out with the others.
@@ -360,3 +362,17 @@ module.exports = createCache
 module.exports.markStale = markStale
 module.exports.ENTRY_FILENAME_RE = ENTRY_FILENAME_RE
 module.exports.DEFAULT_MAX_BYTES = DEFAULT_MAX_BYTES
+
+// The byte budget from FIGMA_BRIDGE_CACHE_MAX_BYTES or config.json: a whole
+// number of bytes. parseInt would read "200MB" as 200 bytes and evict
+// everything on every write, so anything else falls back to the default, with
+// a warning instead of a crash.
+function resolveMaxBytes(value, warn = () => {}) {
+  if (value === undefined || value === null || value === '') return DEFAULT_MAX_BYTES
+  const text = String(value).trim()
+  if (/^\d+$/.test(text) && Number(text) > 0) return Number(text)
+  warn(`The cache budget must be a whole number of bytes, such as 200000000; got "${text.slice(0, 40)}". Using ${DEFAULT_MAX_BYTES}.`)
+  return DEFAULT_MAX_BYTES
+}
+
+module.exports.resolveMaxBytes = resolveMaxBytes

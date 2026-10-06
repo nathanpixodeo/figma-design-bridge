@@ -347,8 +347,9 @@ async function startOrReuse(options = {}) {
     if (errorCode(error) !== 'EADDRINUSE') throw error
     // Lost the race between the probe and listen(). Re-probe once: if the
     // winner is ours, converge on it rather than failing or starting a second.
-    const second = await probe(url, probeOptions)
+    const second = await probe(url, { ...probeOptions, timeoutMs: probeTimeoutMs * 2 })
     if (second.ours) return reuseDescriptor(url, dataDir, second)
+    if (second.reason === 'timeout') throw busyError(url)
     throw occupiedError(url, second)
   }
 }

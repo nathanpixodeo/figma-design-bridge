@@ -34,7 +34,10 @@ const { dataDir: DATA_DIR } = prepareDataDir({ log: message => log(message) });
 const MAX_SNAPSHOTS = parseInt(process.env.FIGMA_BRIDGE_MAX_SNAPSHOTS || fileConfig.maxSnapshots || "50", 10);
 const MAX_BODY_BYTES = parseInt(process.env.FIGMA_BRIDGE_MAX_BODY_BYTES || fileConfig.maxBodyBytes || "50000000", 10);
 // The bridge cache's byte budget, as npm start reads it; this process usually owns the bridge.
-const CACHE_MAX_BYTES = parseInt(process.env.FIGMA_BRIDGE_CACHE_MAX_BYTES || fileConfig.cacheMaxBytes || require("./bridge/cache.js").DEFAULT_MAX_BYTES, 10);
+const CACHE_MAX_BYTES = require("./bridge/cache.js").resolveMaxBytes(
+  process.env.FIGMA_BRIDGE_CACHE_MAX_BYTES || fileConfig.cacheMaxBytes,
+  message => log(message),
+);
 const ALLOW_ANONYMOUS_LEGACY = process.env.FIGMA_BRIDGE_ALLOW_ANONYMOUS_LEGACY === "1";
 
 function log(...args) {
@@ -142,11 +145,14 @@ function summary(data) {
 let bridge = null; // { descriptor, client } once the bridge was started or reused
 let bridgeStartup = null;
 let takeoverPending = false; // a reused bridge went away and has not been replaced yet
+let anonymousLegacyWarned = false;
 
 // When this process ends up owning the port, the Figma plugin's legacy Sync
 // commands post to it as well, so it serves /design next to /bridge/*.
 function legacyRoutesFor({ token, currentToken }) {
-  if (ALLOW_ANONYMOUS_LEGACY) {
+  // Once per process: a start that keeps failing is retried every 10 s.
+  if (ALLOW_ANONYMOUS_LEGACY && !anonymousLegacyWarned) {
+    anonymousLegacyWarned = true;
     log("FIGMA_BRIDGE_ALLOW_ANONYMOUS_LEGACY=1: /design and /snapshots accept unauthenticated requests. "
       + "Any web page open in a browser on this machine can read, overwrite, or delete the cached design. "
       + "Unset it to require the token.");

@@ -972,3 +972,28 @@ test('a late failure from a replaced session does not end the new one', async ()
   assert.equal(lastBridgeStatus(panel).connected, true)
   assert.equal(panel.element('statusText').textContent, 'Connected')
 })
+
+test('a heartbeat of a replaced session does not start a second heartbeat chain', async () => {
+  let sessions = 0
+  let finishHeartbeat
+  const panel = ui(async url => {
+    if (url.endsWith('/bridge/session')) return respondWith(201, { sessionId: `sess-${++sessions}`, sessionSecret: 'secret' })
+    if (url.includes('/poll')) return new Promise(() => {})
+    if (url.endsWith('/heartbeat') && !finishHeartbeat) return new Promise(resolve => { finishHeartbeat = () => resolve(respondWith(200, { ok: true })) })
+    return respondWith(200, { ok: true })
+  })
+  const heartbeats = () => [...panel.time.timers.keys()].filter(id => panel.time.delays[id - 1] === 10000).length
+
+  await panel.post({ type: 'bridge-start', config: savedConfig })
+  await settleUi()
+  panel.time.flush() // the first session's heartbeat goes out and stays pending
+  await settleUi()
+  await panel.post({ type: 'bridge-start', config: savedConfig })
+  await settleUi()
+  assert.equal(heartbeats(), 1)
+
+  finishHeartbeat()
+  await settleUi()
+  assert.equal(sessions, 2)
+  assert.equal(heartbeats(), 1, 'the old heartbeat scheduled another one for the new session')
+})

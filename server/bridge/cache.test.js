@@ -589,3 +589,39 @@ test('the directory the cache creates is private to its user', { skip: process.p
   createCache({ dataDir })
   assert.equal(fs.statSync(dataDir).mode & 0o777, 0o700)
 })
+
+test('an entry that cannot even be stat-ed does not disable the cache', t => {
+  const dir = mkTempDir(t)
+  const writer = createCache({ dataDir: dir })
+  writer.put({ fileKey: 'F1', nodeId: '1:1', payload: { name: 'held' } })
+  writer.put({ fileKey: 'F1', nodeId: '1:2', payload: { name: 'fine' } })
+  const held = fs.readdirSync(dir).filter(name => name.endsWith('.json')).sort()[0]
+
+  // A new process builds its index while a scanner holds one entry.
+  let refused = 0
+  stub(t, 'statSync', (original, file, ...rest) => {
+    if (String(file).endsWith(held)) {
+      refused += 1
+      throw Object.assign(new Error('held'), { code: 'EPERM' })
+    }
+    return original(file, ...rest)
+  })
+  const reader = createCache({ dataDir: dir })
+  assert.equal(reader.stats().entryCount, 2)
+  assert.ok(refused > 0, 'the stub never saw the held entry')
+  assert.doesNotThrow(() => reader.invalidateFile('F1'))
+  assert.doesNotThrow(() => reader.put({ fileKey: 'F2', nodeId: '2:1', payload: { name: 'new' } }))
+})
+
+test('the cache budget setting accepts only a whole number of bytes', () => {
+  const { resolveMaxBytes, DEFAULT_MAX_BYTES } = createCache
+  const warnings = []
+  const warn = message => warnings.push(message)
+  assert.equal(resolveMaxBytes(undefined, warn), DEFAULT_MAX_BYTES)
+  assert.equal(resolveMaxBytes('50000000', warn), 50_000_000)
+  assert.equal(resolveMaxBytes(75_000_000, warn), 75_000_000)
+  assert.equal(warnings.length, 0)
+  // parseInt would have read "200MB" as 200 bytes and evicted everything.
+  for (const bad of ['200MB', '0', '-5', 'abc', '1.5e8']) assert.equal(resolveMaxBytes(bad, warn), DEFAULT_MAX_BYTES, bad)
+  assert.equal(warnings.length, 5)
+})

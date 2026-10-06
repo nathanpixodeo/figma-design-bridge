@@ -9,7 +9,7 @@ const bridgeIdentity = require('./bridge/identity')
 const { getOrCreateToken, createTokenSource } = require('./bridge/token')
 const createSnapshotStore = require('./snapshot-store')
 const createLegacyRoutes = require('./legacy-routes')
-const { prepareDataDir } = require('./data-dir')
+const { prepareDataDir, samePath } = require('./data-dir')
 
 // ── Config ────────────────────────────────────────────────
 
@@ -47,7 +47,10 @@ const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1'])
 const maxSnapshots = parseInt(process.env.FIGMA_BRIDGE_MAX_SNAPSHOTS || config.maxSnapshots, 10)
 const logLevel = process.env.FIGMA_BRIDGE_LOG_LEVEL || config.logLevel
 const maxBodyBytes = parseInt(process.env.FIGMA_BRIDGE_MAX_BODY_BYTES || config.maxBodyBytes || 50_000_000, 10)
-const cacheMaxBytes = parseInt(process.env.FIGMA_BRIDGE_CACHE_MAX_BYTES || config.cacheMaxBytes || createBridgeCache.DEFAULT_MAX_BYTES, 10)
+const cacheMaxBytes = createBridgeCache.resolveMaxBytes(
+  process.env.FIGMA_BRIDGE_CACHE_MAX_BYTES || config.cacheMaxBytes,
+  message => console.warn(`[figma-bridge] ${message}`),
+)
 const allowAnonymousLegacy = process.env.FIGMA_BRIDGE_ALLOW_ANONYMOUS_LEGACY === '1'
 
 // ── Logger ────────────────────────────────────────────────
@@ -154,19 +157,34 @@ server.on('error', async error => {
   }
   const getJSON = async path => {
     try {
-      const response = await fetch(`http://127.0.0.1:${port}${path}`, { signal: AbortSignal.timeout(2000) })
+      const response = await fetch(`http://127.0.0.1:${port}${path}`, { signal: AbortSignal.timeout(4000) })
       return response.ok ? await response.json() : null
-    } catch {
-      return null
+    } catch (error) {
+      return error && error.name === 'TimeoutError' ? { timedOut: true } : null
     }
   }
   const bridge = await getJSON('/bridge/health')
   if (bridge && bridge.service === createBridgeRoutes.SERVICE_NAME) {
+    // Only a bridge on this data directory shares this token; one on another
+    // directory (or older than 1.3.0, which has no dataDir to show) would keep
+    // the Figma plugin paired with a token this setup does not use.
     const legacy = await getJSON('/health')
-    const where = legacy && legacy.dataDir ? ` (data directory: ${legacy.dataDir})` : ''
-    log('info', `A Figma Design Bridge is already running on port ${port}${where}. `
-      + 'It serves the same routes, so this one is not needed.')
-    process.exit(0)
+    const theirs = legacy && typeof legacy.dataDir === 'string' ? legacy.dataDir : null
+    if (theirs && samePath(theirs, dataDir)) {
+      log('info', `A Figma Design Bridge is already running on port ${port} with this data directory. `
+        + 'It serves the same routes, so this one is not needed.')
+      process.exit(0)
+    }
+    log('error', `A Figma Design Bridge is already running on port ${port}, but it uses `
+      + (theirs ? `another data directory (${theirs})` : 'another data directory, or is older than 1.3.0')
+      + `, so it does not accept this setup's token. Stop or update that bridge, then run npm start again.`)
+    process.exit(1)
+  }
+  if (bridge && bridge.timedOut) {
+    log('error', `Port ${port} accepted the connection but did not answer in time. If it is a Figma Design Bridge `
+      + 'busy with a large read, it already serves the plugin; otherwise stop that program, or start the bridge '
+      + 'on another port with FIGMA_BRIDGE_PORT.')
+    process.exit(1)
   }
   log('error', `Port ${port} is in use by another program. Stop it, or start the bridge on another port with FIGMA_BRIDGE_PORT.`)
   process.exit(1)
