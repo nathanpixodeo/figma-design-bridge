@@ -11,3 +11,6 @@ server/config.json
 
 # GitNexus knowledge graph index
 .gitnexus/
+
+# Claude Code agent worktrees
+.claude/worktrees/
