@@ -51,7 +51,7 @@ function createSnapshotStore({ dataDir, maxSnapshots = 50, log = () => {} } = {}
   let restored = false
 
   function ensureDirs() {
-    fs.mkdirSync(snapshotsDir, { recursive: true })
+    fs.mkdirSync(snapshotsDir, { recursive: true, mode: 0o700 })
   }
 
   // Temp file plus rename: a reader in another process sees the old file or the

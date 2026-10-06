@@ -143,7 +143,7 @@ let takeoverPending = false; // a reused bridge went away and has not been repla
 
 // When this process ends up owning the port, the Figma plugin's legacy Sync
 // commands post to it as well, so it serves /design next to /bridge/*.
-function legacyRoutesFor({ token }) {
+function legacyRoutesFor({ token, currentToken }) {
   if (ALLOW_ANONYMOUS_LEGACY) {
     log("FIGMA_BRIDGE_ALLOW_ANONYMOUS_LEGACY=1: /design and /snapshots accept unauthenticated requests. "
       + "Any web page open in a browser on this machine can read, overwrite, or delete the cached design. "
@@ -151,7 +151,8 @@ function legacyRoutesFor({ token }) {
   }
   return createLegacyRoutes({
     store,
-    token,
+    // currentToken follows the token file, so a rotation applies here too.
+    token: currentToken || token,
     allowAnonymous: ALLOW_ANONYMOUS_LEGACY,
     maxBodyBytes: MAX_BODY_BYTES,
     fetchFigmaDesign,
@@ -180,9 +181,17 @@ async function ensureBridge() {
         error.code = "NO_TOKEN";
         throw error;
       }
-      bridge = { descriptor, client: createClient({ url: descriptor.url, token: descriptor.token }) };
+      // currentToken follows the token file, so a rotation does not lock this
+      // server out of the bridge it owns or reuses.
+      bridge = { descriptor, client: createClient({ url: descriptor.url, token: descriptor.currentToken || descriptor.token }) };
       takeoverPending = false;
       return bridge.client;
+    }).catch(error => {
+      // Keep trying in the background (see the interval below): the port may
+      // be held by a bridge of another version or data directory that exits
+      // later, and the Figma plugin needs a bridge before the next tool call.
+      takeoverPending = true;
+      throw error;
     }).finally(() => {
       bridgeStartup = null;
     });
@@ -231,14 +240,16 @@ setInterval(async () => {
   if (takeoverPending) ensureBridge().catch(() => { /* tried again on the next tick */ });
 }, 10_000).unref();
 
-function describeError(error) {
+// read: the call waited on the Figma plugin, so a TIMEOUT means the plugin was
+// slow rather than the bridge being busy.
+function describeError(error, { read = false } = {}) {
   const prefix = error.code ? `${error.code}: ` : "";
   let hint = "";
   if (error.code === "UNAUTHORIZED") {
     hint = ` The bridge on port ${PORT} rejected the token stored in ${DATA_DIR}. It probably uses a different `
       + "data directory: it is older than 1.3.0, or it was started with FIGMA_BRIDGE_DATA_DIR. Update or stop it, "
       + "or start both with the same FIGMA_BRIDGE_DATA_DIR.";
-  } else if (error.code === "TIMEOUT") {
+  } else if (error.code === "TIMEOUT" && read) {
     hint = " Figma loads a large page slowly the first time it is read. Retry with a larger timeoutMs "
       + "(up to 120000), or a smaller depth or maxNodes. Keep the Design Bridge panel open in Figma.";
   }
@@ -252,6 +263,46 @@ function readOptionsFromArgs(args = {}) {
     if (args[key] !== undefined) options[key] = args[key];
   }
   return Object.keys(options).length ? options : undefined;
+}
+
+// A file link (no node-id) reads the document index: pages and their top-level
+// frames, without the layers, text or colors inside them.
+function isDocumentIndex(design) {
+  return Boolean(design?.bridge) && !design.bridge.nodeId;
+}
+
+function indexOnly(what) {
+  return `${what} needs the layers inside a frame, but a file link only returns the document index `
+    + "(pages and their top-level frames). Pass a link that includes node-id: in Figma, right-click "
+    + "the frame and choose Copy link to selection.";
+}
+
+// Where an answer comes from, so an agent can tell a live node from a document
+// index or from an older legacy snapshot.
+function provenance(design) {
+  const bridge = design?.bridge;
+  if (bridge) {
+    const what = bridge.nodeId ? `node ${bridge.nodeId}` : "document index";
+    const freshness = bridge.freshness || (bridge.stale ? "cached" : "live");
+    return `> Source: ${design.fileName || "Figma file"}, ${what}, ${freshness} read at ${bridge.fetchedAt || "an unknown time"}`;
+  }
+  return `> Source: legacy snapshot "${design?.pageName || "unnamed"}", synced at ${design?.syncedAt || design?.savedAt || "an unknown time"}`;
+}
+
+// What limits how far an answer can be trusted.
+function caveats(design) {
+  const bridge = design?.bridge;
+  if (!bridge) return "";
+  const notes = [];
+  if (!bridge.nodeId) {
+    notes.push("This is the document index: pages and their top-level frames only. Pass a link that includes node-id to read inside a frame.");
+  }
+  if (bridge.truncated) {
+    const cut = bridge.completeness?.truncatedNodeIds?.length;
+    notes.push(`The read was truncated${cut ? ` (${cut} subtree(s) cut)` : ""} at depth, maxNodes or maxBytes. Raise them or read a child node before concluding that something is missing.`);
+  }
+  if (bridge.stale || bridge.freshness === "cached") notes.push("Cached data, not verified against the open file.");
+  return notes.length ? "\n\n" + notes.map(note => `> **Note:** ${note}`).join("\n") : "";
 }
 
 // timeout_ms is the spelling earlier versions accepted without declaring it.
@@ -380,17 +431,17 @@ async function startMCP() {
       },
       {
         name: "get_design_texts",
-        description: "Extract text content from an explicit Figma source or the legacy imported snapshot.",
+        description: "Extract text content from a Figma node link (with node-id) through the live plugin bridge, or from the legacy imported snapshot when source is omitted. A file link only has the document index and is refused.",
         inputSchema: { type: "object", properties: { ...SOURCE_PROPERTIES } },
       },
       {
         name: "get_design_colors",
-        description: "Get solid fill/stroke colors from an explicit Figma source or the legacy imported snapshot.",
+        description: "Get solid fill/stroke colors from a Figma node link (with node-id) through the live plugin bridge, or from the legacy imported snapshot when source is omitted. A file link only has the document index and is refused.",
         inputSchema: { type: "object", properties: { ...SOURCE_PROPERTIES } },
       },
       {
         name: "search_design",
-        description: "Search an explicit Figma source or the legacy imported snapshot by node name or text content.",
+        description: "Search a Figma node link (with node-id) through the live plugin bridge, or the legacy imported snapshot when source is omitted, by node name or text content. A file link only has the document index and is refused.",
         inputSchema: {
           type: "object",
           properties: {
@@ -427,7 +478,7 @@ async function startMCP() {
           // Compact: indentation alone made a 150 KB payload 3.7 times larger.
           return ok(JSON.stringify(result));
         } catch (error) {
-          return err(describeError(error));
+          return err(describeError(error, { read: true }));
         }
       }
 
@@ -463,8 +514,10 @@ async function startMCP() {
       }
 
       case "get_design_summary": {
-        try { return ok(summary(await resolveDesign(args))); }
-        catch (error) { return err(describeError(error)); }
+        try {
+          const design = await resolveDesign(args);
+          return ok(`${provenance(design)}\n\n${summary(design)}${caveats(design)}`);
+        } catch (error) { return err(describeError(error, { read: Boolean(args?.source) })); }
       }
 
       case "get_design_tree": {
@@ -472,32 +525,34 @@ async function startMCP() {
           const design = await resolveDesign(args);
           let tree = (design.pageName || "Design") + "\n";
           for (const n of design.nodes || []) tree += treeNode(n);
-          return ok(tree);
-        } catch (error) { return err(describeError(error)); }
+          return ok(`${provenance(design)}\n\n${tree}${caveats(design)}`);
+        } catch (error) { return err(describeError(error, { read: Boolean(args?.source) })); }
       }
 
       case "get_design_texts": {
         try {
           const design = await resolveDesign(args);
+          if (isDocumentIndex(design)) return err(indexOnly("Text extraction"));
           const texts = getAllTexts(design.nodes || []);
-          if (!texts.length) return ok("No text nodes found.");
-          let r = `# Text Content (${texts.length} nodes)\n\n| Path | Text | Font | Size |\n|---|---|---|---|\n`;
+          if (!texts.length) return ok(`${provenance(design)}\n\nNo text nodes found.${caveats(design)}`);
+          let r = `${provenance(design)}\n\n# Text Content (${texts.length} nodes)\n\n| Path | Text | Font | Size |\n|---|---|---|---|\n`;
           texts.forEach(t => { r += `| ${t.path.replace(/\|/g, "\\|")} | ${(t.characters || "").replace(/\|/g, "\\|")} | ${t.fontFamily || "-"} | ${t.fontSize || "-"} |\n`; });
-          return ok(r);
-        } catch (error) { return err(describeError(error)); }
+          return ok(r + caveats(design));
+        } catch (error) { return err(describeError(error, { read: Boolean(args?.source) })); }
       }
 
       case "get_design_colors": {
         try {
           const design = await resolveDesign(args);
+          if (isDocumentIndex(design)) return err(indexOnly("The color palette"));
           const palette = getColors(design.nodes || []);
           const keys = Object.keys(palette);
-          if (!keys.length) return ok("No solid colors found.");
+          if (!keys.length) return ok(`${provenance(design)}\n\nNo solid colors found.${caveats(design)}`);
           const sorted = keys.sort((a, b) => palette[b].length - palette[a].length);
-          let r = `# Color Palette (${keys.length} unique)\n\n| Color | Count | Examples |\n|---|---|---|\n`;
+          let r = `${provenance(design)}\n\n# Color Palette (${keys.length} unique)\n\n| Color | Count | Examples |\n|---|---|---|\n`;
           for (const color of sorted) { const ex = [...new Set(palette[color].map(u => u.node))].slice(0, 3).join(", "); r += `| ${color} | ${palette[color].length} | ${ex} |\n`; }
-          return ok(r);
-        } catch (error) { return err(describeError(error)); }
+          return ok(r + caveats(design));
+        } catch (error) { return err(describeError(error, { read: Boolean(args?.source) })); }
       }
 
       case "search_design": {
@@ -505,10 +560,11 @@ async function startMCP() {
         if (!q) return err('Missing required parameter "q"');
         try {
           const design = await resolveDesign(args);
+          if (isDocumentIndex(design)) return err(indexOnly("Search"));
           const ql = q.toLowerCase();
           const results = findNodes(design.nodes || [], n => (n.name && n.name.toLowerCase().includes(ql)) || (n.type === "TEXT" && n.characters && n.characters.toLowerCase().includes(ql)));
-          if (!results.length) return ok(`No results for "${q}".`);
-          let r = `# Search: "${q}" (${results.length} matches)\n\n`;
+          if (!results.length) return ok(`${provenance(design)}\n\nNo results for "${q}".${caveats(design)}`);
+          let r = `${provenance(design)}\n\n# Search: "${q}" (${results.length} matches)\n\n`;
           results.forEach((res, i) => {
             const p = [...res.path.map(x => x.name), res.node.name].join(" > ");
             r += `**${i + 1}. ${res.node.name}** (${res.node.type})\n- Path: ${p}\n`;
@@ -518,15 +574,15 @@ async function startMCP() {
             if (res.node.fills?.[0]?.type === "SOLID") r += `- Fill: ${res.node.fills[0].color}\n`;
             r += "\n";
           });
-          return ok(r);
-        } catch (error) { return err(describeError(error)); }
+          return ok(r.trimEnd() + caveats(design));
+        } catch (error) { return err(describeError(error, { read: Boolean(args?.source) })); }
       }
 
       case "get_design_info": {
         try {
           const design = await resolveDesign(args);
-          return ok(`**Page:** ${design?.pageName || "—"}\n**File:** ${design?.fileName || "—"}\n**Type:** ${design?.type || "—"}\n**Source:** ${design?.source || "legacy-plugin"}\n**Nodes:** ${design?.nodeCount ?? 0}\n**Synced at:** ${design?.syncedAt || design?.savedAt || "Never"}\n**Data dir:** ${DATA_DIR}`);
-        } catch (error) { return err(describeError(error)); }
+          return ok(`**Page:** ${design?.pageName || "—"}\n**File:** ${design?.fileName || "—"}\n**Type:** ${design?.type || "—"}\n**Source:** ${design?.source || "legacy-plugin"}\n**Nodes:** ${design?.nodeCount ?? 0}\n**Synced at:** ${design?.syncedAt || design?.savedAt || "Never"}\n**Data dir:** ${DATA_DIR}${caveats(design)}`);
+        } catch (error) { return err(describeError(error, { read: Boolean(args?.source) })); }
       }
 
       default:

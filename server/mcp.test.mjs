@@ -12,8 +12,10 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import createSnapshotStore from "./snapshot-store.js";
 import daemonModule from "./bridge/daemon.js";
 import dataDirModule from "./data-dir.js";
+import tokenModule from "./bridge/token.js";
 
 const { createDaemon } = daemonModule;
+const { rotateToken } = tokenModule;
 const { describeDataDir, userDataDir } = dataDirModule;
 
 // Every test runs the MCP server the way Claude Code does — a stdio child
@@ -302,6 +304,105 @@ test("a read waits as long as timeoutMs asks, and a timeout says what to try nex
   assert.equal(read.isError, true);
   assert.match(textOf(read), /TIMEOUT: Request timed out waiting for a plugin reply\. Figma loads .*larger timeoutMs/);
   assert.ok(waited >= 1400 && waited < 10_000, `waited ${waited} ms instead of about 1500`);
+});
+
+// Plays the Figma plugin: registers a session for fileKey and answers every
+// read with answer(request) until the test ends.
+async function fakePlugin(t, port, dataDir, fileKey, answer) {
+  const base = `http://127.0.0.1:${port}`;
+  const auth = { authorization: `Bearer ${tokenIn(dataDir)}`, "content-type": "application/json" };
+  const session = await (await fetch(`${base}/bridge/session`, {
+    method: "POST", headers: auth, body: JSON.stringify({ fileKey, fileName: "Checkout", pluginInstanceId: `fake-${fileKey}` }),
+  })).json();
+  const headers = { ...auth, "x-session-secret": session.sessionSecret };
+  let running = true;
+  t.after(() => { running = false; });
+  (async () => {
+    while (running) {
+      let polled;
+      try {
+        polled = await (await fetch(`${base}/bridge/session/${session.sessionId}/poll?waitMs=1000`, { headers })).json();
+      } catch {
+        return;
+      }
+      for (const request of polled.requests || []) {
+        await fetch(`${base}/bridge/session/${session.sessionId}/reply`, {
+          method: "POST", headers, body: JSON.stringify({ requestId: request.requestId, ok: true, result: answer(request) }),
+        }).catch(() => {});
+      }
+    }
+  })();
+}
+
+test("texts, colors and search refuse a file link, and a truncated read says so", async t => {
+  const dataDir = tempDataDir(t);
+  const port = await freePort();
+  const client = await connectMcp(t, { FIGMA_BRIDGE_DATA_DIR: dataDir, FIGMA_BRIDGE_PORT: String(port) });
+  await waitFor(() => bridgeHealthy(port));
+  await fakePlugin(t, port, dataDir, "CheckoutFile1", request => (request.op === "read-node"
+    ? {
+      fileKey: "CheckoutFile1", fileName: "Checkout", nodeId: request.params.nodeId, pageId: "0:1", pageName: "Home",
+      completeness: { nodeCount: 2, byteSize: 200, limitHit: true, truncatedNodeIds: ["1:9"] },
+      payload: {
+        id: request.params.nodeId, name: "Pay", type: "FRAME",
+        children: [{ id: "1:3", name: "Label", type: "TEXT", characters: "Pay now", fills: [{ type: "SOLID", color: "#FF0000" }] }],
+      },
+    }
+    : {
+      fileKey: "CheckoutFile1", fileName: "Checkout",
+      completeness: { nodeCount: 2, byteSize: 100, limitHit: false, truncatedNodeIds: [] },
+      payload: { pages: [{ id: "0:1", name: "Home", type: "PAGE", children: [{ id: "1:2", name: "Pay", type: "FRAME" }] }] },
+    }));
+
+  // A file link only reaches the document index, which has no text or colors:
+  // "No text nodes found" would be a confident wrong answer.
+  const fileLink = "https://www.figma.com/design/CheckoutFile1/Checkout";
+  for (const [name, extra] of [["get_design_texts", {}], ["get_design_colors", {}], ["search_design", { q: "Pay" }]]) {
+    const refused = await client.callTool({ name, arguments: { source: fileLink, ...extra } });
+    assert.equal(refused.isError, true, `${name} answered from the document index`);
+    assert.match(textOf(refused), /node-id/);
+  }
+  const tree = await client.callTool({ name: "get_design_tree", arguments: { source: fileLink } });
+  assert.match(textOf(tree), /This is the document index/);
+
+  const texts = await client.callTool({ name: "get_design_texts", arguments: { source: `${fileLink}?node-id=1-2` } });
+  assert.equal(texts.isError, undefined, textOf(texts));
+  assert.match(textOf(texts), /^> Source: Checkout, node 1:2, live read at /);
+  assert.match(textOf(texts), /Pay now/);
+  assert.match(textOf(texts), /truncated \(1 subtree\(s\) cut\)/);
+});
+
+test("the MCP server that owns the bridge keeps working after the token is rotated", async t => {
+  const dataDir = tempDataDir(t);
+  const port = await freePort();
+  const client = await connectMcp(t, { FIGMA_BRIDGE_DATA_DIR: dataDir, FIGMA_BRIDGE_PORT: String(port) });
+  await waitFor(() => bridgeHealthy(port));
+  const before = tokenIn(dataDir);
+
+  rotateToken(dataDir);
+  const status = await client.callTool({ name: "get_bridge_status", arguments: {} });
+  assert.equal(status.isError, undefined, textOf(status));
+  const old = await fetch(`http://127.0.0.1:${port}/bridge/status`, { headers: { authorization: `Bearer ${before}` } });
+  assert.equal(old.status, 401);
+});
+
+test("an MCP server that could not start the bridge takes the port once it frees up", async t => {
+  const ownerDir = tempDataDir(t);
+  const dataDir = tempDataDir(t);
+  const port = await freePort();
+  // A bridge on another data directory, such as an older version's, holds the port.
+  const owner = await createDaemon({ port, dataDir: ownerDir, log: () => {} });
+  let ownerClosed = false;
+  t.after(() => (ownerClosed ? undefined : owner.close()));
+
+  const client = await connectMcp(t, { FIGMA_BRIDGE_DATA_DIR: dataDir, FIGMA_BRIDGE_PORT: String(port) });
+  assert.match(textOf(await client.callTool({ name: "get_bridge_status", arguments: {} })), /NO_TOKEN/);
+
+  await owner.close();
+  ownerClosed = true;
+  // No tool call: the Figma plugin needs a bridge before the agent asks again.
+  await waitFor(() => /bridge daemon listening/.test(client.serverLogs()), 25_000);
+  assert.equal(await bridgeHealthy(port), true);
 });
 
 // The per-user directory every launcher shares, redirected into a temporary one

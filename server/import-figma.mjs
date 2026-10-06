@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import fs from "node:fs";
 import figmaApi from "./figma-api.js";
 import dataDirModule from "./data-dir.js";
 import tokenModule from "./bridge/token.js";
@@ -14,6 +15,18 @@ if (!source || source === "--help" || source === "-h") {
   process.exit(source ? 0 : 1);
 }
 
+// The port the server listens on: FIGMA_BRIDGE_PORT, then server/config.json.
+function resolvePort() {
+  if (process.env.FIGMA_BRIDGE_PORT) return process.env.FIGMA_BRIDGE_PORT;
+  try {
+    const config = JSON.parse(fs.readFileSync(dataDirModule.DEFAULT_CONFIG_PATH, "utf8"));
+    if (config.port) return String(config.port);
+  } catch {
+    // No config file, or an unreadable one: the default port.
+  }
+  return "3456";
+}
+
 // POST /design requires the bridge token. An explicit FIGMA_BRIDGE_TOKEN wins so
 // that this can import into a bridge whose data directory is not readable here;
 // otherwise the stored token is read from the same directory the server uses.
@@ -27,7 +40,7 @@ function resolveBridgeToken() {
 
 try {
   const design = await fetchFigmaDesign(source);
-  const bridgeUrl = (process.env.FIGMA_BRIDGE_URL || "http://127.0.0.1:3456").replace(/\/$/, "");
+  const bridgeUrl = (process.env.FIGMA_BRIDGE_URL || `http://127.0.0.1:${resolvePort()}`).replace(/\/$/, "");
   const bridgeToken = resolveBridgeToken();
   const headers = { "Content-Type": "application/json" };
   if (bridgeToken) headers.Authorization = `Bearer ${bridgeToken}`;

@@ -6,7 +6,7 @@ const createBridgeRoutes = require('./bridge/routes')
 const createBridgeCache = require('./bridge/cache')
 const createBridgeBroker = require('./bridge/broker')
 const bridgeIdentity = require('./bridge/identity')
-const { getOrCreateToken } = require('./bridge/token')
+const { getOrCreateToken, createTokenSource } = require('./bridge/token')
 const createSnapshotStore = require('./snapshot-store')
 const createLegacyRoutes = require('./legacy-routes')
 const { prepareDataDir } = require('./data-dir')
@@ -71,7 +71,9 @@ const { dataDir } = prepareDataDir({ log: message => log('info', message) })
 // The legacy snapshot API and the request-driven bridge deliberately share one
 // listener. This keeps `npm start` compatible with existing /design consumers
 // while allowing MCP adapters to safely probe/reuse the same process.
-const bridgeToken = getOrCreateToken(dataDir).token
+// Read from the token file on each request, so a rotation revokes the old
+// token without restarting this server.
+const bridgeToken = createTokenSource(dataDir, getOrCreateToken(dataDir).token)
 const bridgeCache = createBridgeCache({ dataDir })
 const bridgeBroker = createBridgeBroker({ identity: bridgeIdentity, log })
 const bridgeRouter = createBridgeRoutes({
@@ -94,12 +96,37 @@ const legacyRouter = createLegacyRoutes({
   log,
 })
 
-function router(req, res) {
-  if (req.url === '/bridge' || req.url.startsWith('/bridge/')) {
-    bridgeRouter(req, res)
+function sendInternalError(res) {
+  if (res.headersSent) {
+    try { res.end() } catch {}
     return
   }
-  legacyRouter(req, res)
+  res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' })
+  res.end(JSON.stringify({ error: 'Internal bridge error', code: 'INTERNAL_ERROR' }) + '\n')
+}
+
+// Same dispatch as the MCP-owned daemon: the bridge router answers what it
+// owns and returns false for anything else, judged on the parsed path, so a
+// URL such as /bridge/../health still reaches the legacy routes. Nothing a
+// request does may throw out of here: an uncaught exception would end the
+// process and every plugin session with it.
+function router(req, res) {
+  let handled
+  try {
+    handled = bridgeRouter(req, res)
+  } catch (error) {
+    log('error', `Bridge router threw: ${error.message}`)
+    sendInternalError(res)
+    return
+  }
+  Promise.resolve(handled)
+    .then(owned => {
+      if (!owned) return legacyRouter(req, res)
+    })
+    .catch(error => {
+      log('error', `Request failed: ${error.message}`)
+      sendInternalError(res)
+    })
 }
 
 // ── Start ──────────────────────────────────────────────────
@@ -112,8 +139,37 @@ function shutdown(signal) {
     log('info', 'Server closed.')
     process.exit(0)
   })
-  setTimeout(() => { log('warn', 'Forced shutdown.'); process.exit(1) }, 5000)
+  // A connected plugin keeps a long-poll open; close() alone would wait for it.
+  server.closeAllConnections()
+  setTimeout(() => { log('warn', 'Forced shutdown.'); process.exit(1) }, 5000).unref()
 }
+
+// Usually Claude Code's MCP server already hosts the bridge on this port. That
+// is not an error worth a stack trace: say so and leave.
+server.on('error', async error => {
+  if (error.code !== 'EADDRINUSE') {
+    log('error', `Server error: ${error.message}`)
+    process.exit(1)
+  }
+  const getJSON = async path => {
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}${path}`, { signal: AbortSignal.timeout(2000) })
+      return response.ok ? await response.json() : null
+    } catch {
+      return null
+    }
+  }
+  const bridge = await getJSON('/bridge/health')
+  if (bridge && bridge.service === createBridgeRoutes.SERVICE_NAME) {
+    const legacy = await getJSON('/health')
+    const where = legacy && legacy.dataDir ? ` (data directory: ${legacy.dataDir})` : ''
+    log('info', `A Figma Design Bridge is already running on port ${port}${where}. `
+      + 'It serves the same routes, so this one is not needed.')
+    process.exit(0)
+  }
+  log('error', `Port ${port} is in use by another program. Stop it, or start the bridge on another port with FIGMA_BRIDGE_PORT.`)
+  process.exit(1)
+})
 
 process.on('SIGINT', () => shutdown('SIGINT'))
 process.on('SIGTERM', () => shutdown('SIGTERM'))

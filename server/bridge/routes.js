@@ -126,7 +126,11 @@ function createRoutes(options = {}) {
   if (!broker) throw new Error('createRoutes requires a broker')
   if (!cache) throw new Error('createRoutes requires a cache')
   if (!identity) throw new Error('createRoutes requires an identity module')
-  if (typeof token !== 'string' || !token) throw new Error('createRoutes requires a bridge token')
+  // A function is read per request, so a rotated token takes effect at once.
+  if (typeof token !== 'function' && (typeof token !== 'string' || !token)) {
+    throw new Error('createRoutes requires a bridge token')
+  }
+  const currentToken = typeof token === 'function' ? token : () => token
 
   // '*' is dropped deliberately: a wildcard would let any web page in the
   // user's browser drive an authenticated local daemon.
@@ -787,7 +791,7 @@ function createRoutes(options = {}) {
     }
     if (result.status === 'approved') {
       log('info', 'bridge: a Figma plugin paired')
-      return sendJSON(req, res, 200, { status: 'approved', token, protocolVersion })
+      return sendJSON(req, res, 200, { status: 'approved', token: currentToken(), protocolVersion })
     }
     if (result.status === 'expired') {
       return sendError(req, res, 410, 'PAIRING_EXPIRED', 'The pairing code expired before it was approved. Press Pair again.')
@@ -912,7 +916,7 @@ function createRoutes(options = {}) {
     const pairRoute = pathname.match(PAIR_PATH)
     if (pairRoute && method === 'GET') return handlePairCheck(req, res, pairRoute[1])
 
-    if (!verifyToken(req, token)) {
+    if (!verifyToken(req, currentToken())) {
       // Checked before any body is read, so an unauthenticated request cannot
       // register a session, queue a request or write to the cache.
       return sendError(req, res, 401, 'UNAUTHORIZED',

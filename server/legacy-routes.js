@@ -215,13 +215,15 @@ function createLegacyRoutes({
   log = () => {},
 } = {}) {
   if (!store) throw new Error('createLegacyRoutes requires a snapshot store')
-  if (!allowAnonymous && (typeof token !== 'string' || !token)) {
+  // A function is read per request, so a rotated token takes effect at once.
+  if (!allowAnonymous && typeof token !== 'function' && (typeof token !== 'string' || !token)) {
     throw new Error('createLegacyRoutes requires the bridge token')
   }
+  const currentToken = typeof token === 'function' ? token : () => token
 
   function isAuthorized(req) {
     if (allowAnonymous) return true
-    return verifyToken(req, token)
+    return verifyToken(req, currentToken())
   }
 
   function parseBody(req) {
@@ -251,12 +253,27 @@ function createLegacyRoutes({
       return
     }
 
+    // A path the URL parser rejects ("//[" from an <img> on any web page) must
+    // not throw: under `npm start` nothing would catch it and the bridge exits.
+    let url
+    try {
+      url = new URL(req.url, 'http://127.0.0.1')
+    } catch {
+      sendJSON(res, 400, { error: 'Malformed request URL.' })
+      return
+    }
+    const p = url.pathname
+    const m = req.method
+
     const origin = req.headers.origin
     if (!originIsAllowed(origin)) {
       sendJSON(res, 403, { error: 'This origin is not allowed to reach the design bridge.' })
       return
     }
-    if (typeof origin === 'string') {
+    // The open routes carry the page name and the data directory path, which
+    // includes the OS user name. Without a CORS header a web page cannot read
+    // them, even from a sandboxed iframe whose origin is "null"; curl can.
+    if (typeof origin === 'string' && !LEGACY_OPEN_PATHS.has(p)) {
       res.setHeader('Access-Control-Allow-Origin', origin)
       res.setHeader('Vary', 'Origin')
     }
@@ -270,10 +287,6 @@ function createLegacyRoutes({
       res.end()
       return
     }
-
-    const url = new URL(req.url, 'http://127.0.0.1')
-    const p = url.pathname
-    const m = req.method
 
     if (!LEGACY_OPEN_PATHS.has(p) && !isAuthorized(req)) {
       sendJSON(res, 401, {

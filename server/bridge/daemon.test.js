@@ -6,7 +6,7 @@ const os = require('os')
 const path = require('path')
 
 const { createDaemon, startOrReuse, probe, baseUrl, SERVICE_NAME, PROTOCOL_VERSION } = require('./daemon')
-const { readToken, TOKEN_FILENAME } = require('./token')
+const { readToken, rotateToken, TOKEN_FILENAME } = require('./token')
 
 const quietLog = () => {}
 
@@ -166,8 +166,8 @@ test('a started daemon serves health, authenticates and falls through for other 
 test('createFallback builds the legacy handler with the daemon token', async t => {
   const seen = []
   const daemon = await startDaemon(t, {
-    createFallback: ({ token, dataDir }) => {
-      seen.push({ token, dataDir })
+    createFallback: ({ token, currentToken, dataDir }) => {
+      seen.push({ token, currentToken, dataDir })
       return (req, res) => {
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({ authorized: req.headers.authorization === `Bearer ${token}` }))
@@ -177,6 +177,7 @@ test('createFallback builds the legacy handler with the daemon token', async t =
 
   assert.equal(seen.length, 1)
   assert.equal(seen[0].token, daemon.token)
+  assert.equal(seen[0].currentToken(), daemon.token)
 
   const response = await fetch(`${daemon.url}/design`, { headers: { authorization: `Bearer ${daemon.token}` } })
   assert.equal(response.status, 200)
@@ -435,4 +436,30 @@ test('createDaemon reports a missing sibling module as an actionable error', asy
   }
   t.after(() => daemon.close('test-teardown'))
   assert.equal((await fetch(`${daemon.url}/bridge/health`)).status, 200)
+})
+
+test('rotating the token revokes the old one while the daemon keeps running', async t => {
+  const dataDir = tempDataDir(t)
+  const daemon = await createDaemon({ port: 0, dataDir, log: quietLog })
+  t.after(() => daemon.close('test-teardown'))
+  const status = token => fetch(`${daemon.url}/bridge/status`, { headers: { authorization: `Bearer ${token}` } })
+
+  assert.equal((await status(daemon.token)).status, 200)
+  const { token: rotated } = rotateToken(dataDir)
+  assert.equal((await status(daemon.token)).status, 401)
+  assert.equal((await status(rotated)).status, 200)
+  assert.equal(daemon.currentToken(), rotated)
+})
+
+test('a listener that does not answer the health check in time is reported busy, not foreign', async t => {
+  const dataDir = tempDataDir(t)
+  // Accepts connections, never answers: what a bridge stuck on a long read looks like.
+  const stalled = http.createServer(() => {})
+  await new Promise(resolve => stalled.listen(0, '127.0.0.1', resolve))
+  t.after(() => new Promise(resolve => { stalled.closeAllConnections(); stalled.close(() => resolve()) }))
+
+  await assert.rejects(
+    startOrReuse({ port: stalled.address().port, dataDir, probeTimeoutMs: 100, log: quietLog }),
+    { code: 'BRIDGE_BUSY' },
+  )
 })

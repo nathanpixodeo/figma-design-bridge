@@ -15,7 +15,7 @@ function main() {
   const result = rotate ? rotateToken(dataDir) : getOrCreateToken(dataDir)
 
   if (rotate) {
-    process.stderr.write('Token rotated. Every paired plugin has to be reconnected with the new one.\n')
+    process.stderr.write('Token rotated. A running bridge accepts only the new token from now on: press Pair with bridge in the Figma plugin again.\n')
   } else if (result.created) {
     process.stderr.write(`Created a new token in ${dataDir}\n`)
   }

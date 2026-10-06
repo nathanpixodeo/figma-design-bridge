@@ -47,8 +47,11 @@ function createClient(options = {}) {
   async function send(method, path, { body, auth = true, signal, timeout = timeoutMs } = {}) {
     const headers = { accept: 'application/json' }
     if (auth) {
-      if (!token) throw new BridgeClientError('No bridge token configured', { code: 'NO_TOKEN' })
-      headers.authorization = `Bearer ${token}`
+      // A function follows the token file, so a rotation does not lock out the
+      // process that owns the bridge.
+      const value = typeof token === 'function' ? token() : token
+      if (!value) throw new BridgeClientError('No bridge token configured', { code: 'NO_TOKEN' })
+      headers.authorization = `Bearer ${value}`
     }
     if (body !== undefined) headers['content-type'] = 'application/json'
 

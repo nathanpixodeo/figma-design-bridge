@@ -221,3 +221,82 @@ test('the anonymous escape hatch opens the routes and says so loudly', async t =
   const foreign = await request(port, { path: '/design', headers: { Origin: 'https://evil.example' } })
   assert.equal(foreign.status, 403)
 })
+
+// What an <img src="http://127.0.0.1:3456//["> on any web page sends: Node's
+// URL parser rejects it, and an exception there used to end `npm start`.
+function rawStatusLine(port, requestLine) {
+  return new Promise((resolve, reject) => {
+    const socket = net.connect(port, '127.0.0.1', () => {
+      socket.write(`${requestLine}\r\nHost: 127.0.0.1:${port}\r\nConnection: close\r\n\r\n`)
+    })
+    let data = ''
+    socket.on('data', chunk => { data += chunk })
+    socket.on('end', () => resolve(data.split('\r\n')[0]))
+    socket.on('error', reject)
+  })
+}
+
+test('a malformed request URL is answered with 400 and npm start keeps running', async t => {
+  const { port, server } = await withServer(t)
+
+  for (const line of ['GET //[ HTTP/1.1', 'GET //x:99999 HTTP/1.1']) {
+    assert.match(await rawStatusLine(port, line), /^HTTP\/1\.1 400/, line)
+  }
+  assert.equal(server.child.exitCode, null, 'the server exited')
+  assert.equal((await request(port, { path: '/health' })).status, 200)
+
+  // Normalised out of /bridge/, this is the legacy /health; it used to hang.
+  assert.equal((await request(port, { path: '/bridge/../health' })).status, 200)
+})
+
+test('the open routes give a web page nothing it can read', async t => {
+  const { port } = await withServer(t)
+
+  // A sandboxed iframe on any web page sends Origin: null, like the plugin does.
+  const health = await request(port, { path: '/health', headers: { Origin: 'null' } })
+  assert.equal(health.status, 200)
+  assert.equal(health.headers['access-control-allow-origin'], undefined)
+
+  const design = await request(port, { path: '/design', headers: { Origin: 'null' } })
+  assert.equal(design.headers['access-control-allow-origin'], 'null')
+})
+
+test('rotating the token revokes the old one without restarting npm start', async t => {
+  const { port, server } = await withServer(t)
+  const before = server.token()
+
+  const rotate = spawn(process.execPath, [path.join(serverDir, 'bridge-token.js'), '--rotate'], {
+    env: { ...process.env, FIGMA_BRIDGE_DATA_DIR: server.dataDir },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  let rotated = ''
+  rotate.stdout.on('data', chunk => { rotated += chunk })
+  await new Promise(resolve => rotate.on('close', resolve))
+  rotated = rotated.trim()
+  assert.notEqual(rotated, before)
+
+  for (const route of ['/design', '/bridge/status']) {
+    const old = await request(port, { path: route, headers: { Authorization: `Bearer ${before}` } })
+    assert.equal(old.status, 401, `${route} still accepted the rotated-out token`)
+    const fresh = await request(port, { path: route, headers: { Authorization: `Bearer ${rotated}` } })
+    assert.notEqual(fresh.status, 401, `${route} refused the new token`)
+  }
+})
+
+test('a second npm start on a port the bridge already holds says so and exits cleanly', async t => {
+  const { port, server } = await withServer(t)
+
+  const second = spawn(process.execPath, [path.join(serverDir, 'index.js')], {
+    cwd: repoRoot,
+    env: { ...process.env, FIGMA_BRIDGE_DATA_DIR: server.dataDir, FIGMA_BRIDGE_PORT: String(port) },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  let output = ''
+  second.stdout.on('data', chunk => { output += chunk })
+  second.stderr.on('data', chunk => { output += chunk })
+  const code = await new Promise(resolve => second.on('close', resolve))
+
+  assert.equal(code, 0, output)
+  assert.match(output, /already running on port/)
+  assert.doesNotMatch(output, /EADDRINUSE/)
+})

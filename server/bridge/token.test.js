@@ -8,6 +8,7 @@ const path = require('path')
 const createRoutes = require('./routes')
 const {
   getOrCreateToken,
+  createTokenSource,
   readToken,
   rotateToken,
   extractToken,
@@ -147,4 +148,39 @@ test('the bridge token never appears in an unauthenticated health response', asy
     protocolVersion: '1.0',
     service: 'figma-design-bridge',
   })
+})
+
+test('a token source follows the token file, so a rotation revokes the old token at once', t => {
+  const dir = tempDataDir(t)
+  const { token: first } = getOrCreateToken(dir)
+  const current = createTokenSource(dir, first)
+  assert.equal(current(), first)
+
+  const { token: second } = rotateToken(dir)
+  assert.equal(current(), second)
+
+  // A missing or broken file keeps the last good token rather than locking
+  // every client out.
+  fs.rmSync(path.join(dir, TOKEN_FILENAME))
+  assert.equal(current(), second)
+  fs.writeFileSync(path.join(dir, TOKEN_FILENAME), '{ half a write')
+  assert.equal(current(), second)
+})
+
+test('two launchers creating the first token at once end up with the same one', t => {
+  const dir = tempDataDir(t)
+  const theirs = 'b'.repeat(64)
+  // The other launcher places its token between this one's check and its write.
+  const realLink = fs.linkSync
+  t.after(() => { fs.linkSync = realLink })
+  fs.linkSync = (from, to) => {
+    fs.writeFileSync(to, JSON.stringify({ token: theirs, createdAt: new Date().toISOString() }))
+    return realLink(from, to)
+  }
+
+  const result = getOrCreateToken(dir)
+  assert.equal(result.token, theirs)
+  assert.equal(result.created, false)
+  assert.equal(readToken(dir).token, theirs)
+  assert.deepEqual(fs.readdirSync(dir).filter(name => name.endsWith('.tmp')), [])
 })

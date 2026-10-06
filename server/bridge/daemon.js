@@ -9,7 +9,7 @@ const http = require('http')
 const fs = require('fs')
 
 const createRoutes = require('./routes')
-const { getOrCreateToken, readToken } = require('./token')
+const { getOrCreateToken, createTokenSource, readToken } = require('./token')
 
 const PROTOCOL_VERSION = '1.0'
 const SERVICE_NAME = 'figma-design-bridge'
@@ -126,11 +126,14 @@ async function createDaemon(options = {}) {
     throw new Error(`The bridge only binds to a loopback address; refusing to bind ${host}`)
   }
 
-  fs.mkdirSync(dataDir, { recursive: true })
+  // Owner-only: the directory holds cached designs as well as the token.
+  fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 })
 
-  const token = typeof options.token === 'string' && options.token
-    ? options.token
-    : getOrCreateToken(dataDir).token
+  const fixedToken = typeof options.token === 'string' && options.token ? options.token : null
+  const token = fixedToken || getOrCreateToken(dataDir).token
+  // Routes check the token file's current value, so a rotation revokes the old
+  // token while this daemon runs. A token passed in by the caller stays fixed.
+  const currentToken = fixedToken ? () => fixedToken : createTokenSource(dataDir, token)
 
   const identity = options.identity || loadSibling('identity')
   const cache = options.cache
@@ -139,13 +142,13 @@ async function createDaemon(options = {}) {
     || factoryFrom(loadSibling('broker'), 'createBroker', 'broker')({ now, log, identity })
 
   const handler = createRoutes({
-    broker, cache, identity, token, protocolVersion, maxBodyBytes, allowedOrigins, now, log,
+    broker, cache, identity, token: currentToken, protocolVersion, maxBodyBytes, allowedOrigins, now, log,
   })
 
   // The legacy router authenticates with the daemon's own token, which is only
   // known here, so a caller can hand over a factory instead of a handler.
   const fallbackHandler = typeof createFallback === 'function'
-    ? createFallback({ token, dataDir })
+    ? createFallback({ token, currentToken, dataDir })
     : fallback
 
   const server = http.createServer((req, res) => {
@@ -203,7 +206,7 @@ async function createDaemon(options = {}) {
   }
 
   log('info', `bridge daemon listening on ${url}`)
-  return { server, url, port: actualPort, host, token, broker, cache, identity, protocolVersion, close }
+  return { server, url, port: actualPort, host, token, currentToken, broker, cache, identity, protocolVersion, close }
 }
 
 function endJSON(res, status, body) {
@@ -270,6 +273,19 @@ function occupiedError(url, result) {
   return error
 }
 
+// A listener that accepts the connection but does not answer the health check
+// in time is most likely a bridge busy with a large read, not a foreign program.
+function busyError(url) {
+  const error = new Error(
+    `The process on port ${portOf(url)} accepted the connection but did not answer the bridge health check in time. `
+    + 'If it is a Figma Design Bridge busy with a large read, the next call tries again. '
+    + 'If it is another program, stop it or run the bridge on another port with FIGMA_BRIDGE_PORT.',
+  )
+  error.code = 'BRIDGE_BUSY'
+  error.url = url
+  return error
+}
+
 function reuseDescriptor(url, dataDir, result) {
   const stored = readToken(dataDir)
   return {
@@ -279,6 +295,7 @@ function reuseDescriptor(url, dataDir, result) {
     url,
     port: portOf(url),
     token: stored ? stored.token : null,
+    currentToken: stored ? createTokenSource(dataDir, stored.token) : () => null,
     protocolVersion: result.protocolVersion,
     server: null,
     // We did not start it, so we never stop it.
@@ -303,8 +320,12 @@ async function startOrReuse(options = {}) {
   const url = baseUrl(host, port)
   const probeOptions = { timeoutMs: probeTimeoutMs, fetchImpl }
 
-  const first = await probe(url, probeOptions)
+  let first = await probe(url, probeOptions)
+  for (let retry = 0; first.reason === 'timeout' && retry < 2; retry++) {
+    first = await probe(url, { ...probeOptions, timeoutMs: probeTimeoutMs * 2 })
+  }
   if (first.ours) return reuseDescriptor(url, dataDir, first)
+  if (first.reason === 'timeout') throw busyError(url)
   if (first.reason !== 'no-listener') throw occupiedError(url, first)
 
   try {
@@ -316,6 +337,7 @@ async function startOrReuse(options = {}) {
       url: daemon.url,
       port: daemon.port,
       token: daemon.token,
+      currentToken: daemon.currentToken,
       protocolVersion: daemon.protocolVersion,
       server: daemon.server,
       close: daemon.close,

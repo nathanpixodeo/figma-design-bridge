@@ -33,13 +33,38 @@ function restrictPermissions(filePath) {
   try { fs.chmodSync(filePath, 0o600) } catch {}
 }
 
-function writeTokenFile(filePath, record) {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true })
+// The data directory holds cached designs as well as the token: owner-only.
+function writeTempTokenFile(filePath, record) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 })
   const temp = `${filePath}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`
   fs.writeFileSync(temp, JSON.stringify(record, null, 2) + '\n', { mode: 0o600 })
   restrictPermissions(temp)
+  return temp
+}
+
+function writeTokenFile(filePath, record) {
+  const temp = writeTempTokenFile(filePath, record)
   fs.renameSync(temp, filePath)
   restrictPermissions(filePath)
+}
+
+// Places a first token only if there is none yet. Two launchers starting at
+// the same moment would otherwise each mint one, and the loser would keep
+// accepting a token that is no longer on disk. A hard link fails when the
+// target exists; file systems without hard links fall back to checking first.
+function createTokenFile(filePath, record) {
+  const temp = writeTempTokenFile(filePath, record)
+  try {
+    fs.linkSync(temp, filePath)
+    return true
+  } catch (error) {
+    if (error.code === 'EEXIST' || fs.existsSync(filePath)) return false
+    fs.renameSync(temp, filePath)
+    return true
+  } finally {
+    try { fs.rmSync(temp, { force: true }) } catch {}
+    restrictPermissions(filePath)
+  }
 }
 
 function readToken(dataDir) {
@@ -65,7 +90,48 @@ function rotateToken(dataDir) {
 function getOrCreateToken(dataDir) {
   const existing = readToken(dataDir)
   if (existing) return { token: existing.token, created: false, path: existing.path }
+  const filePath = tokenPath(dataDir)
+  const token = crypto.randomBytes(TOKEN_BYTES).toString('hex')
+  if (createTokenFile(filePath, { token, createdAt: new Date().toISOString() })) {
+    return { token, created: true, path: filePath }
+  }
+  // Another launcher created one first: use that.
+  const raced = readToken(dataDir)
+  if (raced) return { token: raced.token, created: false, path: raced.path }
   return rotateToken(dataDir)
+}
+
+// bigint: an NTFS file id does not fit in a double, and mtimeNs separates two
+// writes inside the same millisecond.
+function stampOf(filePath) {
+  try {
+    const stat = fs.statSync(filePath, { bigint: true })
+    return `${stat.ino}:${stat.size}:${stat.mtimeNs}`
+  } catch {
+    return null
+  }
+}
+
+// The token a running bridge accepts follows bridge-token.json, so
+// `npm run bridge:token:rotate` revokes the old token at once rather than at the
+// bridge's next restart. Each call costs one stat; the file is read again only
+// when it changed. A missing or unreadable file keeps the last good token
+// instead of locking everyone out.
+function createTokenSource(dataDir, initialToken) {
+  const filePath = tokenPath(dataDir)
+  let current = initialToken
+  let stamp = stampOf(filePath)
+  return function currentToken() {
+    const next = stampOf(filePath)
+    if (next && next !== stamp) {
+      const record = readToken(dataDir)
+      if (record) {
+        current = record.token
+        stamp = next
+      }
+    }
+    return current
+  }
 }
 
 // ── Request authentication ────────────────────────────────
@@ -105,6 +171,7 @@ function verifyToken(req, expected) {
 
 module.exports = {
   getOrCreateToken,
+  createTokenSource,
   readToken,
   rotateToken,
   extractToken,
