@@ -264,15 +264,60 @@ function createBroker(options = {}) {
     settleRequest(req, false, null, errors.timeout(req.fileKey, req.requestId))
   }
 
+  // Hands the whole queue to a poll and remembers what went out, so the poll
+  // can give it back if its answer never reaches the plugin.
+  function handOut(session, waiter) {
+    waiter.handed = session.queue.splice(0, session.queue.length)
+    waiter.resolve({ requests: waiter.handed.map(id => requestToWireFormat(requests.get(id))).filter(Boolean) })
+  }
+
   function deliverQueuedRequests(session) {
     if (!session.waitingPoll) return
     if (session.queue.length === 0) return
-    const ids = session.queue.splice(0, session.queue.length)
-    const items = ids.map(id => requestToWireFormat(requests.get(id))).filter(Boolean)
     const waiter = session.waitingPoll
     session.waitingPoll = null
     clearTimer(waiter.timer)
-    waiter.resolve({ requests: items })
+    handOut(session, waiter)
+  }
+
+  // The poll's answer never reached the plugin. A poll still waiting is dropped
+  // so nothing is handed to it; requests it was already handed go back to the
+  // front of the queue, in order, for the session's next poll.
+  function abandonPoll(session, waiter) {
+    if (session.waitingPoll === waiter) {
+      clearTimer(waiter.timer)
+      session.waitingPoll = null
+      waiter.resolve({ requests: [] })
+      return
+    }
+    const unanswered = waiter.handed.filter(id => {
+      const req = requests.get(id)
+      return req && !req.settled
+    })
+    waiter.handed = []
+    if (unanswered.length === 0) return
+    session.queue.unshift(...unanswered)
+    deliverQueuedRequests(session)
+  }
+
+  // The session a new request goes to: the one heard from most recently. A
+  // plugin that crashed, or whose panel was reopened, leaves its old session
+  // registered until it expires, and that session must not keep taking the
+  // file's reads from the one that replaced it. Between sessions heard from at
+  // the same moment, one with a poll waiting takes the request at once.
+  function sessionToServe(fileKey) {
+    const fileSessions = sessionsByFile.get(fileKey)
+    if (!fileSessions) return null
+    let best = null
+    for (const sessionId of fileSessions) {
+      const candidate = sessions.get(sessionId)
+      if (!candidate || !candidate.alive) continue
+      if (!best || candidate.lastSeenAt > best.lastSeenAt
+        || (candidate.lastSeenAt === best.lastSeenAt && (candidate.waitingPoll || !best.waitingPoll))) {
+        best = candidate
+      }
+    }
+    return best
   }
 
   // ── Public API ───────────────────────────────────────────────
@@ -374,17 +419,7 @@ function createBroker(options = {}) {
         return
       }
 
-      const fileSessions = sessionsByFile.get(validated.fileKey)
-      let targetSession = null
-      if (fileSessions) {
-        for (const sessionId of fileSessions) {
-          const candidate = sessions.get(sessionId)
-          if (candidate && candidate.alive) {
-            targetSession = candidate
-            break
-          }
-        }
-      }
+      const targetSession = sessionToServe(validated.fileKey)
       if (!targetSession) {
         reject(errors.noSessionForFile(validated.fileKey))
         return
@@ -442,7 +477,9 @@ function createBroker(options = {}) {
     })
   }
 
-  function poll(sessionId, sessionSecret, { waitMs = 25000 } = {}) {
+  // `signal` aborts when the poll's answer cannot reach the plugin, typically
+  // because the plugin closed the connection; see abandonPoll.
+  function poll(sessionId, sessionSecret, { waitMs = 25000, signal } = {}) {
     let session
     try {
       session = authSession(sessionId, sessionSecret)
@@ -450,29 +487,32 @@ function createBroker(options = {}) {
       return Promise.reject(err)
     }
     touchSession(session)
-
-    if (session.queue.length > 0) {
-      const ids = session.queue.splice(0, session.queue.length)
-      const items = ids.map(id => requestToWireFormat(requests.get(id))).filter(Boolean)
-      return Promise.resolve({ requests: items })
-    }
-
-    // A well-behaved client only keeps one poll in flight; if a second one
-    // arrives anyway, resolve the superseded one immediately instead of
-    // leaking its timer.
-    if (session.waitingPoll) {
-      clearTimer(session.waitingPoll.timer)
-      const previousResolve = session.waitingPoll.resolve
-      session.waitingPoll = null
-      previousResolve({ requests: [] })
-    }
+    if (signal && signal.aborted) return Promise.resolve({ requests: [] })
 
     return new Promise(resolve => {
-      const timer = setTimer(() => {
+      const waiter = { resolve, timer: null, handed: [] }
+      if (signal) signal.addEventListener('abort', () => abandonPoll(session, waiter), { once: true })
+
+      if (session.queue.length > 0) {
+        handOut(session, waiter)
+        return
+      }
+
+      // A well-behaved client only keeps one poll in flight; if a second one
+      // arrives anyway, resolve the superseded one immediately instead of
+      // leaking its timer.
+      if (session.waitingPoll) {
+        clearTimer(session.waitingPoll.timer)
+        const previousResolve = session.waitingPoll.resolve
+        session.waitingPoll = null
+        previousResolve({ requests: [] })
+      }
+
+      waiter.timer = setTimer(() => {
         session.waitingPoll = null
         resolve({ requests: [] })
       }, waitMs)
-      session.waitingPoll = { resolve, timer }
+      session.waitingPoll = waiter
     })
   }
 

@@ -414,6 +414,119 @@ test('a poll already waiting is woken immediately by a new request, not left to 
   await requestPromise
 })
 
+// ── Routing between sessions of one file ────────────────────
+
+function pendingCountOf(broker, sessionId) {
+  return broker.listSessions().find(session => session.sessionId === sessionId).pendingCount
+}
+
+test('a read goes to the session heard from most recently, not to an older one a crashed plugin left behind', async () => {
+  const { broker, clock } = makeHarness()
+  // The old plugin crashed, or its panel was reopened: it is never heard from
+  // again, but its session stays registered until it expires.
+  const old = registerTestSession(broker, { fileKey: 'FILE_R', pluginInstanceId: 'plugin-old' })
+  clock.advance(1000)
+  const fresh = registerTestSession(broker, { fileKey: 'FILE_R', pluginInstanceId: 'plugin-new' })
+  const freshPoll = broker.poll(fresh.sessionId, fresh.sessionSecret, { waitMs: 60_000 })
+
+  const pending = broker.request({ fileKey: 'FILE_R', op: 'ping' })
+  assert.equal(pendingCountOf(broker, fresh.sessionId), 1)
+  assert.equal(pendingCountOf(broker, old.sessionId), 0)
+  const { requests: [delivered] } = await freshPoll
+  broker.reply(fresh.sessionId, fresh.sessionSecret, { requestId: delivered.requestId, ok: true, result: {} })
+  assert.equal((await pending).sessionId, fresh.sessionId)
+
+  // The newer session did not close the older one: if that plugin is in fact
+  // still running and is heard from again, it serves the file too.
+  assert.equal(broker.listSessions().filter(session => session.alive).length, 2)
+  clock.advance(1000)
+  broker.heartbeat(old.sessionId, old.sessionSecret)
+  const next = broker.request({ fileKey: 'FILE_R', op: 'ping' })
+  assert.equal(pendingCountOf(broker, old.sessionId), 1)
+  broker.cancelAll('test cleanup')
+  await assert.rejects(next, { code: 'SESSION_LOST' })
+})
+
+test('between sessions heard from at the same moment, the one with a poll waiting takes the read', async () => {
+  const { broker } = makeHarness()
+  const polling = registerTestSession(broker, { fileKey: 'FILE_T', pluginInstanceId: 'plugin-polling' })
+  const idle = registerTestSession(broker, { fileKey: 'FILE_T', pluginInstanceId: 'plugin-idle' })
+  const waiting = broker.poll(polling.sessionId, polling.sessionSecret, { waitMs: 60_000 })
+
+  const pending = broker.request({ fileKey: 'FILE_T', op: 'ping' })
+  assert.equal(pendingCountOf(broker, polling.sessionId), 1)
+  assert.equal(pendingCountOf(broker, idle.sessionId), 0)
+  const { requests: [delivered] } = await waiting
+  broker.reply(polling.sessionId, polling.sessionSecret, { requestId: delivered.requestId, ok: true, result: {} })
+  await pending
+})
+
+// ── Polls whose answer never reaches the plugin ─────────────
+//
+// The HTTP layer aborts a poll's signal when the plugin hung up before the
+// poll's answer was fully sent.
+
+test('a poll abandoned while it waits is dropped, so a read arriving afterwards waits for the next poll', async () => {
+  const { broker } = makeHarness()
+  const session = registerTestSession(broker)
+  const connection = new AbortController()
+  const abandoned = broker.poll(session.sessionId, session.sessionSecret, { waitMs: 60_000, signal: connection.signal })
+
+  connection.abort()
+  const pending = broker.request({ fileKey: 'FILE_DEFAULT', op: 'ping' })
+  assert.equal(broker.stats().queuedRequests, 1, 'the read was handed to a poll nobody is listening to')
+  assert.deepEqual(await abandoned, { requests: [] })
+
+  const next = await broker.poll(session.sessionId, session.sessionSecret, { waitMs: 10 })
+  assert.equal(next.requests.length, 1)
+  broker.reply(session.sessionId, session.sessionSecret, { requestId: next.requests[0].requestId, ok: true, result: {} })
+  await pending
+})
+
+test('reads handed to a poll whose answer never reached the plugin go back to the front of the queue; answered ones do not', async () => {
+  const { broker } = makeHarness()
+  const session = registerTestSession(broker)
+  const lostConnection = new AbortController()
+  const lost = broker.poll(session.sessionId, session.sessionSecret, { waitMs: 60_000, signal: lostConnection.signal })
+  const first = broker.request({ fileKey: 'FILE_DEFAULT', op: 'ping' })
+  const { requests: handed } = await lost
+  const second = broker.request({ fileKey: 'FILE_DEFAULT', op: 'read-document-index' })
+
+  lostConnection.abort()
+  const connection = new AbortController()
+  const next = await broker.poll(session.sessionId, session.sessionSecret, { waitMs: 10, signal: connection.signal })
+  assert.deepEqual(next.requests.map(request => request.op), ['ping', 'read-document-index'])
+  assert.equal(next.requests[0].requestId, handed[0].requestId)
+
+  for (const request of next.requests) {
+    broker.reply(session.sessionId, session.sessionSecret, { requestId: request.requestId, ok: true, result: { op: request.op } })
+  }
+  assert.equal((await first).result.op, 'ping')
+  assert.equal((await second).result.op, 'read-document-index')
+
+  // Losing a poll whose reads were already answered gives nothing back.
+  connection.abort()
+  assert.equal(broker.stats().queuedRequests, 0)
+})
+
+test('a read given back by a lost poll goes straight to a poll already waiting', async () => {
+  const { broker, clock } = makeHarness()
+  const session = registerTestSession(broker)
+  const lostConnection = new AbortController()
+  const lost = broker.poll(session.sessionId, session.sessionSecret, { waitMs: 60_000, signal: lostConnection.signal })
+  const pending = broker.request({ fileKey: 'FILE_DEFAULT', op: 'ping' })
+  const { requests: [handed] } = await lost
+
+  const waiting = broker.poll(session.sessionId, session.sessionSecret, { waitMs: 10 })
+  lostConnection.abort()
+  clock.advance(10)
+  const { requests } = await waiting
+  assert.deepEqual(requests.map(request => request.requestId), [handed.requestId])
+
+  broker.reply(session.sessionId, session.sessionSecret, { requestId: handed.requestId, ok: true, result: {} })
+  await pending
+})
+
 // ── Validation ───────────────────────────────────────────────
 
 test('request() rejects unknown op, non-plain params, oversized params and empty fileKey with BAD_REQUEST', async () => {

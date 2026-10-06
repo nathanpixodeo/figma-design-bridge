@@ -118,6 +118,9 @@ let pairing=null,pairTimer=null
 // Claude Code or npm start runs. tokenRejected: the bridge refused the saved
 // token, so only pairing or a new token can help.
 let waitingForBridge=false,tokenRejected=false
+// invalidating: an invalidate request is in flight. invalidateNext: the latest
+// edit made since, sent when invalidateTimer fires.
+let invalidating=false,invalidateNext=null,invalidateTimer=null
 function bridgeBase(){return ((q('bridgeUrl').value||'').trim()||SERVER_URL).replace(new RegExp('/+$'),'')}
 function hasToken(){return Boolean((q('bridgeToken').value||'').trim())}
 function timeOf(iso){try{return iso?new Date(iso).toLocaleTimeString():''}catch{return ''}}
@@ -230,13 +233,17 @@ function bridgeStatus(connected,error){
 }
 async function closeBridgeSession(reason){
   if(!sessionId||!bridgeConfig) return
-  try{await bridgeFetch('/bridge/session/'+encodeURIComponent(sessionId)+'?reason='+encodeURIComponent(reason||'plugin-stop'),{method:'DELETE'})}catch{}
+  // Figma tears the plugin down right after it closes; keepalive lets this
+  // request outlive the panel instead of being cancelled with it.
+  try{await fetch(bridgeConfig.url+'/bridge/session/'+encodeURIComponent(sessionId)+'?reason='+encodeURIComponent(reason||'plugin-stop'),{method:'DELETE',headers:bridgeHeaders(),keepalive:true})}catch{}
   sessionId=null;sessionSecret=null
 }
 function clearBridgeTimers(){
   if(pollController){pollController.abort();pollController=null}
   if(heartbeatTimer){clearTimeout(heartbeatTimer);heartbeatTimer=null}
   if(reconnectTimer){clearTimeout(reconnectTimer);reconnectTimer=null}
+  if(invalidateTimer){clearTimeout(invalidateTimer);invalidateTimer=null}
+  invalidateNext=null
 }
 async function stopBridge(reason){
   bridgeWanted=false;waitingForBridge=false;clearBridgeTimers();await closeBridgeSession(reason||'plugin-stop');bridgeStatus(false)
@@ -309,9 +316,22 @@ async function sendBridgeReply(msg){
     catch(retryErr){handleBridgeDisconnect(retryErr)}
   }
 }
+// Figma reports every keystroke and drag step as an edit. One invalidate goes
+// out at a time; edits made meanwhile share a single one, sent a second after
+// it returns. Cached reads are already reported unverified, so the delay is safe.
 async function invalidateBridge(msg){
   if(!bridgeWanted||!sessionId) return
-  try{await bridgeFetch('/bridge/session/'+encodeURIComponent(sessionId)+'/invalidate',{method:'POST',body:{fileKey:msg.fileKey,reason:msg.reason||'documentchange'}})}catch(err){handleBridgeDisconnect(err)}
+  if(invalidating||invalidateTimer){invalidateNext=msg;return}
+  invalidating=true
+  try{await bridgeFetch('/bridge/session/'+encodeURIComponent(sessionId)+'/invalidate',{method:'POST',body:{fileKey:msg.fileKey,reason:msg.reason||'documentchange'}})}
+  catch(err){handleBridgeDisconnect(err)}
+  finally{invalidating=false}
+  if(invalidateNext) invalidateTimer=setTimeout(sendNextInvalidate,1000)
+}
+function sendNextInvalidate(){
+  const msg=invalidateNext
+  invalidateTimer=null;invalidateNext=null
+  invalidateBridge(msg)
 }
 // Pairing: the bridge hands this panel its token once someone who already has
 // it approves the code shown here, in Claude Code or in a terminal.
