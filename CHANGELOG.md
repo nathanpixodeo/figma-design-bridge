@@ -6,24 +6,74 @@ marketplace entry and both `package.json` files always carry the same number.
 
 ## [1.3.1] - 2026-10-06
 
+A production-hardening release: no new workflow, many fixes found by a full
+audit. Nothing to migrate.
+
 ### Security
 
+- `npm start` could be stopped by any web page: an `<img>` pointing at
+  `http://127.0.0.1:3456//[` sent a URL the parser rejects, and the exception
+  ended the process. Such a request now gets `400`, and any handler error is a
+  `500` for that request alone.
+- `npm run bridge:token:rotate` now revokes the old token at once. A running
+  bridge used to keep accepting it until it restarted.
+- `GET /` and `GET /health` send no CORS header, so a web page can no longer
+  read the page name and the data directory path (which includes the OS user
+  name) through a sandboxed iframe.
+- The data and snapshot directories are created owner-only (`0700`).
 - Patched the vulnerable transitive dependencies the MCP SDK pulls in
   (`proxy-addr`, `fast-uri`, `ip-address`, `qs`, `hono`, `@hono/node-server`,
   `body-parser`); `npm audit` reports none. The bridge only uses the SDK's stdio
-  transport, so these HTTP components were never reachable, but installs no
-  longer ship the vulnerable versions.
+  transport, so these were never reachable, but installs no longer ship them.
+
+### Fixed
+
+- Typing in Figma no longer stalls the bridge. Every edit made the bridge read
+  and parse its whole cache, which took seconds per keystroke with a large one.
+  The cache now keeps an in-process index and never parses entries for
+  bookkeeping (60 entries of 3 MB: 3.1 s to 0.2 ms per invalidation), and the
+  panel sends at most one invalidation at a time plus one follow-up a second
+  later.
+- A reopened panel works at once. Reads went to the oldest live session for a
+  file, so a session left behind by a crashed or closed panel took every read
+  for up to 90 s and each one timed out. They now go to the session heard from
+  most recently, and the panel closes its session with a `keepalive` request.
+- A read handed to a poll whose plugin hung up is given back to the queue
+  instead of being lost until it times out.
+- `get_design_texts`, `get_design_colors` and `search_design` refuse a file
+  link, which only reaches the document index, instead of answering that the
+  design has no text or colors. Every derived answer names its source and says
+  when the read was truncated. The `/figma-bridge:verify` and Codex prompts ask
+  for a node link.
+- An MCP server that could not start the bridge — its port held by an older
+  version, say — keeps trying in the background, so it takes the port over
+  within about 10 s of it freeing up instead of at the next tool call.
+- A health check that times out is reported as `BRIDGE_BUSY`, not as a foreign
+  program on the port.
+- Two launchers creating the first token at the same moment end up with the
+  same one.
+- `npm start` on a port a bridge already holds says so and exits `0` instead of
+  crashing with `EADDRINUSE`; Ctrl+C no longer waits for the plugin's long-poll;
+  `/bridge/../health` is answered instead of hanging.
+- A late failure from a session the panel already replaced no longer ends the
+  new session.
+- `npm run import:figma` uses `FIGMA_BRIDGE_PORT` and the configured port.
+- The MCP server reports its real version to the client instead of `1.0.0`.
 
 ### Added
 
 - `timeoutMs` on `get_design_context` and the other live-read tools (1000 to
   120000 ms, default 30000), for the first read of a large page, which Figma
-  loads slowly. A `TIMEOUT` error now says what to try next.
+  loads slowly. A `TIMEOUT` from a read says what to try next.
+- A 200 MB budget for the live-read cache next to its 500-entry cap:
+  `FIGMA_BRIDGE_CACHE_MAX_BYTES`, or `cacheMaxBytes` in `server/config.json`.
 - `engines.node` (`>=20`) in both `package.json` files, matching what CI tests.
 
-### Fixed
+### Changed
 
-- The MCP server reports its real version to the client instead of `1.0.0`.
+- Moving to the shared data directory no longer copies the old cache; it
+  refills from live reads. The token, the current design and the ten newest
+  snapshots are still copied.
 
 ## [1.3.0] - 2026-10-05
 

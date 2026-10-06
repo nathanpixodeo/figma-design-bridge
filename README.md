@@ -168,6 +168,8 @@ To customize settings, edit `server/config.json` before starting:
 
 Every setting also has an environment variable: `FIGMA_BRIDGE_PORT`,
 `FIGMA_BRIDGE_DATA_DIR`, `FIGMA_BRIDGE_MAX_SNAPSHOTS`, `FIGMA_BRIDGE_LOG_LEVEL`.
+`FIGMA_BRIDGE_CACHE_MAX_BYTES` (`cacheMaxBytes` in `server/config.json`) caps the
+live-read cache, 200 MB by default; it holds at most 500 entries either way.
 
 #### Where data lives
 
@@ -191,11 +193,12 @@ or `FIGMA_BRIDGE_DATA_DIR` only to keep a setup apart on purpose; every process
 that should share it then needs the same value. Uninstalling the plugin leaves
 this directory in place; delete it to remove the token and the cache.
 
-**Upgrading from 1.2 or earlier.** On its first start, 1.3.0 copies the token,
-the current design, the cache and the ten newest snapshots from the directory
-the previous version used — `server/data`, or the Claude Code plugin's own data
-directory — and leaves that directory as it was, for launchers not updated yet.
-A file that cannot be copied is skipped and named in the log. A `dataDir` in
+**Upgrading from 1.2 or earlier.** On its first start, 1.3.x copies the token,
+the current design and the ten newest snapshots from the directory the previous
+version used — `server/data`, or the Claude Code plugin's own data directory —
+and leaves that directory as it was, for launchers not updated yet. The cache is
+not copied (1.3.0 did); it refills from live reads. A file that cannot be copied
+is skipped and named in the log. A `dataDir` in
 `server/config.json` or a `FIGMA_BRIDGE_DATA_DIR` that names `server/data` —
 the default `npm start` used to write, and what the Codex guide used to
 prescribe — counts as unset. Remove any other `FIGMA_BRIDGE_DATA_DIR` you set
@@ -628,7 +631,7 @@ Design rules it enforces:
   `freshness: "unknown"` and `stale: true`, however recently it was written.
   A TTL is not a freshness guarantee.
 - **Files are isolated.** Entries are keyed by file key + node id +
-  representation. Reading node B never evicts node A, and one plugin session can
+  representation. Reading node B never replaces node A's entry, and one plugin session can
   never answer, poll or invalidate another file's request.
 - **Authentication is not optional on localhost.** Every route but
   `GET /bridge/health` and the pairing request and pickup requires a bearer

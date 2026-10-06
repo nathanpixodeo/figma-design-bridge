@@ -192,6 +192,17 @@ empty when `waitMs` elapses.
 `op` is `read-node` when the read named a node, or `read-document-index` when it
 named a bare file URL.
 
+If the plugin's connection closes before the answer was fully sent, the poll is
+dropped and the requests it held go back to the front of the session's queue,
+for the next poll. A poll answer that went out in full is never resent.
+
+When several live sessions serve the same file — a panel reopened before the old
+session expired, for one — reads go to the session heard from most recently
+(registration, heartbeat or poll); a tie goes to the one with a poll waiting,
+then to the newer registration. A new session under the same
+`pluginInstanceId` replaces the old one, as before; one under a different id
+leaves the old session alive but stops sending it reads.
+
 ---
 
 ### `POST /bridge/session/:id/reply`
@@ -575,11 +586,21 @@ Entries are keyed by validated file key + canonical node id + representation.
 The key is hashed with SHA-256 and stored as `<64 hex>.json` inside the data
 directory, so no Figma-supplied string ever reaches the filesystem path. Writes
 go to a temporary file and are moved into place with `rename`, so a crash
-mid-write cannot leave a half-parsed entry. Retention is bounded
-(500 entries by default).
+mid-write cannot leave a half-parsed entry; a rename Windows refuses for a
+moment is retried.
+
+Retention is bounded by two limits: 500 entries and 200 MB
+(`FIGMA_BRIDGE_CACHE_MAX_BYTES`, or `cacheMaxBytes` in `server/config.json`).
+After each write the oldest entries are removed until both hold — entries left
+by an earlier process first, by file modification time, then this process's
+writes in write order. The entry just written is always kept, even when it alone
+is over the budget. Counting, eviction, invalidation and `stats` work from an
+in-process index and never parse cached payloads; the index is built once per
+process, on first use, from the first 64 KB of each file.
 
 Caches for different files, pages and nodes are independent. Reading node B
-never evicts node A, and never switches another MCP client's file.
+never replaces node A's entry (only the retention limits remove entries), and
+never switches another MCP client's file.
 
 ---
 
@@ -612,10 +633,19 @@ re-probes and reuses the winner.
   reads it, which for a large page can take longer than the default 30 s
   `timeoutMs`. The read fails with `TIMEOUT`; retry with a larger `timeoutMs`
   (up to 120000) or a smaller `depth` or `maxNodes`.
-- **A plugin that dies abruptly is noticed late.** Closing the panel ends its
-  session at once. A plugin that is killed, or whose Figma window hangs, keeps
-  its session until no heartbeat or poll has arrived for 90 s, so reads sent to
-  it in between fail with `TIMEOUT` instead of `NO_SESSION_FOR_FILE`.
+- **A lone plugin that dies abruptly is noticed late.** Closing the panel sends
+  the session's `DELETE` with `keepalive`, so it normally ends at once, and a
+  reopened panel takes the reads straight away (see the poll route). But a
+  plugin that is killed, or whose Figma window hangs, with no other session for
+  that file keeps its session until no heartbeat or poll has arrived for 90 s;
+  reads sent to it in between fail with `TIMEOUT` instead of
+  `NO_SESSION_FOR_FILE`. Reads already queued on a dead session before a new
+  one registered time out too.
+- **Edits reach the cache about a second late.** The panel keeps at most one
+  invalidate request in flight and sends one follow-up about 1 s after it
+  returns, so a burst of edits costs two requests. A `cached`-mode read in that
+  window can return the pre-edit entry, which is why cached reads are always
+  marked unverified.
 - **Truncation does not say which limit was hit.** `completeness.limitHit` and
   `truncatedNodeIds` show that and where a result was cut, not whether
   `depth`, `maxNodes` or `maxBytes` did it.
