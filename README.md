@@ -866,9 +866,9 @@ Restart the MCP client after changing its environment configuration.
 | `sync_figma_design` | Explicitly fetch a Figma URL/file key, normalize it, and cache it locally |
 | `get_design_summary` | Full markdown summary for an explicit `source` or the legacy snapshot |
 | `get_design_tree` | ASCII tree for an explicit `source` or the legacy snapshot |
-| `get_design_texts` | Text content for an explicit `source` or the legacy snapshot |
-| `get_design_colors` | Color palette for an explicit `source` or the legacy snapshot |
-| `search_design` | Search an explicit `source` or the legacy snapshot by node name/text (`q` required) |
+| `get_design_texts` | Text content for a node link (with `node-id`) or the legacy snapshot; a file link is refused |
+| `get_design_colors` | Color palette for a node link (with `node-id`) or the legacy snapshot; a file link is refused |
+| `search_design` | Search a node link (with `node-id`) or the legacy snapshot by node name/text (`q` required); a file link is refused |
 | `get_design_info` | Basic info for an explicit `source` or the legacy snapshot |
 
 ### Usage Flow with MCP
@@ -933,6 +933,7 @@ claude -p "Based on these text nodes, write better copy for the landing page: $T
 | Design seems incomplete | Import the full-file URL without `node-id`, or pass the required `nodeIds` explicitly. |
 | MCP server not connecting | Make sure `npm install` was run. Use absolute path to `server/mcp.mjs` in config. |
 | `npm run bridge:pair` says the bridge "rejected the token" | The bridge on port 3456 keeps a different data directory — usually a Claude Code session still running a plugin older than 1.3.0. [Update the plugin](#updating), restart Claude Code, then press **Pair with bridge** again. `curl http://127.0.0.1:3456/health` shows the data directory the running bridge uses. |
+| `npm start` says a bridge "uses another data directory" | A launcher that keeps its own data directory, or a version older than 1.3.0, holds port 3456 and would keep the Figma plugin on a different token. Stop or update it, then run `npm start` again. When the running bridge shares the data directory, `npm start` just says it is not needed. |
 | `get_design_context` returns `TIMEOUT` | Figma loads a large page slowly the first time it is read. Retry with a larger `timeoutMs` (up to 120000) or a smaller `depth` or `maxNodes`, and keep the panel open. |
 | MCP tools return "No design data" | Call `sync_figma_design` with a Figma URL first. |
 

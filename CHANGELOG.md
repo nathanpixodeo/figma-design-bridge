@@ -52,11 +52,16 @@ audit. Nothing to migrate.
   program on the port.
 - Two launchers creating the first token at the same moment end up with the
   same one.
-- `npm start` on a port a bridge already holds says so and exits `0` instead of
-  crashing with `EADDRINUSE`; Ctrl+C no longer waits for the plugin's long-poll;
-  `/bridge/../health` is answered instead of hanging.
-- A late failure from a session the panel already replaced no longer ends the
-  new session.
+- `npm start` on a port a bridge already holds no longer crashes with
+  `EADDRINUSE`. It exits `0` when that bridge shares its data directory, and
+  `1` with the reason when it does not (another data directory, or a version
+  older than 1.3.0, would keep the Figma plugin on a different token). Ctrl+C no
+  longer waits for the plugin's long-poll, and `/bridge/../health` is answered
+  instead of hanging.
+- A late failure or success from a session the panel already replaced no longer
+  ends the new session or starts a second heartbeat chain.
+- One cache entry that cannot be read or stat-ed (held by a scanner on Windows)
+  no longer disables the cache.
 - `npm run import:figma` uses `FIGMA_BRIDGE_PORT` and the configured port.
 - The MCP server reports its real version to the client instead of `1.0.0`.
 
@@ -67,6 +72,8 @@ audit. Nothing to migrate.
   loads slowly. A `TIMEOUT` from a read says what to try next.
 - A 200 MB budget for the live-read cache next to its 500-entry cap:
   `FIGMA_BRIDGE_CACHE_MAX_BYTES`, or `cacheMaxBytes` in `server/config.json`.
+  It must be a whole number of bytes; anything else (`200MB`, `0`) is ignored
+  with a warning.
 - `engines.node` (`>=20`) in both `package.json` files, matching what CI tests.
 
 ### Changed

@@ -198,7 +198,7 @@ for the next poll. A poll answer that went out in full is never resent.
 
 When several live sessions serve the same file — a panel reopened before the old
 session expired, for one — reads go to the session heard from most recently
-(registration, heartbeat or poll); a tie goes to the one with a poll waiting,
+(registration, heartbeat, poll or invalidate); a tie goes to the one with a poll waiting,
 then to the newer registration. A new session under the same
 `pluginInstanceId` replaces the old one, as before; one under a different id
 leaves the old session alive but stops sending it reads.
@@ -612,10 +612,14 @@ never switches another MCP client's file.
 `startOrReuse` never assumes a listener on the configured port belongs to this
 project. It probes `GET /bridge/health` first and only reuses the listener when
 the service name matches **and** the protocol major version is compatible.
-Anything else — a foreign service, an incompatible version, an unreadable
-response — is reported as an occupied port with instructions to stop that
-process or pick another via `FIGMA_BRIDGE_PORT`. The daemon never kills a
-process it did not start.
+A listener that accepts the connection but does not answer in time is probed
+twice more with a doubled timeout, then reported as `BRIDGE_BUSY`: most likely a
+bridge busy with a large read. Anything else — a foreign service, an
+incompatible version, an unreadable response — is reported as `PORT_OCCUPIED`
+with instructions to stop that process or pick another via `FIGMA_BRIDGE_PORT`.
+The daemon never kills a process it did not start. An MCP server whose start
+failed keeps retrying every 10 seconds, so it takes the port over once it
+frees up.
 
 Concurrent MCP starts converge on a single daemon: a lost `EADDRINUSE` race
 re-probes and reuses the winner.
@@ -661,10 +665,10 @@ re-probes and reuses the winner.
   because the token lives there, and by default they do: every launcher shares
   one directory per user. When it finds another program, or a bridge on a
   different data directory, it keeps serving the snapshot tools
-  and its bridge tools report `PORT_OCCUPIED`, `NO_TOKEN` or `UNAUTHORIZED`
-  with the fix. When the process that owns the port exits, a remaining MCP
-  server takes the port over within about 10 seconds, or at its next bridge
-  call.
+  and its bridge tools report `PORT_OCCUPIED`, `BRIDGE_BUSY`, `NO_TOKEN` or
+  `UNAUTHORIZED` with the fix, while it keeps trying to take the port over in
+  the background. When the process that owns the port exits, a remaining MCP
+  server takes the port over within about 10 seconds.
 - **Token file permissions are best-effort on Windows.** `chmod 0o600` is
   honoured on macOS and Linux; on NTFS the inherited ACL wins and the mode is a
   no-op. The real protection there is that the token lives in the per-user

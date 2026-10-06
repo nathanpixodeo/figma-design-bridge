@@ -12,7 +12,7 @@ Three controls apply to every route in this document. They exist because a loopb
 2. **Loopback `Host` header.** A request whose `Host` names anything else gets `403`. This is what defeats DNS rebinding, where `attacker.example` resolves to `127.0.0.1` and the browser still sends the attacker's host name.
 3. **Bridge token.** Every route except `GET /` and `GET /health` requires the token, sent as `Authorization: Bearer <token>` or `X-Bridge-Token: <token>`. Without it the response is `401`. `npm run bridge:token` prints the token; `npm run bridge:token:rotate` replaces it.
 
-A request carrying a cross-origin `Origin` header is refused with `403`, and no response ever carries `Access-Control-Allow-Origin: *`. An allowed origin is echoed back verbatim alongside `Vary: Origin`. The allow-list is the opaque origin `null`, which is what the Figma plugin's iframe sends, plus `http://localhost` and `http://127.0.0.1` at any port. Because a hostile page can also produce `Origin: null` from a sandboxed iframe, the origin check is defence in depth and the token is what actually separates the two.
+A request carrying a cross-origin `Origin` header is refused with `403`, and no response ever carries `Access-Control-Allow-Origin: *`. An allowed origin is echoed back verbatim alongside `Vary: Origin`, except on the open routes `GET /` and `GET /health`, which never carry a CORS header. The allow-list is the opaque origin `null`, which is what the Figma plugin's iframe sends, plus `http://localhost` and `http://127.0.0.1` at any port. Because a hostile page can also produce `Origin: null` from a sandboxed iframe, the origin check is defence in depth and the token is what actually separates the two.
 
 ```bash
 curl -H "Authorization: Bearer $(npm run --silent bridge:token)" http://127.0.0.1:3456/design
@@ -527,6 +527,10 @@ The allow-list is the opaque origin `null`, which is what the Figma plugin's
 iframe sends, plus `http://localhost` and `http://127.0.0.1` at any port. Any
 other `Origin` is refused with `403` and no CORS headers, preflight included, so
 a page on a real web origin cannot read a response even if it guesses the token.
+
+The open routes `GET /` and `GET /health` send no CORS header to any origin, so
+a web page cannot read the page name or the data directory path they return,
+not even from a sandboxed iframe whose origin is `null`.
 
 Preflight `OPTIONS` requests from an allowed origin are answered with HTTP 204.
 They carry no token, so the token check does not apply to them; the request that
