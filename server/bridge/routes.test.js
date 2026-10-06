@@ -1,7 +1,9 @@
 const test = require('node:test')
 const assert = require('node:assert/strict')
 const http = require('http')
+const { once } = require('events')
 
+const createBroker = require('./broker')
 const createRoutes = require('./routes')
 
 // Distinctive secrets so a leak is unambiguous when a response body is scanned.
@@ -848,6 +850,44 @@ test('a plugin session can register, heartbeat, poll, reply and close', async t 
   assert.equal(closed.status, 200)
   assert.equal(closed.body.closed, true)
   assert.equal(ctx.broker.calls.closed[0].reason, 'user-stop')
+})
+
+// Runs against the real broker: what matters is that a read survives the
+// plugin hanging up mid-poll, which only the two together decide.
+test('a read is never handed to a poll whose plugin hung up, and the next poll gets it exactly once', async t => {
+  const broker = createBroker()
+  t.after(() => broker.cancelAll('test done'))
+  let pollArrived
+  const arrived = new Promise(resolve => { pollArrived = resolve })
+  const ctx = await withServer(t, {
+    broker: { ...broker, poll(sessionId, secret, options) { pollArrived(options.signal); return broker.poll(sessionId, secret, options) } },
+  })
+  const session = await ctx.register('FILE1', 'plugin-a')
+  const secret = { 'x-session-secret': session.sessionSecret }
+  const pollPath = waitMs => `/bridge/session/${session.sessionId}/poll?waitMs=${waitMs}`
+
+  const hangingUp = http.request({
+    host: '127.0.0.1', port: ctx.port, method: 'GET', path: pollPath(30000), headers: { ...ctx.auth, ...secret },
+  })
+  hangingUp.on('error', () => {})
+  hangingUp.end()
+  const signal = await arrived
+  hangingUp.destroy()
+  await once(signal, 'abort', { signal: AbortSignal.timeout(2000) })
+
+  const read = broker.request({ fileKey: 'FILE1', op: 'ping' })
+  const next = await ctx.authed({ method: 'GET', path: pollPath(1000), headers: secret })
+  assert.deepEqual(next.body.requests.map(request => request.op), ['ping'])
+  // That answer went out in full, so the plugin may have it: never again.
+  const after = await ctx.authed({ method: 'GET', path: pollPath(50), headers: secret })
+  assert.deepEqual(after.body.requests, [])
+
+  const reply = await ctx.authed({
+    method: 'POST', path: `/bridge/session/${session.sessionId}/reply`, headers: secret,
+    body: { requestId: next.body.requests[0].requestId, ok: true, result: {} },
+  })
+  assert.equal(reply.body.accepted, true)
+  await read
 })
 
 test('session registration validates its own schema', async t => {

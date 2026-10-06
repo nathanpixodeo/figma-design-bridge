@@ -462,8 +462,15 @@ function createRoutes(options = {}) {
       ? Math.min(Math.max(Math.trunc(requested), 0), MAX_POLL_WAIT_MS)
       : DEFAULT_POLL_WAIT_MS
 
+    // The plugin can hang up mid-poll (panel closed, Figma quit). Unless the
+    // answer was fully handed to the network, the broker takes the poll back:
+    // nothing more goes to it, and what it held returns to the queue. Once the
+    // answer has gone out the plugin may have it, so it is never sent twice.
+    const abandoned = new AbortController()
+    res.on('close', () => { if (!res.writableFinished) abandoned.abort() })
+
     let result
-    try { result = await broker.poll(sessionId, secret, { waitMs }) } catch (error) {
+    try { result = await broker.poll(sessionId, secret, { waitMs, signal: abandoned.signal }) } catch (error) {
       return sendBrokerError(req, res, error)
     }
     const requests = Array.isArray(result && result.requests) ? result.requests : []

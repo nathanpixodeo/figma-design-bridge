@@ -461,6 +461,72 @@ test('between sessions heard from at the same moment, the one with a poll waitin
   await pending
 })
 
+// ── Polls whose answer never reaches the plugin ─────────────
+//
+// The HTTP layer aborts a poll's signal when the plugin hung up before the
+// poll's answer was fully sent.
+
+test('a poll abandoned while it waits is dropped, so a read arriving afterwards waits for the next poll', async () => {
+  const { broker } = makeHarness()
+  const session = registerTestSession(broker)
+  const connection = new AbortController()
+  const abandoned = broker.poll(session.sessionId, session.sessionSecret, { waitMs: 60_000, signal: connection.signal })
+
+  connection.abort()
+  const pending = broker.request({ fileKey: 'FILE_DEFAULT', op: 'ping' })
+  assert.equal(broker.stats().queuedRequests, 1, 'the read was handed to a poll nobody is listening to')
+  assert.deepEqual(await abandoned, { requests: [] })
+
+  const next = await broker.poll(session.sessionId, session.sessionSecret, { waitMs: 10 })
+  assert.equal(next.requests.length, 1)
+  broker.reply(session.sessionId, session.sessionSecret, { requestId: next.requests[0].requestId, ok: true, result: {} })
+  await pending
+})
+
+test('reads handed to a poll whose answer never reached the plugin go back to the front of the queue; answered ones do not', async () => {
+  const { broker } = makeHarness()
+  const session = registerTestSession(broker)
+  const lostConnection = new AbortController()
+  const lost = broker.poll(session.sessionId, session.sessionSecret, { waitMs: 60_000, signal: lostConnection.signal })
+  const first = broker.request({ fileKey: 'FILE_DEFAULT', op: 'ping' })
+  const { requests: handed } = await lost
+  const second = broker.request({ fileKey: 'FILE_DEFAULT', op: 'read-document-index' })
+
+  lostConnection.abort()
+  const connection = new AbortController()
+  const next = await broker.poll(session.sessionId, session.sessionSecret, { waitMs: 10, signal: connection.signal })
+  assert.deepEqual(next.requests.map(request => request.op), ['ping', 'read-document-index'])
+  assert.equal(next.requests[0].requestId, handed[0].requestId)
+
+  for (const request of next.requests) {
+    broker.reply(session.sessionId, session.sessionSecret, { requestId: request.requestId, ok: true, result: { op: request.op } })
+  }
+  assert.equal((await first).result.op, 'ping')
+  assert.equal((await second).result.op, 'read-document-index')
+
+  // Losing a poll whose reads were already answered gives nothing back.
+  connection.abort()
+  assert.equal(broker.stats().queuedRequests, 0)
+})
+
+test('a read given back by a lost poll goes straight to a poll already waiting', async () => {
+  const { broker, clock } = makeHarness()
+  const session = registerTestSession(broker)
+  const lostConnection = new AbortController()
+  const lost = broker.poll(session.sessionId, session.sessionSecret, { waitMs: 60_000, signal: lostConnection.signal })
+  const pending = broker.request({ fileKey: 'FILE_DEFAULT', op: 'ping' })
+  const { requests: [handed] } = await lost
+
+  const waiting = broker.poll(session.sessionId, session.sessionSecret, { waitMs: 10 })
+  lostConnection.abort()
+  clock.advance(10)
+  const { requests } = await waiting
+  assert.deepEqual(requests.map(request => request.requestId), [handed.requestId])
+
+  broker.reply(session.sessionId, session.sessionSecret, { requestId: handed.requestId, ok: true, result: {} })
+  await pending
+})
+
 // ── Validation ───────────────────────────────────────────────
 
 test('request() rejects unknown op, non-plain params, oversized params and empty fileKey with BAD_REQUEST', async () => {
