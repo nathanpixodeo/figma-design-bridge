@@ -274,6 +274,36 @@ test("an MCP server started with no client keeps hosting the bridge", async t =>
   assert.equal(await bridgeHealthy(port), true);
 });
 
+test("a read waits as long as timeoutMs asks, and a timeout says what to try next", async t => {
+  const dataDir = tempDataDir(t);
+  const port = await freePort();
+  const client = await connectMcp(t, { FIGMA_BRIDGE_DATA_DIR: dataDir, FIGMA_BRIDGE_PORT: String(port) });
+  await waitFor(() => bridgeHealthy(port));
+
+  const { version } = JSON.parse(fs.readFileSync(path.join(serverDir, "package.json"), "utf8"));
+  assert.equal(client.getServerVersion().version, version);
+  const { tools } = await client.listTools();
+  assert.equal(tools.find(tool => tool.name === "get_design_context").inputSchema.properties.timeoutMs.maximum, 120000);
+
+  // A plugin session that never answers.
+  const registered = await fetch(`http://127.0.0.1:${port}/bridge/session`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${tokenIn(dataDir)}` },
+    body: JSON.stringify({ fileKey: "SilentFileKey1", fileName: "Silent", pluginInstanceId: "silent-plugin" }),
+  });
+  assert.equal(registered.status, 201);
+
+  const started = Date.now();
+  const read = await client.callTool({
+    name: "get_design_context",
+    arguments: { source: "https://www.figma.com/design/SilentFileKey1/Silent?node-id=1-2", timeoutMs: 1500 },
+  });
+  const waited = Date.now() - started;
+  assert.equal(read.isError, true);
+  assert.match(textOf(read), /TIMEOUT: Request timed out waiting for a plugin reply\. Figma loads .*larger timeoutMs/);
+  assert.ok(waited >= 1400 && waited < 10_000, `waited ${waited} ms instead of about 1500`);
+});
+
 // The per-user directory every launcher shares, redirected into a temporary one
 // on every platform, with no data directory set anywhere.
 function sharedDirSetup(t) {

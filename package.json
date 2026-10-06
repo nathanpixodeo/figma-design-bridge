@@ -4,6 +4,9 @@
   "private": true,
   "description": "Local REST and MCP bridge that serves Figma designs to AI coding assistants, from either the Figma plugin or the official REST API",
   "license": "Apache-2.0",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "start": "node server/index.js",
     "mcp": "node server/mcp.mjs",

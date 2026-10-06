@@ -3,6 +3,9 @@
   "version": "1.3.0",
   "description": "Local REST server that imports and exposes Figma designs to AI tools",
   "license": "Apache-2.0",
+  "engines": {
+    "node": ">=20"
+  },
   "main": "index.js",
   "scripts": {
     "start": "node index.js",

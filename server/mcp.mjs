@@ -18,6 +18,7 @@ const { createClient } = require("./bridge/client.js");
 const createSnapshotStore = require("./snapshot-store.js");
 const createLegacyRoutes = require("./legacy-routes.js");
 const { prepareDataDir } = require("./data-dir.js");
+const { version: PACKAGE_VERSION } = require("./package.json");
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 let fileConfig = {};
@@ -237,8 +238,12 @@ function describeError(error) {
     hint = ` The bridge on port ${PORT} rejected the token stored in ${DATA_DIR}. It probably uses a different `
       + "data directory: it is older than 1.3.0, or it was started with FIGMA_BRIDGE_DATA_DIR. Update or stop it, "
       + "or start both with the same FIGMA_BRIDGE_DATA_DIR.";
+  } else if (error.code === "TIMEOUT") {
+    hint = " Figma loads a large page slowly the first time it is read. Retry with a larger timeoutMs "
+      + "(up to 120000), or a smaller depth or maxNodes. Keep the Design Bridge panel open in Figma.";
   }
-  return `${prefix}${error.message}${hint}`;
+  const message = hint && !/[.!?]$/.test(error.message) ? `${error.message}.` : error.message;
+  return `${prefix}${message}${hint}`;
 }
 
 function readOptionsFromArgs(args = {}) {
@@ -247,6 +252,11 @@ function readOptionsFromArgs(args = {}) {
     if (args[key] !== undefined) options[key] = args[key];
   }
   return Object.keys(options).length ? options : undefined;
+}
+
+// timeout_ms is the spelling earlier versions accepted without declaring it.
+function readTimeoutFromArgs(args = {}) {
+  return args.timeoutMs ?? args.timeout_ms;
 }
 
 function bridgeResultToDesign(result) {
@@ -271,7 +281,7 @@ async function resolveDesign(args = {}) {
     const result = await withBridge(client => client.read({
       source: args.source,
       mode: args.mode || "live",
-      timeoutMs: args.timeout_ms,
+      timeoutMs: readTimeoutFromArgs(args),
       options: readOptionsFromArgs(args),
     }));
     return bridgeResultToDesign(result);
@@ -283,6 +293,13 @@ async function resolveDesign(args = {}) {
   throw error;
 }
 
+const TIMEOUT_PROPERTY = {
+  type: "integer",
+  minimum: 1000,
+  maximum: 120000,
+  description: "How long to wait for the Figma plugin, in milliseconds (default 30000). Figma loads a large page slowly the first time it is read; raise this after a TIMEOUT.",
+};
+
 const SOURCE_PROPERTIES = {
   source: { type: "string", description: "Figma URL or file key. When provided, this tool reads through the live plugin bridge instead of global legacy state." },
   mode: { type: "string", enum: ["live", "cached"], description: "Live by default. Cached mode is explicit opt-in to unverified stale data." },
@@ -290,13 +307,14 @@ const SOURCE_PROPERTIES = {
   maxNodes: { type: "integer", minimum: 1, maximum: 200000 },
   maxBytes: { type: "integer", minimum: 1024, maximum: 50000000, description: "Payload limit in UTF-8 bytes (default 2000000)" },
   includeHidden: { type: "boolean", description: "Include hidden layers (default true)" },
+  timeoutMs: TIMEOUT_PROPERTY,
 };
 
 // ── MCP server ─────────────────────────────────────────────
 
 async function startMCP() {
   const mcp = new Server(
-    { name: "Figma Design Bridge", version: "1.0.0" },
+    { name: "Figma Design Bridge", version: PACKAGE_VERSION },
     { capabilities: { tools: {} } },
   );
 
@@ -317,6 +335,7 @@ async function startMCP() {
             maxNodes: { type: "integer", minimum: 1, maximum: 200000 },
             maxBytes: { type: "integer", minimum: 1024, maximum: 50000000, description: "Payload limit in UTF-8 bytes (default 2000000)" },
             includeHidden: { type: "boolean", description: "Include hidden layers (default true)" },
+            timeoutMs: TIMEOUT_PROPERTY,
           },
           required: ["source"],
         },
@@ -402,6 +421,7 @@ async function startMCP() {
           const result = await withBridge(client => client.read({
             source: args.source,
             mode: args.mode || "live",
+            timeoutMs: readTimeoutFromArgs(args),
             options: readOptionsFromArgs(args),
           }));
           // Compact: indentation alone made a 150 KB payload 3.7 times larger.
