@@ -15,6 +15,7 @@
 const fs = require('fs')
 const os = require('os')
 const path = require('path')
+const { ENTRY_FILENAME_RE } = require('./bridge/cache')
 
 const APP_NAME = 'figma-design-bridge'
 const DEFAULT_CONFIG_PATH = path.join(__dirname, 'config.json')
@@ -24,9 +25,10 @@ const LEGACY_DATA_DIR = path.join(__dirname, 'data')
 const TOKEN_FILENAME = 'bridge-token.json'
 const SNAPSHOT_FILENAME = 'latest.json'
 const SNAPSHOTS_DIRNAME = 'snapshots'
-// The current design and the cache carry over whole, but only the newest
-// snapshots of the history: the copy runs before an MCP server answers its
-// client, and some clients give up after ten seconds.
+// The current design carries over whole, but only the newest snapshots of the
+// history, and none of the cache, which refills from live reads: the copy runs
+// before an MCP server answers its client, and some clients give up after ten
+// seconds.
 const MIGRATED_SNAPSHOTS = 10
 // Antivirus and indexers briefly hold a file that was just written, and Windows
 // then refuses to rename it, with EPERM, EACCES or EBUSY.
@@ -237,11 +239,12 @@ function removeStaleTemps(dataDir, now = Date.now()) {
 }
 
 // Copies what an earlier version kept elsewhere into a shared directory that
-// has no token yet, so the plugin's pairing, the current design, the cache and
-// the newest snapshots carry over. Nothing already in the shared directory is
-// replaced, and the source is left as it is for launchers still on an older
-// version. The token is copied last, so a migration cut short runs again on
-// the next start; a file that fails to copy is skipped and named.
+// has no token yet, so the plugin's pairing, the current design and the newest
+// snapshots carry over. The cache stays behind: it refills from live reads, and
+// copying it could hold up the start for seconds. Nothing already in the shared
+// directory is replaced, and the source is left as it is for launchers still on
+// an older version. The token is copied last, so a migration cut short runs
+// again on the next start; a file that fails to copy is skipped and named.
 function migrateDataDir(dataDir, candidates, log = () => {}) {
   if (hasFile(dataDir, TOKEN_FILENAME)) return null
   const sources = candidates.filter(dir => dir && !samePath(dir, dataDir) && isDirectory(dir))
@@ -251,7 +254,7 @@ function migrateDataDir(dataDir, candidates, log = () => {}) {
 
   removeStaleTemps(dataDir)
   const result = { copied: 0, failed: [] }
-  copyMissing(source, dataDir, result, { skip: name => name === TOKEN_FILENAME })
+  copyMissing(source, dataDir, result, { skip: name => name === TOKEN_FILENAME || ENTRY_FILENAME_RE.test(name) })
 
   let withToken = false
   if (hasFile(source, TOKEN_FILENAME)) {

@@ -33,6 +33,8 @@ const HOST = process.env.FIGMA_BRIDGE_HOST || fileConfig.host || "127.0.0.1";
 const { dataDir: DATA_DIR } = prepareDataDir({ log: message => log(message) });
 const MAX_SNAPSHOTS = parseInt(process.env.FIGMA_BRIDGE_MAX_SNAPSHOTS || fileConfig.maxSnapshots || "50", 10);
 const MAX_BODY_BYTES = parseInt(process.env.FIGMA_BRIDGE_MAX_BODY_BYTES || fileConfig.maxBodyBytes || "50000000", 10);
+// The bridge cache's byte budget, as npm start reads it; this process usually owns the bridge.
+const CACHE_MAX_BYTES = parseInt(process.env.FIGMA_BRIDGE_CACHE_MAX_BYTES || fileConfig.cacheMaxBytes || require("./bridge/cache.js").DEFAULT_MAX_BYTES, 10);
 const ALLOW_ANONYMOUS_LEGACY = process.env.FIGMA_BRIDGE_ALLOW_ANONYMOUS_LEGACY === "1";
 
 function log(...args) {
@@ -169,6 +171,7 @@ async function ensureBridge() {
       port: PORT,
       host: HOST,
       dataDir: DATA_DIR,
+      maxBytes: CACHE_MAX_BYTES,
       log: (level, ...args) => log(`[bridge:${level}]`, ...args),
       createFallback: legacyRoutesFor,
     }).then(descriptor => {

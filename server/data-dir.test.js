@@ -165,7 +165,7 @@ test('resolving the directory never creates a config file', t => {
   assert.equal(fs.existsSync(configPath), false, 'reading the config wrote one')
 })
 
-test('the first start copies the token, the design and the cache an earlier version left, and changes nothing there', t => {
+test('the first start copies the token and the design an earlier version left, not its cache, and changes nothing there', t => {
   const dir = tempDir(t)
   const source = legacyData(path.join(dir, 'old'))
   const before = fs.readdirSync(source).sort()
@@ -177,7 +177,8 @@ test('the first start copies the token, the design and the cache an earlier vers
   assert.equal(readJson(shared, 'bridge-token.json').token, 'a'.repeat(64))
   assert.equal(readJson(shared, 'latest.json').pageName, 'Checkout')
   assert.equal(readJson(shared, 'snapshots', '2026-09-01T00-00-00.000Z.json').pageName, 'Checkout')
-  assert.equal(readJson(shared, `${'c'.repeat(64)}.json`).cached, true)
+  // The cache refills from live reads, and copying it could hold up the start.
+  assert.equal(fs.existsSync(path.join(shared, `${'c'.repeat(64)}.json`)), false, 'a cache entry was copied')
   assert.equal(fs.readdirSync(shared).some(name => name.endsWith('.tmp')), false, 'a temporary file was copied or left behind')
   assert.deepEqual(fs.readdirSync(source).sort(), before)
   assert.equal(notes.length, 1)
@@ -225,13 +226,15 @@ test('a file that cannot be copied is skipped and named, and the token still car
   const notes = []
   stub(t, 'copyFileSync', (original, from, to, ...rest) => {
     if (from.endsWith('latest.json')) throw Object.assign(new Error('locked'), { code: 'EBUSY' })
-    if (from.endsWith(`${'c'.repeat(64)}.json`)) throw Object.assign(new Error('gone'), { code: 'ENOENT' })
+    // Pruned by a running older bridge since the listing: nothing to report.
+    if (from.endsWith('2026-09-01T00-00-00.000Z.json')) throw Object.assign(new Error('gone'), { code: 'ENOENT' })
     return original(from, to, ...rest)
   })
 
   assert.equal(migrateDataDir(shared, [source], note => notes.push(note)), source)
   assert.equal(readJson(shared, 'bridge-token.json').token, 'a'.repeat(64))
   assert.equal(fs.existsSync(path.join(shared, 'latest.json')), false)
+  assert.equal(fs.existsSync(path.join(shared, 'snapshots', '2026-09-01T00-00-00.000Z.json')), false)
   assert.match(notes.join('\n'), /Skipped 1 file\(s\) .*latest\.json \(EBUSY\)/)
   assert.equal(fs.readdirSync(shared).some(name => name.endsWith('.tmp')), false)
 })
