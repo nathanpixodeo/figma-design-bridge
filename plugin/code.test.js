@@ -885,3 +885,65 @@ test('waiting for the bridge does not reach the panel as an error', async () => 
   await p.message({ type: 'bridge-status', connected: false, error: 'This bridge did not accept the saved token.' })
   assert.equal(p.sent.at(-1).type, 'error')
 })
+
+const edit = { type: 'bridge-invalidate', fileKey: 'AAAAfileKeyAAAA', reason: 'documentchange' }
+
+test('the panel keeps one invalidation in flight and folds a burst of edits into one follow-up', async () => {
+  const invalidations = []
+  const panel = ui(async (url, options = {}) => {
+    if (url.endsWith('/bridge/session')) return respondWith(201, { sessionId: 'sess-1', sessionSecret: 'secret-1' })
+    if (url.endsWith('/invalidate')) {
+      return new Promise(resolve => invalidations.push({ body: JSON.parse(options.body), done: () => resolve(respondWith(200, { invalidated: 1 })) }))
+    }
+    if (url.endsWith('/heartbeat')) return respondWith(200, { ok: true })
+    return new Promise(() => {})
+  })
+  await panel.post({ type: 'bridge-start', config: savedConfig })
+  await settleUi()
+
+  for (let i = 0; i < 10; i++) panel.post(edit)
+  await settleUi()
+  assert.equal(invalidations.length, 1, 'edits made during an invalidation must wait for it')
+
+  invalidations[0].done()
+  await settleUi()
+  assert.equal(invalidations.length, 1, 'the follow-up must wait')
+  assert.equal(panel.time.delays.at(-1), 1000)
+
+  // An edit made while the follow-up waits rides on it.
+  panel.post(edit)
+  panel.time.flush()
+  await settleUi()
+  assert.equal(invalidations.length, 2)
+  assert.deepEqual(invalidations[1].body, { fileKey: 'AAAAfileKeyAAAA', reason: 'documentchange' })
+
+  invalidations[1].done()
+  await settleUi()
+  panel.time.flush()
+  await settleUi()
+  assert.equal(invalidations.length, 2, 'nothing changed after the follow-up, so nothing more is sent')
+})
+
+test('closing the panel drops a waiting invalidation and ends the session with a request that outlives the panel', async () => {
+  const calls = []
+  const panel = ui(async (url, options = {}) => {
+    calls.push({ url, options })
+    if (url.endsWith('/bridge/session')) return respondWith(201, { sessionId: 'sess-1', sessionSecret: 'secret-1' })
+    if (url.includes('/poll')) return new Promise(() => {})
+    return respondWith(200, {})
+  })
+  await panel.post({ type: 'bridge-start', config: savedConfig })
+  await settleUi()
+  panel.post(edit)
+  panel.post(edit)
+  await settleUi()
+  assert.equal(panel.time.delays.at(-1), 1000, 'the second edit should wait for a follow-up')
+
+  await panel.post({ type: 'bridge-stop', reason: 'plugin-close' })
+  const close = calls.find(call => call.options.method === 'DELETE')
+  assert.equal(close.url, 'http://localhost:3456/bridge/session/sess-1?reason=plugin-close')
+  assert.equal(close.options.keepalive, true)
+  assert.equal(close.options.headers['X-Session-Secret'], 'secret-1')
+  assert.equal(panel.time.timers.size, 0, 'a follow-up invalidation outlived the session')
+  assert.equal(calls.filter(call => call.url.endsWith('/invalidate')).length, 1)
+})
