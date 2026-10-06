@@ -55,6 +55,14 @@ stays a cheap question. They return no design content beyond the current page
 name and node count, plus the absolute path of the data directory, which can
 include your user name. The Host and Origin checks still apply.
 
+## Dependencies
+
+The only runtime dependency is `@modelcontextprotocol/sdk`, and the bridge uses
+its stdio transport alone; the SDK's HTTP server stack (Express, Hono) is
+installed but never started. `package-lock.json` pins patched versions of that
+stack anyway, and `npm audit --omit=dev` reports no known vulnerability as of
+1.3.1. Installs follow the lockfile, so they get the patched versions.
+
 ## Known weakening you can opt into
 
 `FIGMA_BRIDGE_ALLOW_ANONYMOUS_LEGACY=1` restores the pre-1.1.0 behaviour, where

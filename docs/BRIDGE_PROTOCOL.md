@@ -599,9 +599,22 @@ re-probes and reuses the winner.
 
 ## Known limitations
 
-- **No manual acceptance run yet.** The plugin's Connect On-Demand Bridge
-  command speaks this protocol, and its Sync commands still post to the legacy
-  `POST /design` route. Neither has been accepted in a real Figma session.
+- **Accepted on Windows with Figma desktop only.** The **Open Design Bridge**
+  panel speaks this protocol and its Sync buttons post to the legacy
+  `POST /design` route. Pairing and live node reads were accepted against a real
+  Figma file on Windows (1.1.1 and 1.3.0); macOS and Linux run the automated
+  suite only.
+- **A first read can be slow.** Figma loads a page the first time a plugin
+  reads it, which for a large page can take longer than the default 30 s
+  `timeoutMs`. The read fails with `TIMEOUT`; retry with a larger `timeoutMs`
+  (up to 120000) or a smaller `depth` or `maxNodes`.
+- **A plugin that dies abruptly is noticed late.** Closing the panel ends its
+  session at once. A plugin that is killed, or whose Figma window hangs, keeps
+  its session until no heartbeat or poll has arrived for 90 s, so reads sent to
+  it in between fail with `TIMEOUT` instead of `NO_SESSION_FOR_FILE`.
+- **Truncation does not say which limit was hit.** `completeness.limitHit` and
+  `truncatedNodeIds` show that and where a result was cut, not whether
+  `depth`, `maxNodes` or `maxBytes` did it.
 - **`networkAccess` pins the bridge to port 3456.** `plugin/manifest.json`
   declares `allowedDomains: ["none"]` with `http://localhost:3456` in
   `devAllowedDomains`. Moving the bridge with `FIGMA_BRIDGE_PORT` therefore

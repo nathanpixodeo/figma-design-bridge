@@ -795,7 +795,16 @@ The plugin resolves its own paths through `${CLAUDE_PLUGIN_ROOT}`, so nothing br
 
 The MCP server tries to listen on port 3456, and when it succeeds it is itself the endpoint the Figma plugin talks to — it serves both the Sync commands' `/design` and the `/bridge/*` routes — so install, open the panel in Figma, pair, done. It hosts the bridge while Claude Code runs; in between, the panel waits and reconnects by itself. When `npm start` or another session already holds the port, the MCP server reuses that bridge: they share the token, so it makes no difference to the Figma plugin which of them runs.
 
-Only a bridge that keeps its own data directory gets in the way — one older than 1.3.0, or one started with `FIGMA_BRIDGE_DATA_DIR`. If it holds port 3456, the plugin's bridge tools fail with `NO_TOKEN` or `UNAUTHORIZED`, naming the fix: update or stop that bridge. `/figma-bridge:page` shows the directory the MCP server reads.
+Only a bridge that keeps its own data directory gets in the way — one older than 1.3.0, or one started with `FIGMA_BRIDGE_DATA_DIR`. If it holds port 3456, the plugin's bridge tools fail with `NO_TOKEN` or `UNAUTHORIZED`, naming the fix: update or stop that bridge. `/figma-bridge:page` shows the directory the MCP server reads, and `curl http://127.0.0.1:3456/health` shows the one the running bridge uses.
+
+#### Updating
+
+```bash
+claude plugin marketplace update figma-design-bridge
+claude plugin update figma-bridge@figma-design-bridge
+```
+
+Then restart Claude Code (`/exit`, then `claude -c` to resume the conversation): a running session keeps the MCP server it started with, and that server keeps port 3456. Each Claude Code profile (`CLAUDE_CONFIG_DIR`) has its own plugin install, so update every profile you use. The Figma plugin runs from your clone: `git pull`, then close and reopen the panel. [CHANGELOG.md](CHANGELOG.md) lists what changed and any upgrade steps.
 
 For Codex CLI, see [`integrations/codex/README.md`](integrations/codex/README.md).
 
@@ -846,7 +855,7 @@ Restart the MCP client after changing its environment configuration.
 
 | Tool | Description |
 |------|-------------|
-| `get_design_context` | Read a Figma file or exact node through the connected plugin (`source` required; live by default) |
+| `get_design_context` | Read a Figma file or exact node through the connected plugin (`source` required; live by default). `depth`, `maxNodes` and `maxBytes` bound the result; `timeoutMs` (default 30000, up to 120000) bounds the wait |
 | `get_bridge_status` | Show bridge readiness, live plugin sessions, how many plugins wait for pairing approval, cache statistics, and setup hints |
 | `approve_figma_pairing` | Approve the Figma plugin that shows this 6-digit pairing code (`code` required). Use only a code the user reads from the plugin |
 | `sync_figma_design` | Explicitly fetch a Figma URL/file key, normalize it, and cache it locally |
@@ -918,6 +927,8 @@ claude -p "Based on these text nodes, write better copy for the landing page: $T
 | Server port conflict | Set a custom port: `FIGMA_BRIDGE_PORT=4567 node server/index.js` |
 | Design seems incomplete | Import the full-file URL without `node-id`, or pass the required `nodeIds` explicitly. |
 | MCP server not connecting | Make sure `npm install` was run. Use absolute path to `server/mcp.mjs` in config. |
+| `npm run bridge:pair` says the bridge "rejected the token" | The bridge on port 3456 keeps a different data directory — usually a Claude Code session still running a plugin older than 1.3.0. [Update the plugin](#updating), restart Claude Code, then press **Pair with bridge** again. `curl http://127.0.0.1:3456/health` shows the data directory the running bridge uses. |
+| `get_design_context` returns `TIMEOUT` | Figma loads a large page slowly the first time it is read. Retry with a larger `timeoutMs` (up to 120000) or a smaller `depth` or `maxNodes`, and keep the panel open. |
 | MCP tools return "No design data" | Call `sync_figma_design` with a Figma URL first. |
 
 ---
