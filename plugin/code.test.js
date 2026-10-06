@@ -947,3 +947,28 @@ test('closing the panel drops a waiting invalidation and ends the session with a
   assert.equal(panel.time.timers.size, 0, 'a follow-up invalidation outlived the session')
   assert.equal(calls.filter(call => call.url.endsWith('/invalidate')).length, 1)
 })
+
+test('a late failure from a replaced session does not end the new one', async () => {
+  let sessions = 0
+  let failInvalidate
+  const panel = ui(async url => {
+    if (url.endsWith('/bridge/session')) return respondWith(201, { sessionId: `sess-${++sessions}`, sessionSecret: 'secret' })
+    if (url.includes('/poll')) return new Promise(() => {})
+    if (url.endsWith('/invalidate')) return new Promise((_, reject) => { failInvalidate = reject })
+    return respondWith(200, {})
+  })
+
+  await panel.post({ type: 'bridge-start', config: savedConfig })
+  await settleUi()
+  panel.post({ type: 'bridge-invalidate', fileKey: 'AAAAfileKeyAAAA', reason: 'documentchange' })
+  await settleUi()
+  // The panel reconnects while that invalidate is still out, then it fails.
+  await panel.post({ type: 'bridge-start', config: savedConfig })
+  await settleUi()
+  failInvalidate(new TypeError('Failed to fetch'))
+  await settleUi()
+
+  assert.equal(sessions, 2)
+  assert.equal(lastBridgeStatus(panel).connected, true)
+  assert.equal(panel.element('statusText').textContent, 'Connected')
+})

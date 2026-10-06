@@ -251,8 +251,10 @@ async function stopBridge(reason){
 function scheduleHeartbeat(){
   if(!bridgeWanted||!sessionId) return
   heartbeatTimer=setTimeout(async()=>{
-    try{await bridgeFetch('/bridge/session/'+encodeURIComponent(sessionId)+'/heartbeat',{method:'POST',body:{}});scheduleHeartbeat()}
-    catch(err){handleBridgeDisconnect(err)}
+    const sid=sessionId
+    try{await bridgeFetch('/bridge/session/'+encodeURIComponent(sid)+'/heartbeat',{method:'POST',body:{}});scheduleHeartbeat()}
+    // A failure of a session that was already replaced must not end the new one.
+    catch(err){if(sid===sessionId)handleBridgeDisconnect(err)}
   },10000)
 }
 function handleBridgeDisconnect(err){
@@ -323,8 +325,9 @@ async function invalidateBridge(msg){
   if(!bridgeWanted||!sessionId) return
   if(invalidating||invalidateTimer){invalidateNext=msg;return}
   invalidating=true
-  try{await bridgeFetch('/bridge/session/'+encodeURIComponent(sessionId)+'/invalidate',{method:'POST',body:{fileKey:msg.fileKey,reason:msg.reason||'documentchange'}})}
-  catch(err){handleBridgeDisconnect(err)}
+  const sid=sessionId
+  try{await bridgeFetch('/bridge/session/'+encodeURIComponent(sid)+'/invalidate',{method:'POST',body:{fileKey:msg.fileKey,reason:msg.reason||'documentchange'}})}
+  catch(err){if(sid===sessionId)handleBridgeDisconnect(err)}
   finally{invalidating=false}
   if(invalidateNext) invalidateTimer=setTimeout(sendNextInvalidate,1000)
 }
