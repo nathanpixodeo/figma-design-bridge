@@ -414,6 +414,53 @@ test('a poll already waiting is woken immediately by a new request, not left to 
   await requestPromise
 })
 
+// ── Routing between sessions of one file ────────────────────
+
+function pendingCountOf(broker, sessionId) {
+  return broker.listSessions().find(session => session.sessionId === sessionId).pendingCount
+}
+
+test('a read goes to the session heard from most recently, not to an older one a crashed plugin left behind', async () => {
+  const { broker, clock } = makeHarness()
+  // The old plugin crashed, or its panel was reopened: it is never heard from
+  // again, but its session stays registered until it expires.
+  const old = registerTestSession(broker, { fileKey: 'FILE_R', pluginInstanceId: 'plugin-old' })
+  clock.advance(1000)
+  const fresh = registerTestSession(broker, { fileKey: 'FILE_R', pluginInstanceId: 'plugin-new' })
+  const freshPoll = broker.poll(fresh.sessionId, fresh.sessionSecret, { waitMs: 60_000 })
+
+  const pending = broker.request({ fileKey: 'FILE_R', op: 'ping' })
+  assert.equal(pendingCountOf(broker, fresh.sessionId), 1)
+  assert.equal(pendingCountOf(broker, old.sessionId), 0)
+  const { requests: [delivered] } = await freshPoll
+  broker.reply(fresh.sessionId, fresh.sessionSecret, { requestId: delivered.requestId, ok: true, result: {} })
+  assert.equal((await pending).sessionId, fresh.sessionId)
+
+  // The newer session did not close the older one: if that plugin is in fact
+  // still running and is heard from again, it serves the file too.
+  assert.equal(broker.listSessions().filter(session => session.alive).length, 2)
+  clock.advance(1000)
+  broker.heartbeat(old.sessionId, old.sessionSecret)
+  const next = broker.request({ fileKey: 'FILE_R', op: 'ping' })
+  assert.equal(pendingCountOf(broker, old.sessionId), 1)
+  broker.cancelAll('test cleanup')
+  await assert.rejects(next, { code: 'SESSION_LOST' })
+})
+
+test('between sessions heard from at the same moment, the one with a poll waiting takes the read', async () => {
+  const { broker } = makeHarness()
+  const polling = registerTestSession(broker, { fileKey: 'FILE_T', pluginInstanceId: 'plugin-polling' })
+  const idle = registerTestSession(broker, { fileKey: 'FILE_T', pluginInstanceId: 'plugin-idle' })
+  const waiting = broker.poll(polling.sessionId, polling.sessionSecret, { waitMs: 60_000 })
+
+  const pending = broker.request({ fileKey: 'FILE_T', op: 'ping' })
+  assert.equal(pendingCountOf(broker, polling.sessionId), 1)
+  assert.equal(pendingCountOf(broker, idle.sessionId), 0)
+  const { requests: [delivered] } = await waiting
+  broker.reply(polling.sessionId, polling.sessionSecret, { requestId: delivered.requestId, ok: true, result: {} })
+  await pending
+})
+
 // ── Validation ───────────────────────────────────────────────
 
 test('request() rejects unknown op, non-plain params, oversized params and empty fileKey with BAD_REQUEST', async () => {

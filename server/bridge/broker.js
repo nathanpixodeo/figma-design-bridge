@@ -275,6 +275,26 @@ function createBroker(options = {}) {
     waiter.resolve({ requests: items })
   }
 
+  // The session a new request goes to: the one heard from most recently. A
+  // plugin that crashed, or whose panel was reopened, leaves its old session
+  // registered until it expires, and that session must not keep taking the
+  // file's reads from the one that replaced it. Between sessions heard from at
+  // the same moment, one with a poll waiting takes the request at once.
+  function sessionToServe(fileKey) {
+    const fileSessions = sessionsByFile.get(fileKey)
+    if (!fileSessions) return null
+    let best = null
+    for (const sessionId of fileSessions) {
+      const candidate = sessions.get(sessionId)
+      if (!candidate || !candidate.alive) continue
+      if (!best || candidate.lastSeenAt > best.lastSeenAt
+        || (candidate.lastSeenAt === best.lastSeenAt && (candidate.waitingPoll || !best.waitingPoll))) {
+        best = candidate
+      }
+    }
+    return best
+  }
+
   // ── Public API ───────────────────────────────────────────────
 
   function registerSession({ fileKey, fileName, pluginInstanceId, capabilities } = {}) {
@@ -374,17 +394,7 @@ function createBroker(options = {}) {
         return
       }
 
-      const fileSessions = sessionsByFile.get(validated.fileKey)
-      let targetSession = null
-      if (fileSessions) {
-        for (const sessionId of fileSessions) {
-          const candidate = sessions.get(sessionId)
-          if (candidate && candidate.alive) {
-            targetSession = candidate
-            break
-          }
-        }
-      }
+      const targetSession = sessionToServe(validated.fileKey)
       if (!targetSession) {
         reject(errors.noSessionForFile(validated.fileKey))
         return
