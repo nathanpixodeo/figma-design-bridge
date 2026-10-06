@@ -27,11 +27,10 @@ Neither path needs a Figma token to *read* the cache, but both need the local
 unrelated: the Figma one authenticates you to Figma, the bridge one keeps other
 programs on your machine out of your design data.
 
-A third, request-driven path is being built alongside them: a plugin-first
-bridge where you paste any node URL and the agent reads that node live from the
-open Figma document, with no REST token and no manual Sync click. It is wired up
-but not yet proven end to end in Figma, so it is not a supported path yet — see
-[Request-Driven Plugin Bridge](#request-driven-plugin-bridge-phase-1).
+A third, request-driven path is the one [Fastest setup](#fastest-setup-claude-code--figma-nothing-to-copy)
+uses: a plugin-first bridge where you paste any node URL and the agent reads that
+node live from the open Figma document, with no REST token and no manual Sync
+click. See [Request-Driven Plugin Bridge](#request-driven-plugin-bridge-phase-1).
 
 ## Fastest setup: Claude Code + Figma, nothing to copy
 
@@ -107,7 +106,7 @@ Agents query the cached data; reading and searching never call Figma again.
 
 ### Prerequisites
 
-- [Node.js](https://nodejs.org/) 18+ (for the local server)
+- [Node.js](https://nodejs.org/) 20+ (for the local server)
 - A Figma account that can view the target file
 
 **For the REST path only**, also: a Figma personal access token with
@@ -229,7 +228,11 @@ controls apply to every route, and all three are on by default — see
 2. A request whose `Host` header names anything but a loopback host gets `403`,
    which defeats DNS rebinding. A cross-origin `Origin` gets `403` too, and no
    response ever carries `Access-Control-Allow-Origin: *`.
-3. Every route except `GET /` and `GET /health` requires the bridge token.
+3. Every route requires the bridge token except `GET /`, `GET /health`,
+   `GET /bridge/health` and the two pairing routes (`POST /bridge/pair`,
+   `GET /bridge/pair/:id`), which hand nothing out until someone holding the
+   token approves the code. The open legacy routes send no CORS header, so a web
+   page cannot read them.
 
 ### 3. Pair with the Bridge Token
 
@@ -577,14 +580,12 @@ The server validates all incoming request payloads and returns appropriate HTTP 
 
 ## Request-Driven Plugin Bridge (Phase 1)
 
-> **Status: phase 1 complete, phase 2 in progress.** The modules under
-> `server/bridge/` are covered by tests, both the HTTP server and the MCP server
-> mount them under `/bridge/`, and the Figma plugin's **Open Design Bridge**
-> panel pairs, opens a session and answers polls. Live reads against a real
-> Figma file have worked; what is still missing is the full manual acceptance
-> run described under
-> [Known gaps](#known-gaps-before-this-works-end-to-end), so treat this path as
-> unproven end to end and keep using the two paths above for real work.
+> **Status: supported.** The modules under `server/bridge/` are covered by
+> tests, both the HTTP server and the MCP server mount them under `/bridge/`, and
+> the Figma plugin's **Open Design Bridge** panel pairs, opens a session and
+> answers live reads. Pairing and live reads were accepted against a real Figma
+> file on Windows; macOS and Linux run the automated suite. See
+> [Known gaps](#known-gaps).
 
 The REST import path above works, but it has a shape problem: it needs a personal
 access token, it caches one global "current design" that every sync replaces, and
@@ -630,8 +631,8 @@ Design rules it enforces:
   representation. Reading node B never evicts node A, and one plugin session can
   never answer, poll or invalidate another file's request.
 - **Authentication is not optional on localhost.** Every route but
-  `GET /bridge/health` requires a bearer token; session routes require a second
-  per-session secret. Requests are Host-checked against loopback to block DNS
+  `GET /bridge/health` and the pairing request and pickup requires a bearer
+  token; session routes require a second per-session secret. Requests are Host-checked against loopback to block DNS
   rebinding, and CORS is an explicit origin allowlist, never `*`.
 - **Limits are explicit.** Truncation is reported as
   `completeness: { nodeCount, byteSize, limitHit, truncatedNodeIds }`, so a
@@ -659,15 +660,15 @@ the plugin serializer and the REST importer. No network and no Figma credential
 are involved; every test uses a temporary data directory and a free port. CI runs
 the same command on Linux and Windows against Node 20, 22 and 24.
 
-### Known gaps before this works end to end
+### Known gaps
 
-- The full manual acceptance checklist in
-  [docs/PLAN_PLUGIN_ON_DEMAND_MCP.md](docs/PLAN_PLUGIN_ON_DEMAND_MCP.md) has not
-  been run against the `/bridge/*` routes yet, although live reads of a real
-  Figma file have worked. The panel's live reads use them; its Sync buttons
-  still post to `POST /design`.
-- The first read after opening a large file can take longer than the 30-second
-  read timeout, while Figma loads its pages for the first time. Retrying is fast.
+- Manual acceptance in a real Figma session has been run on Windows only. The
+  panel's live reads use `/bridge/*`; its Sync buttons still post to
+  `POST /design`.
+- The first read of a large page can take longer than the default 30-second
+  timeout while Figma loads it. Pass a larger `timeoutMs` (up to 120000), or a
+  smaller `depth` or `maxNodes`; a retry is fast.
+- More in [docs/BRIDGE_PROTOCOL.md](docs/BRIDGE_PROTOCOL.md#known-limitations).
 
 ---
 
@@ -840,7 +841,8 @@ commands post to — or reuses the one already running there:
 - Anything else on that port — another program, or a bridge on a different data
   directory — does not stop the MCP server. The snapshot tools keep reading the
   data directory, and `get_bridge_status` and `get_design_context` report
-  `PORT_OCCUPIED`, `NO_TOKEN` or `UNAUTHORIZED` with the fix.
+  `PORT_OCCUPIED`, `BRIDGE_BUSY`, `NO_TOKEN` or `UNAUTHORIZED` with the fix, and
+  keeps trying to take the port over in the background.
 - When the process that owns the port exits, another running MCP server takes
   the port over within about 10 seconds, or at its next bridge call.
 - When its MCP client closes stdin, the server answers the calls in flight,

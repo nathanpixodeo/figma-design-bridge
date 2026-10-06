@@ -16,11 +16,16 @@ Prefer the official Figma MCP server when it is connected, because it is the onl
 - `get_variable_defs` on the node — design tokens. A hard-coded value in the code that matches a token's *value* is still a finding: it will not follow the token when the token changes.
 
 Otherwise use this plugin's bridge tools: call `get_bridge_status` first for
-setup diagnostics. If the first argument is a Figma URL or file key, call
-`get_design_context` with it as `source`, then pass the same `source` to
-`search_design`, `get_design_texts`, and `get_design_colors`. Only use
-unscoped `get_design_info` and omit `source` when checking the legacy imported
-snapshot. Say in the report that the bridge was used, and mark every layout and
+setup diagnostics. If the first argument is a Figma node link (it contains
+`node-id`), call `get_design_context` with it as `source`, then pass the same
+`source` to `search_design`, `get_design_texts`, and `get_design_colors`. A file
+link or a bare file key returns only the document index — pages and their
+top-level frames — and those three tools refuse it: use the index to find the
+frame, then ask the user for that frame's link (in Figma, right-click the frame
+and choose Copy link to selection). When a result carries a truncation note,
+raise `depth`, `maxNodes` or `maxBytes`, or read a child node, before reporting
+anything as missing. Only use unscoped `get_design_info` and omit `source` when
+checking the legacy imported snapshot. Say in the report that the bridge was used, and mark every layout and
 visual-weight check as **not verified** rather than passed — the bridge exposes
 no image, so those checks cannot be performed from it.
 

@@ -1,10 +1,10 @@
 # Bridge Protocol (`/bridge/*`)
 
-Status: **implemented, not yet accepted in a manual Figma run.** Both
+Status: **implemented and accepted in a real Figma session on Windows.** Both
 `npm start` and the MCP server mount these routes, and the Figma plugin's
-**Connect On-Demand Bridge** command opens a session and answers reads. See
-[the implementation plan](./PLAN_PLUGIN_ON_DEMAND_MCP.md) for the remaining
-acceptance work.
+**Open Design Bridge** panel pairs, opens a session and answers reads. See
+[Known limitations](#known-limitations) and
+[the implementation plan](./PLAN_PLUGIN_ON_DEMAND_MCP.md).
 
 This document describes the request-driven bridge: a shared loopback daemon that
 lets an MCP client paste a Figma node URL and read that node live, out of the
@@ -407,7 +407,11 @@ Readiness and actionable setup errors. Never connection secrets.
     }
   ],
   "pairing": { "pending": 0 },
-  "cache": { "entries": 12, "bytes": 402118 },
+  "cache": {
+    "entryCount": 12,
+    "byteSize": 402118,
+    "files": [{ "fileKey": "abc123DEF456", "fileName": "Checkout", "entryCount": 12 }]
+  },
   "setupHints": []
 }
 ```
@@ -530,7 +534,7 @@ An error body is **flat**: `error` is the human-readable message string and
 
 ```json
 {
-  "error": "No Figma plugin session is connected for file abc123DEF456. Open that file in Figma, run Plugins → Development → Design Bridge → Connect On-Demand Bridge, press Start, then retry. Pass mode \"cached\" to read explicitly unverified data instead.",
+  "error": "No Figma plugin session is connected for file abc123DEF456. Open that file in Figma and run Plugins → Development → Design Bridge → Open Design Bridge (press Pair with bridge the first time), then retry. Pass mode \"cached\" to read explicitly unverified data instead.",
   "code": "NO_SESSION_FOR_FILE"
 }
 ```

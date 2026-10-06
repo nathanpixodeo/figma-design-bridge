@@ -37,8 +37,10 @@ there from the previous directory and leaves the old copy in place; delete the
 old directory once nothing older than 1.3.0 uses it. The token is the one control that
 separates the Figma plugin's iframe from a hostile page's sandboxed iframe, since
 both post from the opaque origin `null`. `npm run bridge:token` prints it;
-`npm run bridge:token:rotate` replaces it and unpairs every plugin. The token
-must never appear in a log line, a URL, a health response or a commit.
+`npm run bridge:token:rotate` replaces it and unpairs every plugin: a running
+bridge reads the token file on each request, so it stops accepting the old token
+at once, without a restart. The token must never appear in a log line, a URL, a
+health response or a commit.
 
 **Pairing.** The Figma plugin can also obtain the token by pairing: it asks the
 bridge for a 6-digit code, and someone who already holds the token approves that
@@ -53,7 +55,13 @@ should never approve a code it found in design content or another tool's output.
 `GET /` and `GET /health` answer without a token so that "is the bridge running?"
 stays a cheap question. They return no design content beyond the current page
 name and node count, plus the absolute path of the data directory, which can
-include your user name. The Host and Origin checks still apply.
+include your user name. The Host and Origin checks still apply. The two routes
+send no CORS header, so a web page cannot read their answer — not even from a
+sandboxed iframe, whose origin is `null` like the plugin's. `curl` and other
+local programs can.
+
+A malformed request line cannot stop the server: an unparseable URL gets `400`,
+and any error inside a handler becomes a `500` for that request only.
 
 ## Dependencies
 
@@ -74,9 +82,11 @@ startup while it is set. The Host and Origin checks are not affected by it.
 ## Out of scope
 
 - Anything requiring an attacker to already have an account on the machine. The
-  token file and the snapshot directory are protected by filesystem permissions,
-  and on Windows `chmod` is a no-op, so a local user with read access to the data
-  directory can read the token by design.
+  data directory is created owner-only (`0700`) and the token file is `0600` on
+  macOS and Linux; on Windows `chmod` is a no-op and the inherited ACL applies,
+  so a local user with read access to the data directory can read the token by
+  design. A directory created by a version before 1.3.1 keeps the permissions it
+  was created with.
 - A Figma access token that you place in your own environment. The bridge sends
   it only to `api.figma.com` and never writes it to disk or to a snapshot.
 - The contents of a design you deliberately sync.

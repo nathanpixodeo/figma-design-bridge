@@ -125,7 +125,7 @@ Common causes are a missing/invalid token, missing `file_content:read` scope, no
 
 Receive already-normalized bridge data. The legacy Figma plugin and the `import:figma` CLI use this endpoint.
 
-The plugin's **Watch Mode** posts a `type: "page"` snapshot on startup and after debounced design edits or page switches. It includes all roots and descendants on the current page, regardless of selection (subject to the serializer's 30-level depth limit). **Sync Selected Nodes** posts `type: "selection"` with the selected subtrees. These are complete snapshots, not incremental patches: each successful POST replaces the current design rather than merging pages or selections. Previously synced data remains in retained snapshots. Watch Mode must stay open in Figma for live updates; it does not fetch arbitrary nodes from a Figma URL.
+The panel's **Sync page** button and **Quick Sync → Sync Full Page** post a `type: "page"` snapshot of the current page: all roots and descendants, regardless of selection (subject to the serializer's 30-level depth limit). With **Auto-sync page changes** on, edits and page switches re-sync it, debounced. **Sync selection** and **Quick Sync → Sync Selected Nodes** post `type: "selection"` with the selected subtrees. These are complete snapshots, not incremental patches: each successful POST replaces the current design rather than merging pages or selections. Previously synced data remains in retained snapshots. Auto-sync needs the panel open; reading an arbitrary node from a Figma URL is what the live `/bridge/*` reads do.
 
 **Request Body:**
 

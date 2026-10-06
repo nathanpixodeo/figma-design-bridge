@@ -12,11 +12,16 @@ Report only. Do not edit code. Stop after the report unless asked to apply the f
 Use the `figma-bridge` MCP server:
 
 - `get_bridge_status` first, to confirm the local bridge is ready.
-- If the first argument is a Figma URL or file key, call `get_design_context`
-  with that value as `source`; otherwise call `get_design_info` for the legacy
-  imported snapshot.
+- If the first argument is a Figma node link (it contains `node-id`), call
+  `get_design_context` with that value as `source`; otherwise call
+  `get_design_info` for the legacy imported snapshot.
 - Call `search_design`, `get_design_texts`, and `get_design_colors` with the
-  same `source` when reviewing a specific file or node.
+  same `source`. A file link or bare file key returns only the document index
+  (pages and their top-level frames) and those tools refuse it: find the frame
+  in the index, then ask for that frame's link (in Figma: right-click, Copy link
+  to selection).
+- When a result carries a truncation note, raise `depth`, `maxNodes` or
+  `maxBytes`, or read a child node, before reporting anything as missing.
 
 The bridge exposes no rendered image. Mark every layout and visual-weight check as **not verified** rather than passed, because they cannot be performed from structural data alone. If another connected server can return a screenshot of the node, use it and say so.
 

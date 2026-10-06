@@ -27,6 +27,15 @@ No data directory needs configuring. Codex, the Claude Code plugin and `npm star
 
 Check it with `codex mcp list`.
 
+Codex stops waiting for a tool call after `tool_timeout_sec` (60 seconds by default). The first live read of a large Figma page can take longer, and the read tools accept a `timeoutMs` of up to 120 seconds, so raise the limit in the same table:
+
+```toml
+[mcp_servers.figma-bridge]
+command = "node"
+args = ["<REPO>/server/mcp.mjs"]
+tool_timeout_sec = 150
+```
+
 ## 2. Use the review prompt (optional)
 
 The current Codex CLI help exposes no prompt installation command. Copy the
