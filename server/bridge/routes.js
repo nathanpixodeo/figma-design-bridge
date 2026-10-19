@@ -17,8 +17,10 @@ const DEFAULT_PROTOCOL_VERSION = '1.0'
 const DEFAULT_MAX_BODY_BYTES = 2_000_000
 // A plugin reply carries a payload of up to the read's maxBytes plus its
 // envelope. Every reply to a legal read has to fit, or the read dies with the
-// connection instead of reporting why.
-const MAX_READ_BYTES = 50_000_000
+// connection instead of reporting why. The read limits match what the plugin
+// serves: 20,000 nodes take about 90 seconds to walk inside Figma.
+const MAX_READ_BYTES = 10_000_000
+const MAX_READ_NODES = 20_000
 const REPLY_ENVELOPE_BYTES = 1_000_000
 const DEFAULT_MAX_REPLY_BODY_BYTES = MAX_READ_BYTES + REPLY_ENVELOPE_BYTES
 const MAX_POLL_WAIT_MS = 30_000
@@ -322,7 +324,7 @@ function createRoutes(options = {}) {
         } else if (key === 'depth') {
           if (!isInteger(value, 0, 50)) return 'Option "depth" must be an integer between 0 and 50'
         } else if (key === 'maxNodes') {
-          if (!isInteger(value, 1, 200_000)) return 'Option "maxNodes" must be an integer between 1 and 200000'
+          if (!isInteger(value, 1, MAX_READ_NODES)) return `Option "maxNodes" must be an integer between 1 and ${MAX_READ_NODES}`
         } else if (key === 'maxBytes') {
           // The plugin cannot serialize a meaningful response smaller than its
           // 1 KiB floor. Rejecting a lower request here keeps the advertised

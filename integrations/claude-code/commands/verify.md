@@ -22,9 +22,12 @@ setup diagnostics. If the first argument is a Figma node link (it contains
 link or a bare file key returns only the document index — pages and their
 top-level frames — and those three tools refuse it: use the index to find the
 frame, then ask the user for that frame's link (in Figma, right-click the frame
-and choose Copy link to selection). When a result carries a truncation note,
-raise `depth`, `maxNodes` or `maxBytes`, or read a child node, before reporting
-anything as missing. Only use unscoped `get_design_info` and omit `source` when
+and choose Copy link to selection). Prefer a link to one screen frame: a section
+or group holding many screens is slow to read and can run the Figma plugin out
+of memory. Pass `includeHidden: false` unless hidden layers matter. When a
+result carries a truncation note, raise `depth`, `maxNodes` or `maxBytes`, or
+read a child node, before reporting anything as missing. If a read fails with
+`SESSION_LOST`, ask the user to reopen Design Bridge, then read a smaller node. Only use unscoped `get_design_info` and omit `source` when
 checking the legacy imported snapshot. Say in the report that the bridge was used, and mark every layout and
 visual-weight check as **not verified** rather than passed — the bridge exposes
 no image, so those checks cannot be performed from it.

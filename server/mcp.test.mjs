@@ -286,6 +286,11 @@ test("a read waits as long as timeoutMs asks, and a timeout says what to try nex
   assert.equal(client.getServerVersion().version, version);
   const { tools } = await client.listTools();
   assert.equal(tools.find(tool => tool.name === "get_design_context").inputSchema.properties.timeoutMs.maximum, 120000);
+  // The schemas advertise what the plugin can serve, not more.
+  for (const tool of tools.filter(t => t.inputSchema.properties?.maxNodes)) {
+    assert.equal(tool.inputSchema.properties.maxNodes.maximum, 20000, tool.name);
+    assert.equal(tool.inputSchema.properties.maxBytes.maximum, 10000000, tool.name);
+  }
 
   // A plugin session that never answers.
   const registered = await fetch(`http://127.0.0.1:${port}/bridge/session`, {
@@ -304,6 +309,33 @@ test("a read waits as long as timeoutMs asks, and a timeout says what to try nex
   assert.equal(read.isError, true);
   assert.match(textOf(read), /TIMEOUT: Request timed out waiting for a plugin reply\. Figma loads .*larger timeoutMs/);
   assert.ok(waited >= 1400 && waited < 10_000, `waited ${waited} ms instead of about 1500`);
+});
+
+test("a read whose plugin goes away says how to retry with a smaller read", async t => {
+  const dataDir = tempDataDir(t);
+  const port = await freePort();
+  const client = await connectMcp(t, { FIGMA_BRIDGE_DATA_DIR: dataDir, FIGMA_BRIDGE_PORT: String(port) });
+  await waitFor(() => bridgeHealthy(port));
+
+  // A panel that takes the read and then closes, as Figma does to a plugin
+  // that runs out of memory.
+  const base = `http://127.0.0.1:${port}`;
+  const auth = { authorization: `Bearer ${tokenIn(dataDir)}`, "content-type": "application/json" };
+  const session = await (await fetch(`${base}/bridge/session`, {
+    method: "POST", headers: auth, body: JSON.stringify({ fileKey: "ClosingFile1", fileName: "Closing", pluginInstanceId: "closing-plugin" }),
+  })).json();
+  const headers = { ...auth, "x-session-secret": session.sessionSecret };
+  const read = client.callTool({
+    name: "get_design_summary",
+    arguments: { source: "https://www.figma.com/design/ClosingFile1/Closing?node-id=1-2", timeoutMs: 10000 },
+  });
+  const polled = await (await fetch(`${base}/bridge/session/${session.sessionId}/poll?waitMs=5000`, { headers })).json();
+  assert.equal(polled.requests.length, 1);
+  await fetch(`${base}/bridge/session/${session.sessionId}?reason=plugin-close`, { method: "DELETE", headers });
+
+  const result = await read;
+  assert.equal(result.isError, true);
+  assert.match(textOf(result), /SESSION_LOST: .*reopen Design Bridge.*one screen frame.*includeHidden: false\.$/s);
 });
 
 // Plays the Figma plugin: registers a session for fileKey and answers every

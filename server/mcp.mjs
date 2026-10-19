@@ -261,6 +261,11 @@ function describeError(error, { read = false } = {}) {
   } else if (error.code === "TIMEOUT" && read) {
     hint = " Figma loads a large page slowly the first time it is read. Retry with a larger timeoutMs "
       + "(up to 120000), or a smaller depth or maxNodes. Keep the Design Bridge panel open in Figma.";
+  } else if (error.code === "SESSION_LOST" && read) {
+    hint = " The Design Bridge panel closed or stopped answering during this read. If Figma's console shows "
+      + "\"Plugin runtime aborted\", the read was too large for the plugin's memory. Ask the user to reopen "
+      + "Design Bridge in Figma, then read one screen frame rather than a section of many screens, or pass a "
+      + "smaller depth or maxNodes, or includeHidden: false.";
   }
   const message = hint && !/[.!?]$/.test(error.message) ? `${error.message}.` : error.message;
   return `${prefix}${message}${hint}`;
@@ -361,12 +366,12 @@ const TIMEOUT_PROPERTY = {
 };
 
 const SOURCE_PROPERTIES = {
-  source: { type: "string", description: "Figma URL or file key. When provided, this tool reads through the live plugin bridge instead of global legacy state." },
+  source: { type: "string", description: "Figma URL or file key. When provided, this tool reads through the live plugin bridge instead of global legacy state. Prefer a link to one screen frame: a section or page holding many screens is slow to read and can run the Figma plugin out of memory." },
   mode: { type: "string", enum: ["live", "cached"], description: "Live by default. Cached mode is explicit opt-in to unverified stale data." },
   depth: { type: "integer", minimum: 0, maximum: 50 },
-  maxNodes: { type: "integer", minimum: 1, maximum: 200000 },
-  maxBytes: { type: "integer", minimum: 1024, maximum: 50000000, description: "Payload limit in UTF-8 bytes (default 2000000)" },
-  includeHidden: { type: "boolean", description: "Include hidden layers (default true)" },
+  maxNodes: { type: "integer", minimum: 1, maximum: 20000, description: "Most nodes to read (default 5000)" },
+  maxBytes: { type: "integer", minimum: 1024, maximum: 10000000, description: "Payload limit in UTF-8 bytes (default 2000000)" },
+  includeHidden: { type: "boolean", description: "Include hidden layers (default true). Pass false unless hidden layers matter; it keeps a large read smaller." },
   timeoutMs: TIMEOUT_PROPERTY,
 };
 
@@ -389,12 +394,12 @@ async function startMCP() {
         inputSchema: {
           type: "object",
           properties: {
-            source: { type: "string", description: "Figma design URL (including node-id when relevant) or a Figma file key" },
+            source: { type: "string", description: "Figma design URL (including node-id when relevant) or a Figma file key. Prefer a link to one screen frame: a section or page holding many screens is slow to read and can run the Figma plugin out of memory." },
             mode: { type: "string", enum: ["live", "cached"], description: "Use live unless the user explicitly asks for cached/offline data." },
             depth: { type: "integer", minimum: 0, maximum: 50 },
-            maxNodes: { type: "integer", minimum: 1, maximum: 200000 },
-            maxBytes: { type: "integer", minimum: 1024, maximum: 50000000, description: "Payload limit in UTF-8 bytes (default 2000000)" },
-            includeHidden: { type: "boolean", description: "Include hidden layers (default true)" },
+            maxNodes: { type: "integer", minimum: 1, maximum: 20000, description: "Most nodes to read (default 5000)" },
+            maxBytes: { type: "integer", minimum: 1024, maximum: 10000000, description: "Payload limit in UTF-8 bytes (default 2000000)" },
+            includeHidden: { type: "boolean", description: "Include hidden layers (default true). Pass false unless hidden layers matter; it keeps a large read smaller." },
             timeoutMs: TIMEOUT_PROPERTY,
           },
           required: ["source"],

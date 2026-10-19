@@ -71,7 +71,7 @@ Two further guards apply to every `/bridge/*` request:
 
 Request bodies are capped at 2,000,000 bytes (`413 PAYLOAD_TOO_LARGE`), except
 a plugin reply (`POST /bridge/session/:id/reply`), which may carry up to
-51,000,000 bytes: the largest `maxBytes` a read can ask for plus 1,000,000 bytes
+11,000,000 bytes: the largest `maxBytes` a read can ask for plus 1,000,000 bytes
 of envelope. Every route rejects unknown fields rather than ignoring them.
 
 ---
@@ -258,7 +258,10 @@ The file is taken from the registered session, never from the body. Passing a
 { "fileKey": "abc123DEF456", "invalidated": 12, "reason": "plugin-documentchange" }
 ```
 
-Invalidation is currently file-wide, which is conservative but correct.
+Invalidation is currently file-wide, which is conservative but correct. An edit
+made while the plugin is in the middle of a read is reported after that read's
+reply, so it also drops the entry the reply just cached, which may mix content
+from before and after the edit.
 
 ---
 
@@ -299,9 +302,15 @@ The route an MCP adapter calls with the URL a user pasted.
 |--------|-------|----------------|
 | `representation` | short identifier, `[A-Za-z0-9_.+-]{1,40}` | `node-subtree` or `document-index` |
 | `depth` | integer 0–50; the plugin serializes at most 30 levels | 12 |
-| `maxNodes` | integer 1–200000 | 5000 |
-| `maxBytes` | integer 1024–50000000, in UTF-8 bytes of the serialized payload | 2000000 |
+| `maxNodes` | integer 1–20000 | 5000 |
+| `maxBytes` | integer 1024–10000000, in UTF-8 bytes of the serialized payload | 2000000 |
 | `includeHidden` | boolean; hidden layers come back with `visible: false` | `true` |
+
+The caps keep a read inside what the plugin can serve. It walks roughly 270–600
+nodes a second, so 20,000 nodes take about 90 s, close to the 120 s `timeoutMs`
+ceiling. The walk runs in slices of about 50 ms and hands control back to Figma
+between them, so Figma, the panel and its heartbeats stay responsive during a
+long read. The plugin serves one read at a time, in the order they arrive.
 
 A URL `node-id` in dash form (`1-23`) is canonicalized to colon form (`1:23`).
 A source with no node id asks for a lightweight document index rather than a
@@ -645,6 +654,16 @@ re-probes and reuses the winner.
   reads sent to it in between fail with `TIMEOUT` instead of
   `NO_SESSION_FOR_FILE`. Reads already queued on a dead session before a new
   one registered time out too.
+- **Figma can close the plugin during a large read.** The plugin VM has a
+  memory ceiling; when a read goes over it, Figma's console shows
+  `Plugin runtime aborted` and the panel closes without sending its `DELETE`.
+  A read still waiting when the session expires fails with `SESSION_LOST`,
+  saying the plugin stopped answering while it had that read. Reopen Design
+  Bridge, then read one screen frame rather than a section of many screens, or
+  pass a smaller `depth` or `maxNodes`, or `includeHidden: false`. Where the
+  ceiling sits depends on the state of the Figma process: a 6,000-node read
+  passed ten times in a fresh panel, while a default read crashed one that had
+  been open for hours.
 - **Edits reach the cache about a second late.** The panel keeps at most one
   invalidate request in flight and sends one follow-up about 1 s after it
   returns, so a burst of edits costs two requests. A `cached`-mode read in that

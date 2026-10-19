@@ -433,9 +433,15 @@ function markBridgeTruncated(limits, nodeId) {
   }
 }
 
-function serializeNode(node, depth, limits) {
+function bridgeBudgetSpent(limits) {
+  return limits.state.nodeCount >= limits.maxNodes || limits.state.byteSize >= limits.maxBytes
+}
+
+// Decides whether a node is walked. Returns a placeholder when a limit cuts it,
+// null for a hidden layer the read leaves out, and undefined to serialize it.
+function cutNode(node, depth, limits) {
   if (limits && limits.state) {
-    if (depth > limits.maxDepth || limits.state.nodeCount >= limits.maxNodes || limits.state.byteSize >= limits.maxBytes) {
+    if (depth > limits.maxDepth || bridgeBudgetSpent(limits)) {
       markBridgeTruncated(limits, node.id)
       return { id: node.id, name: node.name, type: node.type, truncated: true }
     }
@@ -444,7 +450,94 @@ function serializeNode(node, depth, limits) {
   } else if (depth > 30) {
     return { id: node.id, name: node.name, type: node.type, truncated: true }
   }
+  return undefined
+}
 
+// Counts a node's own fields toward maxBytes. Returns true when that spends the
+// budget, so the node is kept but its children are left out.
+function spendNodeBytes(obj, node, limits) {
+  if (!limits || !limits.state) return false
+  try {
+    limits.state.byteSize += JSON.stringify(obj).length + 2
+  } catch {
+    limits.state.byteSize += 256
+  }
+  if (limits.state.byteSize < limits.maxBytes) return false
+  markBridgeTruncated(limits, node.id)
+  obj.truncated = true
+  return true
+}
+
+function serializeNode(node, depth, limits) {
+  const cut = cutNode(node, depth, limits)
+  if (cut !== undefined) return cut
+  const obj = describeNode(node, limits)
+  if (spendNodeBytes(obj, node, limits)) return obj
+
+  if ('children' in node && node.children.length > 0) {
+    if (limits && limits.state) {
+      obj.children = []
+      for (const child of node.children) {
+        if (bridgeBudgetSpent(limits)) {
+          markBridgeTruncated(limits, node.id)
+          obj.truncated = true
+          break
+        }
+        const serialized = serializeNode(child, depth + 1, limits)
+        if (serialized) obj.children.push(serialized)
+      }
+      if (obj.children.length === 0) delete obj.children
+    } else {
+      obj.children = node.children.map(child => serializeNode(child, depth + 1))
+    }
+  }
+
+  return obj
+}
+
+// Bridge reads walk thousands of nodes at a few hundred a second. Done in one
+// go, that freezes Figma and the panel with it, and a panel that cannot send a
+// heartbeat for 90 seconds loses its session. The paced walk hands control back
+// to Figma whenever it has worked for a slice.
+const BRIDGE_SLICE_MS = 50
+
+function createPacer(sliceMs = BRIDGE_SLICE_MS) {
+  let sliceStart = Date.now()
+  return async function pace() {
+    if (Date.now() - sliceStart < sliceMs) return
+    await new Promise(resolve => setTimeout(resolve, 0))
+    sliceStart = Date.now()
+  }
+}
+
+async function serializeNodePaced(node, depth, limits, pace) {
+  await pace()
+  const cut = cutNode(node, depth, limits)
+  if (cut !== undefined) return cut
+  const obj = describeNode(node, limits)
+  if (spendNodeBytes(obj, node, limits)) return obj
+
+  if ('children' in node && node.children.length > 0) {
+    obj.children = []
+    for (const child of node.children) {
+      if (bridgeBudgetSpent(limits)) {
+        markBridgeTruncated(limits, node.id)
+        obj.truncated = true
+        break
+      }
+      // Figma may apply an edit while the walk is paused; a layer deleted by
+      // then is skipped rather than failing the whole read.
+      if (child.removed) continue
+      const serialized = await serializeNodePaced(child, depth + 1, limits, pace)
+      if (serialized) obj.children.push(serialized)
+    }
+    if (obj.children.length === 0) delete obj.children
+  }
+
+  return obj
+}
+
+function describeNode(node, limits) {
   const obj = { id: node.id, name: node.name, type: node.type }
 
   if ('x' in node) obj.x = Math.round(node.x)
@@ -570,37 +663,6 @@ function serializeNode(node, depth, limits) {
     obj.expanded = node.expanded
   }
 
-  if (limits && limits.state) {
-    try {
-      limits.state.byteSize += JSON.stringify(obj).length + 2
-    } catch {
-      limits.state.byteSize += 256
-    }
-    if (limits.state.byteSize >= limits.maxBytes) {
-      markBridgeTruncated(limits, node.id)
-      obj.truncated = true
-      return obj
-    }
-  }
-
-  if ('children' in node && node.children.length > 0) {
-    if (limits && limits.state) {
-      obj.children = []
-      for (const child of node.children) {
-        if (limits.state.nodeCount >= limits.maxNodes || limits.state.byteSize >= limits.maxBytes) {
-          markBridgeTruncated(limits, node.id)
-          obj.truncated = true
-          break
-        }
-        const serialized = serializeNode(child, depth + 1, limits)
-        if (serialized) obj.children.push(serialized)
-      }
-      if (obj.children.length === 0) delete obj.children
-    } else {
-      obj.children = node.children.map(child => serializeNode(child, depth + 1))
-    }
-  }
-
   return obj
 }
 
@@ -679,12 +741,14 @@ function normalizeBridgeUrl(value) {
   return url
 }
 
+// The caps keep a read inside what the plugin can serve: 20,000 nodes take
+// about 90 seconds to walk, and the bridge waits two minutes at most.
 function bridgeLimits(options = {}) {
   const integer = (value, fallback, min, max) => Number.isInteger(value) ? Math.max(min, Math.min(max, value)) : fallback
   return {
     maxDepth: integer(options.depth, 12, 0, 30),
-    maxNodes: integer(options.maxNodes, 5000, 1, 200000),
-    maxBytes: integer(options.maxBytes, 2_000_000, 1024, 50_000_000),
+    maxNodes: integer(options.maxNodes, 5000, 1, 20_000),
+    maxBytes: integer(options.maxBytes, 2_000_000, 1024, 10_000_000),
     maxTextChars: 100_000,
     includeHidden: options.includeHidden !== false,
     state: { nodeCount: 0, byteSize: 0, limitHit: false, truncatedNodeIds: [] },
@@ -736,9 +800,11 @@ function countPayloadNodes(value) {
   return count
 }
 
-function completenessFor(payload, limits) {
+// knownSize spares serializing the payload again when the caller already has it.
+function completenessFor(payload, limits, knownSize) {
   let byteSize = 0
-  try { byteSize = jsonBytes(payload) } catch { byteSize = limits.state.byteSize }
+  if (knownSize !== undefined) byteSize = knownSize
+  else try { byteSize = jsonBytes(payload) } catch { byteSize = limits.state.byteSize }
   return {
     nodeCount: countPayloadNodes(payload),
     byteSize,
@@ -781,10 +847,11 @@ function pruneTrailingNodes(root, limits, size = jsonBytes(root)) {
   return size
 }
 
-function fitNodePayloadToLimit(payload, limits, nodeId) {
+function fitNodePayloadToLimit(payload, limits, nodeId, knownSize) {
   if (!payload) return payload
   let size = 0
-  try { size = jsonBytes(payload) } catch { size = 0 }
+  if (knownSize !== undefined) size = knownSize
+  else try { size = jsonBytes(payload) } catch { size = 0 }
   if (!size || size <= limits.maxBytes) return payload
 
   if (pruneTrailingNodes(payload, limits, size) <= limits.maxBytes) return payload
@@ -867,9 +934,19 @@ async function readBridgeNode(request) {
     }
   }
 
-  let payload = sanitizeForMessage(serializeNode(node, 0, limits))
-  payload = fitNodePayloadToLimit(payload, limits, node.id)
-  const completeness = completenessFor(payload, limits)
+  // The walked tree is released as soon as it is serialized, and parsing that
+  // text gives the copy structured clone accepts (no figma.mixed symbols), so
+  // the plugin never holds the tree, its text and the copy at once. The text's
+  // size is the payload's, and serializing again is needed only to trim it.
+  let text = JSON.stringify(await serializeNodePaced(node, 0, limits, createPacer()))
+  let size = utf8Length(text)
+  let payload = JSON.parse(text)
+  text = null
+  if (size > limits.maxBytes) {
+    payload = fitNodePayloadToLimit(payload, limits, node.id, size)
+    size = undefined
+  }
+  const completeness = completenessFor(payload, limits, size)
   const page = findPageForNode(node)
   return {
     fileKey: state.bridgeFileKey, fileName: state.bridgeFileName, nodeId: node.id,
@@ -923,6 +1000,7 @@ async function handleBridgeRequest(sessionId, request) {
     figma.ui.postMessage({ type: 'bridge-result', sessionId, requestId: request.requestId, ok: false, error: 'Request file does not match the connected Figma file.' })
     return
   }
+  state.bridgeReading = true
   try {
     let result
     if (request.op === 'read-node') result = await readBridgeNode(request)
@@ -934,7 +1012,35 @@ async function handleBridgeRequest(sessionId, request) {
     figma.ui.postMessage({ type: 'bridge-result', sessionId, requestId: request.requestId, ok: true, result })
   } catch (error) {
     figma.ui.postMessage({ type: 'bridge-result', sessionId, requestId: request.requestId, ok: false, error: error.message || String(error) })
+  } finally {
+    state.bridgeReading = false
+    if (state.editedDuringRead) {
+      state.editedDuringRead = false
+      reportBridgeEdit()
+    }
   }
+}
+
+// One read at a time: a paced walk lets other work run between its slices, and
+// two walks at once would hold two trees in the plugin's memory.
+let bridgeQueue = Promise.resolve()
+
+function queueBridgeRequest(sessionId, request) {
+  const run = bridgeQueue.then(() => handleBridgeRequest(sessionId, request))
+  bridgeQueue = run.catch(() => {})
+  return run
+}
+
+// An edit invalidates what the bridge cached for this file. One made while a
+// read is paused goes out after that read's reply, as it did when a read could
+// not be interrupted, so the bridge drops the reply it just cached.
+function reportBridgeEdit() {
+  if (!state.bridgeConnected || !state.bridgeFileKey) return
+  if (state.bridgeReading) {
+    state.editedDuringRead = true
+    return
+  }
+  figma.ui.postMessage({ type: 'bridge-invalidate', fileKey: state.bridgeFileKey, reason: 'documentchange' })
 }
 
 // clientStorage is per Figma user, not per document, so a file link is kept per
@@ -999,7 +1105,7 @@ const state = {
   autoSync: true, lastNodeCount: 0, lastSyncTime: null, lastPageName: null,
   connected: false, ready: false, inFlight: null, pendingSync: null, pendingScope: null, nextRequestId: 0,
   bridgeFileKey: null, bridgeFileName: null, bridgeConnected: false, bridgeToken: '',
-  lastBridgeNode: null, lastBridgeRequest: null,
+  lastBridgeNode: null, lastBridgeRequest: null, bridgeReading: false, editedDuringRead: false,
   pluginInstanceId: `plugin-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
 }
 
@@ -1108,9 +1214,7 @@ function main() {
     // One handler per event: an edit invalidates what the bridge cached for this
     // file, and re-syncs the page as well when auto-sync is on.
     figma.on('documentchange', () => {
-      if (state.bridgeConnected && state.bridgeFileKey) {
-        figma.ui.postMessage({ type: 'bridge-invalidate', fileKey: state.bridgeFileKey, reason: 'documentchange' })
-      }
+      reportBridgeEdit()
       debouncedSync()
     })
     figma.on('currentpagechange', debouncedSync)
@@ -1260,7 +1364,7 @@ function main() {
         break
 
       case 'bridge-request':
-        if (isOpen) await handleBridgeRequest(msg.sessionId, msg.request)
+        if (isOpen) await queueBridgeRequest(msg.sessionId, msg.request)
         break
 
       case 'bridge-stopped':

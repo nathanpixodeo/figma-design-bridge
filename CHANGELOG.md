@@ -4,6 +4,40 @@ All notable changes to Figma Design Bridge. Versions follow
 [Semantic Versioning](https://semver.org/); the Claude Code plugin, the
 marketplace entry and both `package.json` files always carry the same number.
 
+## [1.3.2] - 2026-10-19
+
+Keeps a large live read from freezing Figma or losing the panel. Nothing to
+migrate; reopen Design Bridge in Figma to load the new plugin code.
+
+### Fixed
+
+- A large read no longer freezes Figma. The plugin walked the node in one go,
+  at roughly 270–600 nodes a second, so Figma and the panel stopped responding
+  until it finished. A read over 90 s starved the heartbeats and the session
+  expired with `SESSION_LOST`. The walk now hands control back to Figma every
+  50 ms, and the panel serves one read at a time.
+- An edit made during a read is reported after that read's reply, so it also
+  drops the entry the reply cached, which may mix content from before and after
+  the edit.
+- A read holds less memory once the walk ends. The plugin serializes the
+  result once, frees the walked tree before it parses the text back, and reuses
+  the byte count instead of serializing again to measure it.
+- When the panel stops answering while it has a read (Figma closes the plugin
+  with `Plugin runtime aborted` when a read runs it out of memory), the read
+  fails with a `SESSION_LOST` that says so, and the MCP tools add what to do:
+  reopen Design Bridge, then read one screen frame, a smaller `depth` or
+  `maxNodes`, or `includeHidden: false`.
+
+### Changed
+
+- `maxNodes` is capped at 20,000 (was 200,000) and `maxBytes` at 10,000,000
+  (was 50,000,000). The bridge rejects a larger value with `BAD_REQUEST`, and
+  the MCP tool schemas advertise the new maxima. The defaults stay at 5,000
+  nodes and 2,000,000 bytes. A plugin reply body may now be 11,000,000 bytes.
+- The tool descriptions, `/figma-bridge:verify` and the Codex prompt ask for a
+  link to one screen frame rather than a section of many screens, and for
+  `includeHidden: false` unless hidden layers matter.
+
 ## [1.3.1] - 2026-10-06
 
 A production-hardening release: no new workflow, many fixes found by a full
@@ -165,7 +199,8 @@ audit. Nothing to migrate.
   with page and selection sync and Watch mode, and the MCP server for Claude
   Code.
 
-[1.3.1]: https://github.com/nathanpixodeo/figma-design-bridge/compare/a392ce3...main
+[1.3.2]: https://github.com/nathanpixodeo/figma-design-bridge/compare/b093ebf...main
+[1.3.1]: https://github.com/nathanpixodeo/figma-design-bridge/compare/a392ce3...b093ebf
 [1.3.0]: https://github.com/nathanpixodeo/figma-design-bridge/compare/398c555...a392ce3
 [1.2.0]: https://github.com/nathanpixodeo/figma-design-bridge/compare/6ed2cf9...398c555
 [1.1.1]: https://github.com/nathanpixodeo/figma-design-bridge/compare/7a52eb4...6ed2cf9

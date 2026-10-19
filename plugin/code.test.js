@@ -56,9 +56,18 @@ function plugin(command = 'watch', currentPage = page()) {
 
 function bridgePlugin({
   characters = 'Hello from another page', command = 'bridge', fileKey = 'AAAAfileKeyAAAA',
-  rootName = 'Bridge Test File', saved,
+  rootName = 'Bridge Test File', saved, now, manualYield = false,
 } = {}) {
   const time = clock()
+  // A paced read hands control back to Figma with setTimeout(0). Those run on
+  // their own unless a test steps through them with time.flush().
+  const setTimeoutFor = (callback, delay) => {
+    if (delay === 0 && !manualYield) {
+      setImmediate(callback)
+      return 0
+    }
+    return time.setTimeout(callback, delay)
+  }
   const sent = [], notifications = [], events = new Map()
   const storage = new Map(saved ? [['design-bridge-pairing', saved]] : [])
   const activePage = { id: '0:1', name: 'Screens', type: 'PAGE', selection: [], children: [] }
@@ -85,7 +94,9 @@ function bridgePlugin({
       setAsync: async (key, value) => storage.set(key, structuredClone(value)),
     },
   }
-  vm.runInNewContext(source, { figma, setTimeout: time.setTimeout, clearTimeout: time.clearTimeout })
+  const context = { figma, setTimeout: setTimeoutFor, clearTimeout: time.clearTimeout }
+  if (now) context.Date = class extends Date { static now() { return now() } }
+  vm.runInNewContext(source, context)
   return {
     figma, time, sent, notifications, target, activePage, otherPage, storage,
     emit: event => events.get(event)?.(),
@@ -509,6 +520,120 @@ test('Bridge counts maxBytes in UTF-8 bytes, not string length', async () => {
   assert.ok(bytes <= 4096, `${bytes} bytes`)
   assert.equal(reply.result.completeness.byteSize, bytes)
   assert.ok(reply.result.payload.characters.length > 1000)
+})
+
+// Every reading of the clock moves it 20 ms, so the walk uses up a 50 ms slice
+// every few nodes.
+function steppingClock() {
+  let t = 0
+  return () => (t += 20)
+}
+
+function flatScreen(parent, count) {
+  const screen = { id: '4:1', name: 'Screen', type: 'FRAME', parent, children: [] }
+  const nodes = new Map([[screen.id, screen]])
+  for (let i = 0; i < count; i++) {
+    const text = { id: `4:${i + 2}`, name: `Label ${i}`, type: 'TEXT', characters: `Label ${i}`, parent: screen }
+    screen.children.push(text)
+    nodes.set(text.id, text)
+  }
+  return { screen, nodes }
+}
+
+// Runs the timers a paced read leaves behind until the read settles.
+async function settle(p, pending) {
+  let done = false
+  pending.then(() => { done = true }, () => { done = true })
+  for (let i = 0; i < 10_000 && !done; i++) {
+    await new Promise(resolve => setImmediate(resolve))
+    p.time.flush()
+  }
+  return pending
+}
+
+function readRequest(requestId, nodeId, options) {
+  return {
+    type: 'bridge-request', sessionId: 'session-1',
+    request: { requestId, op: 'read-node', params: { fileKey: 'AAAAfileKeyAAAA', nodeId, options } },
+  }
+}
+
+test('Bridge walks a large node in slices, handing control back to Figma between them', async () => {
+  const p = await connectedBridgePlugin({ now: steppingClock(), manualYield: true })
+  const { screen, nodes } = flatScreen(p.otherPage, 40)
+  p.figma.getNodeByIdAsync = async id => nodes.get(id) || null
+
+  const pending = p.message(readRequest('paced', screen.id))
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(p.sent.filter(message => message.type === 'bridge-result').length, 0, 'the read waits for Figma')
+  assert.ok(p.time.delays.filter(delay => delay === 0).length > 0, 'the walk yielded')
+  await settle(p, pending)
+
+  const reply = p.sent.filter(message => message.type === 'bridge-result').at(-1)
+  assert.equal(reply.ok, true)
+  assert.equal(reply.result.payload.children.length, 40)
+  assert.equal(reply.result.completeness.nodeCount, 41)
+  assert.equal(reply.result.completeness.byteSize, Buffer.byteLength(JSON.stringify(reply.result.payload)))
+  assert.ok(p.time.delays.filter(delay => delay === 0).length >= 10)
+})
+
+test('Bridge reports an edit made while a read is paused only after that read replies', async () => {
+  const p = await connectedBridgePlugin({ now: steppingClock(), manualYield: true })
+  const { screen, nodes } = flatScreen(p.otherPage, 20)
+  p.figma.getNodeByIdAsync = async id => nodes.get(id) || null
+
+  const pending = p.message(readRequest('edited', screen.id))
+  await new Promise(resolve => setImmediate(resolve))
+  p.emit('documentchange')
+  p.emit('documentchange')
+  assert.equal(p.sent.filter(message => message.type === 'bridge-invalidate').length, 0)
+  await settle(p, pending)
+
+  const types = p.sent.map(message => message.type).filter(type => type === 'bridge-result' || type === 'bridge-invalidate')
+  assert.deepEqual(types, ['bridge-result', 'bridge-invalidate'])
+
+  p.emit('documentchange')
+  assert.equal(p.sent.filter(message => message.type === 'bridge-invalidate').length, 2, 'later edits go out at once')
+})
+
+test('Bridge serves one read at a time, in the order they arrive', async () => {
+  const p = await connectedBridgePlugin({ now: steppingClock(), manualYield: true })
+  const { screen, nodes } = flatScreen(p.otherPage, 30)
+  p.figma.getNodeByIdAsync = async id => nodes.get(id) || null
+
+  const slow = p.message(readRequest('slow', screen.id))
+  const quick = p.message({
+    type: 'bridge-request', sessionId: 'session-1',
+    request: { requestId: 'quick', op: 'read-document-index', params: { fileKey: 'AAAAfileKeyAAAA' } },
+  })
+  await settle(p, Promise.all([slow, quick]))
+
+  const order = p.sent.filter(message => message.type === 'bridge-result').map(message => message.requestId)
+  assert.deepEqual(order, ['slow', 'quick'])
+})
+
+test('Bridge skips a layer deleted while the walk was paused', async () => {
+  const p = await connectedBridgePlugin()
+  const { screen, nodes } = flatScreen(p.otherPage, 3)
+  screen.children[1].removed = true
+  Object.defineProperty(screen.children[1], 'name', { get() { throw new Error('The node with id "4:3" does not exist') } })
+  p.figma.getNodeByIdAsync = async id => nodes.get(id) || null
+
+  const reply = await readNode(p, screen.id)
+  assert.equal(reply.ok, true)
+  assert.deepEqual(reply.result.payload.children.map(child => child.id), ['4:2', '4:4'])
+})
+
+test('Bridge caps maxNodes at 20000 however many a read asks for', async () => {
+  const p = await connectedBridgePlugin()
+  const { screen, nodes } = flatScreen(p.otherPage, 20_005)
+  p.figma.getNodeByIdAsync = async id => nodes.get(id) || null
+
+  const reply = await readNode(p, screen.id, { maxNodes: 200_000, maxBytes: 50_000_000 })
+  assert.equal(reply.ok, true)
+  assert.equal(reply.result.completeness.nodeCount, 20_000)
+  assert.equal(reply.result.completeness.limitHit, true)
+  assert.equal(reply.result.payload.truncated, true)
 })
 
 test('Bridge document index is lightweight and document changes invalidate only the connected file', async () => {

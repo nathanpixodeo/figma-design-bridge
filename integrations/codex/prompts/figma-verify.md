@@ -20,8 +20,13 @@ Use the `figma-bridge` MCP server:
   (pages and their top-level frames) and those tools refuse it: find the frame
   in the index, then ask for that frame's link (in Figma: right-click, Copy link
   to selection).
+- Prefer a link to one screen frame: a section or group holding many screens is
+  slow to read and can run the Figma plugin out of memory. Pass
+  `includeHidden: false` unless hidden layers matter.
 - When a result carries a truncation note, raise `depth`, `maxNodes` or
   `maxBytes`, or read a child node, before reporting anything as missing.
+- If a read fails with `SESSION_LOST`, ask the user to reopen Design Bridge,
+  then read a smaller node.
 
 The bridge exposes no rendered image. Mark every layout and visual-weight check as **not verified** rather than passed, because they cannot be performed from structural data alone. If another connected server can return a screenshot of the node, use it and say so.
 

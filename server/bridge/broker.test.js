@@ -248,7 +248,7 @@ test('a session that misses its heartbeat/poll window is expired by the clock an
 
   clock.advance(300)
 
-  await assert.rejects(pending, { code: 'SESSION_LOST' })
+  await assert.rejects(pending, { code: 'SESSION_LOST', message: /stopped answering while it had this read.*too large for its memory/ })
   assert.equal(broker.hasSessionForFile('FILE_DEFAULT'), false)
   const [listed] = broker.listSessions()
   assert.equal(listed.alive, false)

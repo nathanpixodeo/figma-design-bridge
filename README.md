@@ -671,6 +671,9 @@ the same command on Linux and Windows against Node 20, 22 and 24.
 - The first read of a large page can take longer than the default 30-second
   timeout while Figma loads it. Pass a larger `timeoutMs` (up to 120000), or a
   smaller `depth` or `maxNodes`; a retry is fast.
+- A read is capped at 20,000 nodes and 10 MB. Figma can still close the plugin
+  when a large read runs it out of memory; read one screen frame rather than a
+  section of many screens.
 - More in [docs/BRIDGE_PROTOCOL.md](docs/BRIDGE_PROTOCOL.md#known-limitations).
 
 ---
@@ -935,6 +938,7 @@ claude -p "Based on these text nodes, write better copy for the landing page: $T
 | `npm run bridge:pair` says the bridge "rejected the token" | The bridge on port 3456 keeps a different data directory — usually a Claude Code session still running a plugin older than 1.3.0. [Update the plugin](#updating), restart Claude Code, then press **Pair with bridge** again. `curl http://127.0.0.1:3456/health` shows the data directory the running bridge uses. |
 | `npm start` says a bridge "uses another data directory" | A launcher that keeps its own data directory, or a version older than 1.3.0, holds port 3456 and would keep the Figma plugin on a different token. Stop or update it, then run `npm start` again. When the running bridge shares the data directory, `npm start` just says it is not needed. |
 | `get_design_context` returns `TIMEOUT` | Figma loads a large page slowly the first time it is read. Retry with a larger `timeoutMs` (up to 120000) or a smaller `depth` or `maxNodes`, and keep the panel open. |
+| Figma's console shows `Plugin runtime aborted` and the panel closes; the read fails with `SESSION_LOST` | The read was too large for the plugin's memory. Reopen Design Bridge, then read one screen frame rather than a section of many screens, or pass a smaller `depth` or `maxNodes`, or `includeHidden: false`. A panel left open for hours is closer to the limit; reopening it starts fresh. |
 | MCP tools return "No design data" | Call `sync_figma_design` with a Figma URL first. |
 
 ---

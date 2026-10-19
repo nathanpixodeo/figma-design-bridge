@@ -178,7 +178,13 @@ function createBroker(options = {}) {
   function handleSessionExpiry(sessionId) {
     const session = sessions.get(sessionId)
     if (!session || !session.alive) return
-    closeSessionInternal(session, 'Session timed out: no heartbeat or poll received in time')
+    // A panel goes quiet with reads outstanding when Figma closed the plugin,
+    // which is what Figma does when a read runs the plugin out of memory.
+    const reason = session.pendingRequestIds.size
+      ? 'The Figma plugin stopped answering while it had this read: no heartbeat or poll received in time. '
+        + 'Figma closes the plugin when a read is too large for its memory'
+      : 'Session timed out: no heartbeat or poll received in time'
+    closeSessionInternal(session, reason)
   }
 
   function authSession(sessionId, sessionSecret) {
