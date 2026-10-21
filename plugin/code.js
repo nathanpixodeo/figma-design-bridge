@@ -58,7 +58,7 @@ summary{cursor:pointer;color:#8E8E93;user-select:none;margin-bottom:8px}
     <span class="dot yellow"></span>
     <span id="statusText">Starting...</span>
   </div>
-  <p class="hint wait-hint hidden" id="waitHint">The bridge starts with Claude Code (figma-bridge plugin) or npm start. This panel connects as soon as it is up.</p>
+  <p class="hint wait-hint hidden" id="waitHint">The bridge starts with Claude Code (figma-bridge plugin) or figma-bridge start. This panel connects as soon as it is up.</p>
   <div class="info-grid">
     <span class="label" id="pageLabel">Synced page</span>
     <span class="value" id="pageName">—</span>
@@ -73,8 +73,8 @@ summary{cursor:pointer;color:#8E8E93;user-select:none;margin-bottom:8px}
       <div class="pair-code" id="pairCode">—</div>
       <p class="hint">Approve this code in Claude Code:</p>
       <code id="pairCommand">/figma-bridge:pair</code>
-      <p class="hint">or in a terminal, in the bridge folder:</p>
-      <code id="pairCli">npm run bridge:pair --</code>
+      <p class="hint">or in a terminal:</p>
+      <code id="pairCli">figma-bridge pair</code>
       <div class="row"><span class="hint" id="pairExpiry"></span><button class="btn-stop" id="cancelPairBtn">Cancel</button></div>
     </div>
   </div>
@@ -98,7 +98,7 @@ summary{cursor:pointer;color:#8E8E93;user-select:none;margin-bottom:8px}
   <details id="advanced">
     <summary>Advanced</summary>
     <div class="actions">
-      <div class="field"><label>Bridge token (pairing fills it in)</label><input id="bridgeToken" type="password" autocomplete="off" placeholder="or paste the output of npm run bridge:token"></div>
+      <div class="field"><label>Bridge token (pairing fills it in)</label><input id="bridgeToken" type="password" autocomplete="off" placeholder="or paste the output of figma-bridge token"></div>
       <div class="actions hidden" id="bridgeActions">
         <div class="field"><label>Bridge URL</label><input id="bridgeUrl" value="${SERVER_URL}"></div>
         <div class="field hidden" id="fileField"><label>This file's link (Share → Copy link)</label><input id="fileSource" placeholder="https://www.figma.com/design/..."></div>
@@ -115,7 +115,7 @@ let mode='watch',fileKeyKnown=false,connectedNow=false
 let bridgeWanted=false,bridgeConfig=null,sessionId=null,sessionSecret=null,pollController=null,heartbeatTimer=null,reconnectTimer=null,reconnectDelay=750
 let pairing=null,pairTimer=null
 // waitingForBridge: nothing answers at the bridge URL yet, which is normal until
-// Claude Code or npm start runs. tokenRejected: the bridge refused the saved
+// Claude Code or figma-bridge start runs. tokenRejected: the bridge refused the saved
 // token, so only pairing or a new token can help.
 let waitingForBridge=false,tokenRejected=false
 // invalidating: an invalidate request is in flight. invalidateNext: the latest
@@ -186,7 +186,7 @@ async function sendToServer(data,requestId){
     // A failed fetch is either no bridge at all or a bridge that cut the upload off.
     const failed=err.name==='TypeError',offline=failed&&!(await bridgeAnswers(base))
     const message=err.name==='AbortError'?'Sync timed out after 30 seconds. Try Sync page again.'
-      :offline?'No bridge is running at '+base+'. Open Claude Code with the figma-bridge plugin, or run npm start, then sync again.'
+      :offline?'No bridge is running at '+base+'. Open Claude Code with the figma-bridge plugin, or run figma-bridge start, then sync again.'
       :failed?'The bridge at '+base+' dropped the upload, most likely because it is larger than the bridge accepts (FIGMA_BRIDGE_MAX_BODY_BYTES). Try Sync selection.'
       :err.message
     showError(failed?message:message+'\\nCheck the bridge at '+base+'.')
@@ -201,7 +201,7 @@ async function bridgeAnswers(base){
 }
 function waitingHint(){
   const url=bridgeConfig?String(bridgeConfig.url||'').replace(new RegExp('/+$'),''):bridgeBase()
-  let text='Nothing answers at '+url+' yet. The bridge starts with Claude Code (figma-bridge plugin) or npm start, and this panel connects as soon as it is up.'
+  let text='Nothing answers at '+url+' yet. The bridge starts with Claude Code (figma-bridge plugin) or figma-bridge start, and this panel connects as soon as it is up.'
   // The manifest lets the plugin reach this one address only.
   if(url!==SERVER_URL) text+=' This plugin can only reach '+SERVER_URL+': reset the Bridge URL under Advanced.'
   return text
@@ -358,14 +358,14 @@ async function startPairing(){
     r=await fetch(base+'/bridge/pair',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({clientName:'Figma Design Bridge plugin',fileName:(q('pageName').textContent||'').slice(0,200)})})
     try{body=await r.json()}catch{}
   }catch(err){
-    showError('No bridge is running at '+base+'. Open Claude Code with the figma-bridge plugin, or run npm start, then press Pair with bridge again.')
+    showError('No bridge is running at '+base+'. Open Claude Code with the figma-bridge plugin, or run figma-bridge start, then press Pair with bridge again.')
     return
   }
   if(!r.ok||!body||!body.code){showError((body&&body.error)||('Bridge HTTP '+r.status));return}
   pairing={id:body.pairingId,secret:body.pairingSecret,code:body.code,expiresAt:Date.parse(body.expiresAt)||Date.now()+120000,base}
   q('pairCode').textContent=pairing.code.slice(0,3)+' '+pairing.code.slice(3)
   q('pairCommand').textContent='/figma-bridge:pair '+pairing.code
-  q('pairCli').textContent='npm run bridge:pair -- '+pairing.code
+  q('pairCli').textContent='figma-bridge pair '+pairing.code
   toggle('pairInfo',true)
   q('pairBtn').disabled=true
   showExpiry()

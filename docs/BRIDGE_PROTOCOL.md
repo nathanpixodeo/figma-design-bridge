@@ -1,10 +1,10 @@
 # Bridge Protocol (`/bridge/*`)
 
 Status: **implemented and accepted in a real Figma session on Windows.** Both
-`npm start` and the MCP server mount these routes, and the Figma plugin's
+`figma-bridge start` and the MCP server mount these routes, and the Figma plugin's
 **Open Design Bridge** panel pairs, opens a session and answers reads. See
 [Known limitations](#known-limitations) and
-[the implementation plan](./PLAN_PLUGIN_ON_DEMAND_MCP.md).
+[the implementation plan](https://github.com/nathanpixodeo/figma-design-bridge/blob/main/docs/PLAN_PLUGIN_ON_DEMAND_MCP.md).
 
 This document describes the request-driven bridge: a shared loopback daemon that
 lets an MCP client paste a Figma node URL and read that node live, out of the
@@ -447,7 +447,7 @@ connected, `setupHints` explains what to do.
 How the Figma plugin obtains the bridge token without anyone copying it. The
 plugin asks to pair and shows the 6-digit code it gets back. Someone who already
 holds the token approves that code (`approve_figma_pairing` in an MCP client, or
-`npm run bridge:pair -- <code>` in a terminal), and the plugin then collects the
+`figma-bridge pair <code>` in a terminal), and the plugin then collects the
 token once.
 
 Asking and collecting cannot require the token, so they rely on the code

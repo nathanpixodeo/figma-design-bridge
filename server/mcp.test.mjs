@@ -13,10 +13,12 @@ import createSnapshotStore from "./snapshot-store.js";
 import daemonModule from "./bridge/daemon.js";
 import dataDirModule from "./data-dir.js";
 import tokenModule from "./bridge/token.js";
+import toolPolicy from "./tool-policy.js";
 
 const { createDaemon } = daemonModule;
 const { rotateToken } = tokenModule;
 const { describeDataDir, userDataDir } = dataDirModule;
+const { READ_TOOLS } = toolPolicy;
 
 // Every test runs the MCP server the way Claude Code does — a stdio child
 // process — on a free port and a temporary data directory, so the bridge on
@@ -130,6 +132,18 @@ test("the bridge an MCP server starts accepts the plugin's /design sync, and the
   const { tools } = await client.listTools();
   const context = tools.find(tool => tool.name === "get_design_context");
   assert.equal(context._meta?.["anthropic/maxResultSizeChars"], 500000);
+
+  // Codex runs a tool marked read-only without asking; pairing and a REST sync
+  // must still ask.
+  const hints = Object.fromEntries(tools.map(tool => [tool.name, tool.annotations]));
+  for (const name of READ_TOOLS) {
+    assert.deepEqual(hints[name], { readOnlyHint: true, destructiveHint: false, openWorldHint: false }, name);
+  }
+  assert.equal(hints.approve_figma_pairing.readOnlyHint, false);
+  assert.equal(hints.approve_figma_pairing.destructiveHint, true);
+  assert.equal(hints.sync_figma_design.readOnlyHint, false);
+  assert.equal(hints.sync_figma_design.openWorldHint, true);
+  assert.equal(tools.length, READ_TOOLS.length + 2);
 
   const anonymous = await fetch(`http://127.0.0.1:${port}/design`);
   assert.equal(anonymous.status, 401);

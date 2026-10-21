@@ -10,12 +10,12 @@ Three controls apply to every route in this document. They exist because a loopb
 
 1. **Loopback bind.** The listener binds `127.0.0.1` and nothing else. `FIGMA_BRIDGE_HOST` overrides it — the server warns at startup when the result is not loopback — but on a shared network that exposes the port to everyone who can reach it.
 2. **Loopback `Host` header.** A request whose `Host` names anything else gets `403`. This is what defeats DNS rebinding, where `attacker.example` resolves to `127.0.0.1` and the browser still sends the attacker's host name.
-3. **Bridge token.** Every route except `GET /` and `GET /health` requires the token, sent as `Authorization: Bearer <token>` or `X-Bridge-Token: <token>`. Without it the response is `401`. `npm run bridge:token` prints the token; `npm run bridge:token:rotate` replaces it.
+3. **Bridge token.** Every route except `GET /` and `GET /health` requires the token, sent as `Authorization: Bearer <token>` or `X-Bridge-Token: <token>`. Without it the response is `401`. `figma-bridge token` prints the token; `figma-bridge token --rotate` replaces it.
 
 A request carrying a cross-origin `Origin` header is refused with `403`, and no response ever carries `Access-Control-Allow-Origin: *`. An allowed origin is echoed back verbatim alongside `Vary: Origin`, except on the open routes `GET /` and `GET /health`, which never carry a CORS header. The allow-list is the opaque origin `null`, which is what the Figma plugin's iframe sends, plus `http://localhost` and `http://127.0.0.1` at any port. Because a hostile page can also produce `Origin: null` from a sandboxed iframe, the origin check is defence in depth and the token is what actually separates the two.
 
 ```bash
-curl -H "Authorization: Bearer $(npm run --silent bridge:token)" http://127.0.0.1:3456/design
+curl -H "Authorization: Bearer $(figma-bridge token)" http://127.0.0.1:3456/design
 ```
 
 > **Breaking change in 1.1.0.** These routes used to answer without a token and returned `Access-Control-Allow-Origin: *`. `FIGMA_BRIDGE_ALLOW_ANONYMOUS_LEGACY=1` restores the old token-free behaviour for scripts that cannot be updated yet; the server then warns at every startup, and the `Host` and `Origin` checks still apply. See [SECURITY.md](../SECURITY.md).
@@ -24,7 +24,7 @@ curl -H "Authorization: Bearer $(npm run --silent bridge:token)" http://127.0.0.
 
 > **Scope of this document.** Everything below describes the snapshot-based REST-import server, which keeps one global "current design" that each sync replaces. The request-driven plugin bridge is a separate surface under the `/bridge/` prefix with per-file isolation and freshness rules of its own — see [BRIDGE_PROTOCOL.md](./BRIDGE_PROTOCOL.md).
 >
-> These routes are served by whichever process owns the port: `npm start`, or an MCP server (`server/mcp.mjs`) that started the bridge itself. Both keep the current design in `<dataDir>/latest.json` and reload it when another process writes a newer one.
+> These routes are served by whichever process owns the port: `figma-bridge start`, or an MCP server (`server/mcp.mjs`) that started the bridge itself. Both keep the current design in `<dataDir>/latest.json` and reload it when another process writes a newer one.
 
 ---
 
@@ -123,7 +123,7 @@ Common causes are a missing/invalid token, missing `file_content:read` scope, no
 
 ## `POST /design`
 
-Receive already-normalized bridge data. The legacy Figma plugin and the `import:figma` CLI use this endpoint.
+Receive already-normalized bridge data. The legacy Figma plugin and `figma-bridge import` use this endpoint.
 
 The panel's **Sync page** button and **Quick Sync → Sync Full Page** post a `type: "page"` snapshot of the current page: all roots and descendants, regardless of selection (subject to the serializer's 30-level depth limit). With **Auto-sync page changes** on, edits and page switches re-sync it, debounced. **Sync selection** and **Quick Sync → Sync Selected Nodes** post `type: "selection"` with the selected subtrees. These are complete snapshots, not incremental patches: each successful POST replaces the current design rather than merging pages or selections. Previously synced data remains in retained snapshots. Auto-sync needs the panel open; reading an arbitrary node from a Figma URL is what the live `/bridge/*` reads do.
 

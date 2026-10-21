@@ -7,7 +7,7 @@ const path = require('node:path')
 
 const { createDaemon } = require('./bridge/daemon')
 
-// `npm run bridge:pair -- <code>` approves a waiting Figma plugin from the
+// `figma-bridge pair <code>` approves a waiting Figma plugin from the
 // terminal, using the token from the same data directory as the bridge.
 
 function run(args, env) {
@@ -57,7 +57,7 @@ test('the terminal command explains a missing, malformed or unknown code', async
 
   const usage = await run([], env)
   assert.equal(usage.code, 2)
-  assert.match(usage.stderr, /Usage: npm run bridge:pair/)
+  assert.match(usage.stderr, /Usage: figma-bridge pair/)
 
   const unknown = await run(['123456'], env)
   assert.equal(unknown.code, 1)

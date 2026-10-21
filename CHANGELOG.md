@@ -4,6 +4,59 @@ All notable changes to Figma Design Bridge. Versions follow
 [Semantic Versioning](https://semver.org/); the Claude Code plugin, the
 marketplace entry and both `package.json` files always carry the same number.
 
+## [1.4.0] - 2026-10-21
+
+One command installs everything, a `figma-bridge` command works from any
+directory, and design reads stop asking for permission.
+
+### Upgrading
+
+- Run `npx -y @pixodeo/figma-bridge@latest setup` once. It installs the
+  `figma-bridge` command and updates the plugin in Claude Code and Codex. A
+  Claude Code or Codex marketplace you added from GitHub stays in use.
+- Figma keeps loading the plugin from the manifest you imported, which a clone
+  updates with `git pull`. To have `figma-bridge update` update it instead,
+  remove the development plugin in Figma and import the `manifest.json` path
+  setup prints.
+- Codex set up by hand before 1.4.0 (`codex mcp add figma-bridge …`) would run
+  the bridge twice. Setup says so; remove it with `codex mcp remove figma-bridge`.
+- Settings move to `config.json` in the data directory. `server/config.json` in
+  a clone is still read, never written; the file in the data directory wins.
+
+### Added
+
+- The `@pixodeo/figma-bridge` npm package and its `figma-bridge` command:
+  `setup`, `status`, `approvals`, `update`, `start`, `mcp`, `pair`, `token` and
+  `import`, from any directory. The `npm start` and `npm run bridge:*` scripts
+  keep working in a clone.
+- `figma-bridge setup` installs the plugin into Claude Code and Codex from the
+  package's own marketplace, registers the MCP server with agy, creates the
+  pairing token and prints the Figma manifest path. Clients that are not on
+  `PATH` are skipped; `--only` picks some. Running it again updates, and keeps
+  a plugin you turned off turned off and the environment of agy's server. The
+  first time it changes a client's config file, it keeps a copy ending in
+  `.figma-bridge.bak`.
+- `figma-bridge status` shows the version, the data directory and where it came
+  from, whether a token exists (never the token), who holds the port and which
+  Figma files are connected, and each client.
+- Approvals, `auto` by default: Claude Code, Codex and agy run the eight read
+  tools without a prompt. Pairing and REST sync always ask.
+  `figma-bridge approvals manual` makes every tool ask again. The MCP tools now
+  carry `readOnlyHint`, `destructiveHint` and `openWorldHint` annotations, and
+  the Claude Code plugin ships a `PreToolUse` hook for the read tools.
+- CI checks what `npm pack` would publish and runs the packed command; a
+  manual release workflow publishes to npm.
+
+### Changed
+
+- The server no longer creates `server/config.json`, so it runs from a
+  read-only install.
+- Messages, the Figma panel and the docs name `figma-bridge` commands instead of
+  `npm run` scripts.
+- `@modelcontextprotocol/sdk` 1.32.1 or later, which fixes the advisories
+  against 1.31.0 and earlier. The bridge uses only the stdio transport, which
+  they do not affect.
+
 ## [1.3.2] - 2026-10-19
 
 Keeps a large live read from freezing Figma or losing the panel. Nothing to

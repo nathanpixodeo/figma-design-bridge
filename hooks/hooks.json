@@ -1,0 +1,17 @@
+{
+  "description": "Lets Figma Design Bridge reads run without a permission prompt while approvals is auto (figma-bridge approvals). Pairing and REST sync always ask.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "^mcp__plugin_figma-bridge_bridge__(get_design_context|get_design_summary|get_design_tree|get_design_texts|get_design_colors|search_design|get_design_info|get_bridge_status)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/allow-reads.js\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

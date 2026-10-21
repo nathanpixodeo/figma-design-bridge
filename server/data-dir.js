@@ -23,6 +23,7 @@ const DEFAULT_CONFIG_PATH = path.join(__dirname, 'config.json')
 // also wrote this path into config.json as its default.
 const LEGACY_DATA_DIR = path.join(__dirname, 'data')
 const TOKEN_FILENAME = 'bridge-token.json'
+const CONFIG_FILENAME = 'config.json'
 const SNAPSHOT_FILENAME = 'latest.json'
 const SNAPSHOTS_DIRNAME = 'snapshots'
 // The current design carries over whole, but only the newest snapshots of the
@@ -60,7 +61,7 @@ function samePath(a, b) {
 function configuredDataDir(configPath) {
   try {
     if (fs.existsSync(configPath)) {
-      const config = JSON.parse(fs.readFileSync(configPath, 'utf8'))
+      const config = parseConfigText(fs.readFileSync(configPath, 'utf8'))
       if (config.dataDir) return config.dataDir
     }
   } catch {
@@ -114,6 +115,57 @@ function describeDataDir(options = {}) {
 
 function resolveDataDir(options = {}) {
   return describeDataDir(options).dataDir
+}
+
+// The settings every launcher reads: config.json in the data directory, over the
+// config.json a clone keeps next to the code. It never writes one: a global
+// install can be read-only, and a client must not mint a file by being run.
+function readConfig(options = {}) {
+  const log = options.log || (() => {})
+  const dataDir = options.dataDir || resolveDataDir(options)
+  let config = {}
+  for (const file of [options.configPath || DEFAULT_CONFIG_PATH, path.join(dataDir, CONFIG_FILENAME)]) {
+    try {
+      if (!fs.existsSync(file)) continue
+      const parsed = parseConfigText(fs.readFileSync(file, 'utf8'))
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) config = { ...config, ...parsed }
+    } catch (error) {
+      log(`Ignored ${file}: ${error.message}`)
+    }
+  }
+  return config
+}
+
+// Notepad saves UTF-8 with a byte order mark, which JSON.parse rejects.
+function parseConfigText(text) {
+  return JSON.parse(text.charCodeAt(0) === 0xfeff ? text.slice(1) : text)
+}
+
+// Merges changes into config.json in the data directory, for the CLI. A file it
+// cannot parse is left alone rather than replaced.
+function writeConfig(changes, options = {}) {
+  const dataDir = options.dataDir || resolveDataDir(options)
+  const file = path.join(dataDir, CONFIG_FILENAME)
+  let current = {}
+  if (fs.existsSync(file)) {
+    try {
+      current = parseConfigText(fs.readFileSync(file, 'utf8'))
+    } catch (error) {
+      throw new Error(`cannot read ${file} (${error.message}); fix or delete it, then run the command again`)
+    }
+    if (!current || typeof current !== 'object' || Array.isArray(current)) {
+      throw new Error(`cannot read ${file} (it does not hold a JSON object); fix or delete it, then run the command again`)
+    }
+  }
+  fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 })
+  const temp = path.join(dataDir, `.${CONFIG_FILENAME}.${process.pid}.tmp`)
+  try {
+    fs.writeFileSync(temp, JSON.stringify({ ...current, ...changes }, null, 2) + '\n')
+    renameWithRetry(temp, file)
+  } finally {
+    removeQuietly(temp)
+  }
+  return file
 }
 
 function hasFile(dir, name) {
@@ -296,6 +348,8 @@ module.exports = {
   describeDataDir,
   prepareDataDir,
   migrateDataDir,
+  readConfig,
+  writeConfig,
   userDataDir,
   samePath,
   DEFAULT_CONFIG_PATH,

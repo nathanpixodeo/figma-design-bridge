@@ -291,7 +291,7 @@ function createLegacyRoutes({
     if (!LEGACY_OPEN_PATHS.has(p) && !isAuthorized(req)) {
       sendJSON(res, 401, {
         error: 'A bridge token is required for this route.',
-        hint: 'Run `npm run bridge:token` and send it as `Authorization: Bearer <token>`.',
+        hint: 'Run `figma-bridge token` and send it as `Authorization: Bearer <token>`.',
       })
       return
     }

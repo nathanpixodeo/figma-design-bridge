@@ -855,7 +855,7 @@ test('the panel shows a pairing code, collects the token once approved and hands
   assert.equal(calls[0].method, 'POST')
   assert.equal(panel.element('pairCode').textContent, '482 913')
   assert.equal(panel.element('pairCommand').textContent, '/figma-bridge:pair 482913')
-  assert.equal(panel.element('pairCli').textContent, 'npm run bridge:pair -- 482913')
+  assert.equal(panel.element('pairCli').textContent, 'figma-bridge pair 482913')
 
   panel.time.flush()
   await settleUi()

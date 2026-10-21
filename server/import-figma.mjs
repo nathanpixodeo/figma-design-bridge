@@ -1,30 +1,24 @@
 #!/usr/bin/env node
-import fs from "node:fs";
 import figmaApi from "./figma-api.js";
 import dataDirModule from "./data-dir.js";
 import tokenModule from "./bridge/token.js";
 
 const { fetchFigmaDesign } = figmaApi;
-const { prepareDataDir } = dataDirModule;
+const { prepareDataDir, readConfig } = dataDirModule;
 const { readToken } = tokenModule;
 const source = process.argv[2];
 
 if (!source || source === "--help" || source === "-h") {
-  console.error("Usage: npm run import:figma -- <figma-url-or-file-key>");
+  console.error("Usage: figma-bridge import <figma-url-or-file-key>");
   console.error("Requires FIGMA_ACCESS_TOKEN and a running bridge server/MCP HTTP endpoint.");
   process.exit(source ? 0 : 1);
 }
 
-// The port the server listens on: FIGMA_BRIDGE_PORT, then server/config.json.
+// The port the server listens on: FIGMA_BRIDGE_PORT, then config.json.
 function resolvePort() {
   if (process.env.FIGMA_BRIDGE_PORT) return process.env.FIGMA_BRIDGE_PORT;
-  try {
-    const config = JSON.parse(fs.readFileSync(dataDirModule.DEFAULT_CONFIG_PATH, "utf8"));
-    if (config.port) return String(config.port);
-  } catch {
-    // No config file, or an unreadable one: the default port.
-  }
-  return "3456";
+  const { port } = readConfig();
+  return port ? String(port) : "3456";
 }
 
 // POST /design requires the bridge token. An explicit FIGMA_BRIDGE_TOKEN wins so
@@ -53,7 +47,7 @@ try {
   const result = await response.json().catch(() => ({}));
   if (response.status === 401) {
     throw new Error(
-      "The bridge rejected the token. Run `npm run bridge:token` and either export " +
+      "The bridge rejected the token. Run `figma-bridge token` and either export " +
       "FIGMA_BRIDGE_TOKEN or point FIGMA_BRIDGE_DATA_DIR at the directory the server uses."
     );
   }

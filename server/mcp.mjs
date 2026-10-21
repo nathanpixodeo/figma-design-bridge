@@ -5,9 +5,7 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import fs from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
 import figmaApi from "./figma-api.js";
 
@@ -17,15 +15,11 @@ const { startOrReuse } = require("./bridge/daemon.js");
 const { createClient } = require("./bridge/client.js");
 const createSnapshotStore = require("./snapshot-store.js");
 const createLegacyRoutes = require("./legacy-routes.js");
-const { prepareDataDir } = require("./data-dir.js");
+const { prepareDataDir, readConfig } = require("./data-dir.js");
+const { READ_TOOLS } = require("./tool-policy.js");
 const { version: PACKAGE_VERSION } = require("./package.json");
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-let fileConfig = {};
-try {
-  const configPath = path.join(__dirname, "config.json");
-  if (fs.existsSync(configPath)) fileConfig = JSON.parse(fs.readFileSync(configPath, "utf8"));
-} catch { /* fall back to defaults */ }
+const fileConfig = readConfig({ log: message => log(message) });
 const PORT = parseInt(process.env.FIGMA_BRIDGE_PORT || fileConfig.port || "3456", 10);
 const HOST = process.env.FIGMA_BRIDGE_HOST || fileConfig.host || "127.0.0.1";
 // The directory every launcher shares unless FIGMA_BRIDGE_DATA_DIR or
@@ -33,7 +27,7 @@ const HOST = process.env.FIGMA_BRIDGE_HOST || fileConfig.host || "127.0.0.1";
 const { dataDir: DATA_DIR } = prepareDataDir({ log: message => log(message) });
 const MAX_SNAPSHOTS = parseInt(process.env.FIGMA_BRIDGE_MAX_SNAPSHOTS || fileConfig.maxSnapshots || "50", 10);
 const MAX_BODY_BYTES = parseInt(process.env.FIGMA_BRIDGE_MAX_BODY_BYTES || fileConfig.maxBodyBytes || "50000000", 10);
-// The bridge cache's byte budget, as npm start reads it; this process usually owns the bridge.
+// The bridge cache's byte budget, as figma-bridge start reads it; this process usually owns the bridge.
 const CACHE_MAX_BYTES = require("./bridge/cache.js").resolveMaxBytes(
   process.env.FIGMA_BRIDGE_CACHE_MAX_BYTES || fileConfig.cacheMaxBytes,
   message => log(message),
@@ -46,7 +40,7 @@ function log(...args) {
 
 // ── Snapshot store ─────────────────────────────────────────
 
-// Shared with the legacy routes below and with any `npm start` server using the
+// Shared with the legacy routes below and with any `figma-bridge start` server using the
 // same data directory: a sync written by either is visible to these tools.
 const store = createSnapshotStore({
   dataDir: DATA_DIR,
@@ -377,6 +371,19 @@ const SOURCE_PROPERTIES = {
 
 // ── MCP server ─────────────────────────────────────────────
 
+// Hints for the client's approval policy: Codex runs a read-only tool without
+// asking. Pairing hands a Figma plugin the bridge token, so it is marked
+// destructive and always asks; a REST sync reaches Figma, so it asks too.
+const READ_ANNOTATIONS = { readOnlyHint: true, destructiveHint: false, openWorldHint: false };
+const WRITE_ANNOTATIONS = {
+  approve_figma_pairing: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
+  sync_figma_design: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
+};
+const annotate = tools => tools.map(tool => ({
+  ...tool,
+  annotations: READ_TOOLS.includes(tool.name) ? READ_ANNOTATIONS : WRITE_ANNOTATIONS[tool.name],
+}));
+
 async function startMCP() {
   const mcp = new Server(
     { name: "Figma Design Bridge", version: PACKAGE_VERSION },
@@ -384,7 +391,7 @@ async function startMCP() {
   );
 
   mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: [
+    tools: annotate([
       {
         name: "get_design_context",
         description: "Read a Figma file or exact node through the connected Figma plugin. A node URL returns that node and subtree; a file URL returns a lightweight document index. Live mode never silently falls back to REST or stale cache.",
@@ -470,7 +477,7 @@ async function startMCP() {
         description: "Get basic info for an explicit Figma source or the legacy imported snapshot.",
         inputSchema: { type: "object", properties: { ...SOURCE_PROPERTIES } },
       },
-    ],
+    ]),
   }));
 
   const callTool = async req => {
@@ -653,7 +660,7 @@ function onStdinClosed() {
   if (clientConnected) {
     shutdown("the MCP client closed stdin");
   } else {
-    log("stdin closed before any MCP client connected; hosting the bridge until stopped. `npm start` does this without the MCP server.");
+    log("stdin closed before any MCP client connected; hosting the bridge until stopped. `figma-bridge start` does this without the MCP server.");
   }
 }
 process.stdin.on("end", onStdinClosed);

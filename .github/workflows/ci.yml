@@ -64,6 +64,10 @@ jobs:
             if (serverPkg.version !== plugin.version) {
               throw new Error('version drift: server/package.json ' + serverPkg.version + ' vs plugin.json ' + plugin.version)
             }
+            const lock = JSON.parse(fs.readFileSync('package-lock.json', 'utf8'))
+            if (lock.name !== pkg.name || lock.version !== pkg.version || lock.packages[''].version !== pkg.version) {
+              throw new Error('package-lock.json is out of date: run npm install --package-lock-only')
+            }
             for (const dir of plugin.commands || []) {
               if (!fs.existsSync(dir)) throw new Error('commands directory is missing: ' + dir)
             }
@@ -73,3 +77,61 @@ jobs:
             if (!script || !fs.existsSync(script)) throw new Error('MCP entry point is missing: ' + script)
             console.log('manifests agree on version ' + plugin.version)
           "
+
+  package:
+    name: npm package (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # npm installs the bin as a shell script on POSIX and a .cmd shim on
+        # Windows, and the CLI starts the clients' shims the same way.
+        os: [ubuntu-latest, windows-latest]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # What npm publishes is what every install runs. The allowlist in
+      # package.json decides it, so check that it carries what the CLI, the
+      # Figma plugin and the Claude Code plugin need, and nothing private.
+      - name: Check what npm pack would publish
+        run: |
+          npm pack --dry-run --json > pack.json
+          node -e "
+            const fs = require('fs')
+            const files = JSON.parse(fs.readFileSync('pack.json', 'utf8'))[0].files.map(file => file.path)
+            const required = [
+              'bin/figma-bridge.js', 'server/cli/index.js', 'server/mcp.mjs', 'server/index.js',
+              'plugin/manifest.json', 'plugin/code.js', '.claude-plugin/plugin.json',
+              '.claude-plugin/marketplace.json', 'hooks/hooks.json', 'hooks/allow-reads.js',
+              'integrations/claude-code/commands/pair.md', 'README.md', 'LICENSE',
+            ]
+            const missing = required.filter(file => !files.includes(file))
+            if (missing.length) throw new Error('missing from the package: ' + missing.join(', '))
+            const forbidden = files.filter(file =>
+              /\.test\.|(^|\/)config\.json$|^server\/data\/|\.log$|\.tmp$|bridge-token\.json$|(^|\/)\.env|^\.gitnexus\/|^\.claude\//.test(file))
+            if (forbidden.length) throw new Error('must not be published: ' + forbidden.join(', '))
+            console.log(files.length + ' files, all required ones present')
+          "
+
+      - name: Install the packed tarball globally and run it
+        run: |
+          npm pack
+          npm install --global ./pixodeo-figma-bridge-*.tgz
+          cd "$RUNNER_TEMP"
+          figma-bridge --version
+          FIGMA_BRIDGE_DATA_DIR="$RUNNER_TEMP/data" figma-bridge token | grep -Eq '^[0-9a-f]{64}$'
+          FIGMA_BRIDGE_DATA_DIR="$RUNNER_TEMP/data" figma-bridge status
+
+      # Git Bash runs npm's shell script; Command Prompt and PowerShell run the
+      # .cmd shim, which is what most Windows users start.
+      - name: Run the .cmd shim
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: figma-bridge --version

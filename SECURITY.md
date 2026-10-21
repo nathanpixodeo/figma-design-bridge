@@ -36,8 +36,8 @@ or `~/.local/share/figma-design-bridge`. Upgrading to 1.3.0 copies the token
 there from the previous directory and leaves the old copy in place; delete the
 old directory once nothing older than 1.3.0 uses it. The token is the one control that
 separates the Figma plugin's iframe from a hostile page's sandboxed iframe, since
-both post from the opaque origin `null`. `npm run bridge:token` prints it;
-`npm run bridge:token:rotate` replaces it and unpairs every plugin: a running
+both post from the opaque origin `null`. `figma-bridge token` prints it;
+`figma-bridge token --rotate` replaces it and unpairs every plugin: a running
 bridge reads the token file on each request, so it stops accepting the old token
 at once, without a restart. The token must never appear in a log line, a URL, a
 health response or a commit.
@@ -45,7 +45,7 @@ health response or a commit.
 **Pairing.** The Figma plugin can also obtain the token by pairing: it asks the
 bridge for a 6-digit code, and someone who already holds the token approves that
 code in Claude Code (`approve_figma_pairing`) or a terminal
-(`npm run bridge:pair -- <code>`). Asking needs no credential, so a web page can
+(`figma-bridge pair <code>`). Asking needs no credential, so a web page can
 ask too; it never receives the token unless a person approves its code. Codes
 are shown only to the requester, never in a log line or a status response,
 expire after two minutes, and are limited to three waiting and ten requested per
@@ -67,9 +67,67 @@ and any error inside a handler becomes a `500` for that request only.
 
 The only runtime dependency is `@modelcontextprotocol/sdk`, and the bridge uses
 its stdio transport alone; the SDK's HTTP server stack (Express, Hono) is
-installed but never started. `package-lock.json` pins patched versions of that
-stack anyway, and `npm audit --omit=dev` reports no known vulnerability as of
-1.3.1. Installs follow the lockfile, so they get the patched versions.
+installed but never started. 1.4.0 requires SDK 1.32.1 or later, which fixes
+the advisories against 1.31.0 and earlier, and `npm audit --omit=dev` reports no
+known vulnerability as of 1.4.0. A clone installs what `package-lock.json` pins.
+`npm install -g @pixodeo/figma-bridge` does not read the lockfile: it resolves
+the newest versions the package's ranges allow at install time, and
+`figma-bridge update` resolves them again.
+
+## Approvals and client configuration
+
+With approvals set to `auto`, the default, Claude Code, Codex and agy run the
+read tools (`get_design_*`, `search_design`, `get_bridge_status`) without a
+permission prompt. They read the local cache or the open Figma document and
+change nothing. `approve_figma_pairing` hands a Figma plugin the bridge token
+and `sync_figma_design` calls the Figma API, so neither is ever allowed
+automatically:
+
+- The Claude Code hook (`hooks/allow-reads.js`) matches the eight read tools by
+  their exact names, and says nothing for any other tool, for `manual`, or when
+  it cannot read its input or `config.json`. Claude Code then asks as usual. A
+  deny or ask rule of the user's own still wins over the hook. The names start
+  with `mcp__plugin_figma-bridge_bridge__`, which names a plugin and its server,
+  not where they came from: another plugin installed under the name
+  `figma-bridge` with a server called `bridge` would get the same tool names,
+  and its reads with those names would run without a prompt too.
+- For Codex, the read tools carry `readOnlyHint: true`; pairing carries
+  `destructiveHint: true` and sync `openWorldHint: true`, so Codex asks for both.
+- For agy, setup adds the two of them to `permissions.ask`, which outranks any
+  broad allow rule such as `mcp(*)`.
+
+Design content can contain text written to steer an agent. Approvals do not
+change what such text can reach: a read returns it to the agent either way, and
+pairing still needs a code the user reads from the Figma panel.
+
+`figma-bridge setup` changes the following. `figma-bridge approvals` changes only
+`approvals` in `config.json`, `default_tools_approval_mode` in Codex and the agy
+permission rules.
+
+- The [data directory](#what-this-software-exposes): `approvals` in
+  `config.json`, and `bridge-token.json` when there is no token yet.
+- Claude Code and Codex: the `figma-design-bridge` marketplace and the
+  `figma-bridge` plugin, through their own `plugin` commands. A client may copy
+  the plugin, `node_modules` included, into its own plugin cache. A marketplace
+  whose folder no longer exists is removed and added again from this install.
+- agy: the `figma-bridge` server in `~/.gemini/config/mcp_config.json`, through
+  `agy mcp add` the first time. Later runs change only its command and
+  arguments, and keep its environment and whether it is turned off.
+- `$CODEX_HOME/config.toml`: `default_tools_approval_mode` for this bridge's
+  server, and `enabled = false` put back on the plugin when it was off before
+  `codex plugin add`. The edit is line by line, so comments and layout stay;
+  setup stops with an error naming the file instead when the file holds these
+  tables in a form it cannot edit safely: twice, or through dotted keys or an
+  inline table. For a plugin that was off, it checks this before
+  `codex plugin add` turns the plugin on.
+- `~/.gemini/antigravity-cli/settings.json`: the `mcp(figma-bridge/...)` rules
+  in `permissions.allow` and `permissions.ask`. The file is parsed and written
+  back as JSON, so its own formatting is not kept; a file that does not parse is
+  left alone and reported.
+
+The first time setup changes one of these files, it keeps the file as it was
+next to it, with `.figma-bridge.bak` added to the name. Later changes leave that
+copy alone.
 
 ## Known weakening you can opt into
 

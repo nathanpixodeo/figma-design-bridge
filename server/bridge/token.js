@@ -113,7 +113,7 @@ function stampOf(filePath) {
 }
 
 // The token a running bridge accepts follows bridge-token.json, so
-// `npm run bridge:token:rotate` revokes the old token at once rather than at the
+// `figma-bridge token --rotate` revokes the old token at once rather than at the
 // bridge's next restart. Each call costs one stat; the file is read again only
 // when it changed. A missing or unreadable file keeps the last good token
 // instead of locking everyone out.

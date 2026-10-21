@@ -1,35 +1,27 @@
 #!/usr/bin/env node
 // Approves a Figma plugin that asked to pair, from the terminal:
 //
-//   npm run bridge:pair -- 482913
+//   figma-bridge pair 482913
 //
 // The code is the one the plugin shows after "Pair with bridge". Approving it
 // hands that plugin the bridge token, so only approve a code you see in Figma.
 // The token is read from the same data directory the server uses, or from
 // FIGMA_BRIDGE_TOKEN; FIGMA_BRIDGE_URL overrides the bridge address.
 
-const fs = require('fs')
 const { readToken } = require('./bridge/token')
 const { normalizeCode } = require('./bridge/pairing')
-const { prepareDataDir, DEFAULT_CONFIG_PATH } = require('./data-dir')
+const { prepareDataDir, readConfig } = require('./data-dir')
 
 function resolvePort(env = process.env) {
   if (env.FIGMA_BRIDGE_PORT) return env.FIGMA_BRIDGE_PORT
-  try {
-    if (fs.existsSync(DEFAULT_CONFIG_PATH)) {
-      const config = JSON.parse(fs.readFileSync(DEFAULT_CONFIG_PATH, 'utf8'))
-      if (config.port) return String(config.port)
-    }
-  } catch {
-    // Fall through to the default port.
-  }
-  return '3456'
+  const { port } = readConfig()
+  return port ? String(port) : '3456'
 }
 
 async function main() {
   const code = normalizeCode(process.argv.slice(2).join(''))
   if (!code) {
-    process.stderr.write('Usage: npm run bridge:pair -- <the 6-digit code shown in the Figma plugin>\n')
+    process.stderr.write('Usage: figma-bridge pair <the 6-digit code shown in the Figma plugin>\n')
     process.exit(2)
   }
 
@@ -37,7 +29,7 @@ async function main() {
   const stored = readToken(dataDir)
   const token = (process.env.FIGMA_BRIDGE_TOKEN || (stored && stored.token) || '').trim()
   if (!token) {
-    process.stderr.write(`No bridge token in ${dataDir}. Start the bridge once (open Claude Code with the figma-bridge plugin, or run npm start), or set FIGMA_BRIDGE_DATA_DIR to the directory it uses.\n`)
+    process.stderr.write(`No bridge token in ${dataDir}. Start the bridge once (open Claude Code with the figma-bridge plugin, or run figma-bridge start), or set FIGMA_BRIDGE_DATA_DIR to the directory it uses.\n`)
     process.exit(1)
   }
 

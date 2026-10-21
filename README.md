@@ -27,37 +27,152 @@ Neither path needs a Figma token to *read* the cache, but both need the local
 unrelated: the Figma one authenticates you to Figma, the bridge one keeps other
 programs on your machine out of your design data.
 
-A third, request-driven path is the one [Fastest setup](#fastest-setup-claude-code--figma-nothing-to-copy)
+A third, request-driven path is the one [Install](#install)
 uses: a plugin-first bridge where you paste any node URL and the agent reads that
 node live from the open Figma document, with no REST token and no manual Sync
 click. See [Request-Driven Plugin Bridge](#request-driven-plugin-bridge-phase-1).
 
-## Fastest setup: Claude Code + Figma, nothing to copy
+## Install
 
-1. Install the Claude Code plugin. It runs the bridge for you:
-   ```bash
-   claude plugin marketplace add nathanpixodeo/figma-design-bridge
-   claude plugin install figma-bridge@figma-design-bridge
-   ```
-2. In Figma desktop, import `plugin/manifest.json` from a clone of this repository
-   once (**Plugins → Development → Import plugin from manifest…**). Open your file
-   and run **Plugins → Development → Design Bridge → Open Design Bridge**.
-3. Press **Pair with bridge**. The panel shows a 6-digit code. In Claude Code, run
-   `/figma-bridge:pair <code>`. The panel saves the token and connects.
+One command, on any machine with [Node.js](https://nodejs.org/) 20 or later:
+
+```bash
+npx -y @pixodeo/figma-bridge@latest setup
+```
+
+It installs the `figma-bridge` command globally, creates the pairing token, and
+sets up every AI client it finds on `PATH`:
+
+- **Claude Code**: installs the `figma-bridge` plugin, which carries the MCP
+  server, the [slash commands](#install-as-a-claude-code-plugin-recommended) and
+  the hook that lets design reads run without a prompt.
+- **Codex**: installs the same plugin.
+- **agy**: registers the `figma-bridge` MCP server and its approval rules.
+
+A client that is not installed is skipped; run `figma-bridge setup` again after
+installing it. Running setup again is always safe: it updates what is already
+there. If the `figma-bridge` command is already installed,
+`npm install -g @pixodeo/figma-bridge && figma-bridge setup` does the same.
+
+Each Claude Code profile has its own plugins. If you use several
+(`CLAUDE_CONFIG_DIR`), run `figma-bridge setup --only claude` once with each.
+
+If npm cannot write its global folder (`EACCES` on Linux with a system-wide
+Node.js), install Node.js through a version manager such as nvm, or set an npm
+prefix your user owns. Do not run setup with `sudo`: it would set up the clients
+of the root user.
+
+### Connect Figma
+
+Once per machine, in Figma desktop:
+
+1. **Plugins → Development → Import plugin from manifest…**, and pick the
+   `manifest.json` path that setup printed. `figma-bridge status` prints it again.
+2. Open your file and run **Plugins → Development → Design Bridge → Open Design
+   Bridge**.
+3. Press **Pair with bridge**. The panel shows a 6-digit code. Approve it with
+   `/figma-bridge:pair <code>` in Claude Code, or `figma-bridge pair <code>` in
+   any terminal. The panel saves the token and connects.
 
 From then on, opening the panel connects by itself, and you can paste any node
-link of that file into Claude Code. Figma tells the plugin which file it is in,
-so no link has to be pasted into the panel; if your Figma account does not, the
-panel asks for the file's link once per document.
+link of that file into your AI client. Figma tells the plugin which file it is
+in, so no link has to be pasted into the panel; if your Figma account does not,
+the panel asks for the file's link once per document.
 
-The bridge runs while Claude Code does; nothing has to be started by hand. Opened
-before Claude Code, the panel shows **Waiting for the bridge...** and connects as
-soon as a session starts. A plugin installed during a session starts with the
-next one: restart Claude Code (`claude -c` resumes the conversation).
+The bridge runs while Claude Code, Codex or agy does; nothing has to be started
+by hand. Opened before them, the panel shows **Waiting for the bridge...** and
+connects as soon as a session starts. A plugin installed during a session starts
+with the next one: restart Claude Code (`claude -c` resumes the conversation).
+`figma-bridge start` runs the bridge on its own, without an AI client.
 
-Without Claude Code, start the bridge with `npm start` and approve the code with
-`npm run bridge:pair -- <code>` instead. Copying the token by hand
-(`npm run bridge:token`) still works, under **Advanced** in the panel.
+### Commands
+
+`figma-bridge` works from any directory.
+
+| Command | Does |
+| --- | --- |
+| `figma-bridge setup [--only claude,codex,agy] [--approvals auto\|manual]` | Sets up the AI clients and the pairing token. Safe to repeat |
+| `figma-bridge status` | Shows the version, the data directory, whether the bridge runs and which Figma files are connected, and each client |
+| `figma-bridge approvals [auto\|manual]` | Shows or sets whether design reads ask before they run. See [Approvals](#approvals) |
+| `figma-bridge update` | Installs the latest version and runs setup again |
+| `figma-bridge start` | Runs the bridge in this terminal |
+| `figma-bridge mcp` | Runs the MCP server on stdio, for an MCP client configured by hand |
+| `figma-bridge pair <code>` | Approves the Figma plugin that shows this code |
+| `figma-bridge token [--rotate]` | Prints the bridge token for scripts, or replaces it and unpairs every plugin |
+| `figma-bridge import <figma-url>` | Pulls a design through the Figma REST API (needs `FIGMA_ACCESS_TOKEN`) |
+
+### Approvals
+
+Reading a design changes nothing, so by default (`auto`) Claude Code, Codex and
+agy run the eight read tools — `get_design_*`, `search_design` and
+`get_bridge_status` — without asking. `approve_figma_pairing` hands a Figma
+plugin the bridge token and `sync_figma_design` calls the Figma API, so those two
+always ask. Rules of your own that deny or ask for a tool still apply.
+
+```bash
+figma-bridge approvals manual   # every bridge tool asks again
+figma-bridge approvals auto     # back to the default
+```
+
+| Client | `auto` | `manual` |
+| --- | --- | --- |
+| Claude Code | The plugin's `PreToolUse` hook allows the read tools | The hook stays silent and Claude Code asks as usual |
+| Codex | The tools are marked `readOnlyHint`, which Codex runs without asking | `default_tools_approval_mode = "prompt"` for the plugin's server in `config.toml` |
+| agy | `mcp(figma-bridge/<tool>)` rules in `permissions.allow` of `~/.gemini/antigravity-cli/settings.json` | Those rules are removed |
+
+The mode is stored as `approvals` in `config.json` in the
+[data directory](#where-data-lives). Claude Code reads it at every tool call;
+for Codex and agy the command rewrites their config file. The first time setup
+changes one of those files, it keeps the file as it was next to it, with
+`.figma-bridge.bak` added to the name.
+
+### Update and uninstall
+
+```bash
+figma-bridge update
+```
+
+Then restart running Claude Code, Codex and agy sessions, and close and reopen
+the Design Bridge panel in Figma. The manifest path stays the same, so Figma
+needs no new import. [CHANGELOG.md](CHANGELOG.md) lists what changed.
+
+On Windows, npm cannot replace files that a running program holds open. If the
+update fails with `EPERM` or `EBUSY`, close Claude Code, Codex and agy, stop a
+`figma-bridge start` that is running, and run `figma-bridge update` again.
+
+Running setup again is also how an install repairs itself. It keeps what you
+changed since: a plugin you turned off stays off, and agy keeps the environment
+you gave its server, such as `FIGMA_ACCESS_TOKEN`. A marketplace whose folder
+no longer exists, such as a deleted clone, is replaced with this install.
+
+To uninstall, remove the plugin in Figma (**Plugins → Development → Manage
+plugins in development**), then:
+
+```bash
+claude plugin uninstall figma-bridge@figma-design-bridge
+claude plugin marketplace remove figma-design-bridge
+codex plugin remove figma-bridge@figma-design-bridge
+codex plugin marketplace remove figma-design-bridge
+agy mcp remove figma-bridge
+npm uninstall -g @pixodeo/figma-bridge
+```
+
+The [data directory](#where-data-lives) keeps the token and the cache; delete it
+too to remove everything.
+
+### From a clone
+
+Contributors can run everything from a clone:
+
+```bash
+git clone https://github.com/nathanpixodeo/figma-design-bridge.git
+cd figma-design-bridge
+npm install
+npm link             # puts this clone's figma-bridge on PATH
+figma-bridge setup   # the clients then load the plugin from this clone
+```
+
+The `npm start` and `npm run bridge:*` scripts still work inside the clone.
 
 ---
 
@@ -120,18 +235,10 @@ Figma token step below and go to
 [Figma Plugin](#figma-plugin-token-free-path). You will still pair the plugin
 with the bridge token in [step 3](#3-pair-with-the-bridge-token).
 
-### 1. Clone & Install
+### 1. Install
 
-```bash
-git clone <your-repo-url>
-cd figma-bridge
-```
-
-Install the MCP SDK dependency:
-
-```bash
-npm install
-```
+Run the one command in [Install](#install). The steps below use the
+`figma-bridge` command it puts on `PATH`.
 
 ### 2. Start the Server
 
@@ -146,18 +253,18 @@ $env:FIGMA_ACCESS_TOKEN="figd_your_token"
 Then start the HTTP server:
 
 ```bash
-node server/index.js
+figma-bridge start
 ```
 
 You'll see:
 ```
-  🎨 Design Bridge Server running on http://localhost:3456
+  🎨 Design Bridge Server — http://localhost:3456
   ─────────────────────────────────────────────
-  Config loaded from server/config.json
-  Import with: npm run import:figma -- <figma-url>
+  Import with: figma-bridge import <figma-url>
 ```
 
-To customize settings, edit `server/config.json` before starting:
+To customize settings, create `config.json` in the
+[data directory](#where-data-lives) before starting:
 ```json
 {
   "port": 3456,
@@ -166,9 +273,13 @@ To customize settings, edit `server/config.json` before starting:
 }
 ```
 
+The bridge only reads this file, and never creates it. A clone also reads
+`server/config.json`, as before 1.4.0; the file in the data directory wins where
+both set a key.
+
 Every setting also has an environment variable: `FIGMA_BRIDGE_PORT`,
 `FIGMA_BRIDGE_DATA_DIR`, `FIGMA_BRIDGE_MAX_SNAPSHOTS`, `FIGMA_BRIDGE_LOG_LEVEL`.
-`FIGMA_BRIDGE_CACHE_MAX_BYTES` (`cacheMaxBytes` in `server/config.json`) caps the
+`FIGMA_BRIDGE_CACHE_MAX_BYTES` (`cacheMaxBytes` in `config.json`) caps the
 live-read cache, 200 MB by default; it holds at most 500 entries either way.
 
 #### Where data lives
@@ -186,12 +297,14 @@ On Linux the path comes from the home directory alone, not from
 `XDG_DATA_HOME`: MCP hosts such as Codex pass a server only a few environment
 variables, and every launcher has to arrive at the same directory.
 
-Every launcher uses it: the Claude Code plugin in any profile, Codex, `npm start`
-and the npm scripts. They share one token, so the Figma plugin pairs once per
-machine, whichever of them holds the port. Set `dataDir` in `server/config.json`
-or `FIGMA_BRIDGE_DATA_DIR` only to keep a setup apart on purpose; every process
-that should share it then needs the same value. Uninstalling the plugin leaves
-this directory in place; delete it to remove the token and the cache.
+Every launcher uses it: the Claude Code plugin in any profile, Codex, agy and
+every `figma-bridge` command. They share one token, so the Figma plugin pairs
+once per machine, whichever of them holds the port. Set `FIGMA_BRIDGE_DATA_DIR`
+(or, in a clone, `dataDir` in `server/config.json`) only to keep a setup apart
+on purpose; every process that should share it then needs the same value.
+`figma-bridge status` shows the directory in use and where it came from.
+Uninstalling leaves this directory in place; delete it to remove the token and
+the cache.
 
 **Upgrading from 1.2 or earlier.** On its first start, 1.3.x copies the token,
 the current design and the ten newest snapshots from the directory the previous
@@ -208,7 +321,7 @@ or that launcher keeps a directory and token of its own.
 Code plugin sets it to its previous data directory.
 
 ```bash
-FIGMA_BRIDGE_PORT=4567 node server/index.js
+FIGMA_BRIDGE_PORT=4567 figma-bridge start
 ```
 
 **The server binds `127.0.0.1` only.** `FIGMA_BRIDGE_HOST` overrides that for
@@ -239,31 +352,31 @@ controls apply to every route, and all three are on by default — see
 
 ### 3. Pair with the Bridge Token
 
-Everything that reads or writes design data needs a local token. The server
-creates one on first start and keeps it in `<dataDir>/bridge-token.json`.
+Everything that reads or writes design data needs a local token. Setup, or the
+first server start, creates one and keeps it in `<dataDir>/bridge-token.json`.
 
 **The Figma plugin pairs by itself.** Press **Pair with bridge** in its panel and
 approve the 6-digit code it shows, with `/figma-bridge:pair <code>` in Claude
-Code or `npm run bridge:pair -- <code>` in this folder. The plugin then receives
+Code or `figma-bridge pair <code>` in any terminal. The plugin then receives
 the token and remembers it per Figma user. The code expires after two minutes,
 and nothing is handed out until someone who already has the token approves it.
 
 For scripts and `curl`, print the token with:
 
 ```bash
-npm run bridge:token
+figma-bridge token
 ```
 
 Send it as `Authorization: Bearer <token>` or `X-Bridge-Token: <token>`. To
-revoke it and unpair every client, run `npm run bridge:token:rotate`.
+revoke it and unpair every client, run `figma-bridge token --rotate`.
 
 Every shell example in this README assumes `$BRIDGE_TOKEN`, so export it once:
 
 ```bash
-export BRIDGE_TOKEN="$(npm run --silent bridge:token)"
+export BRIDGE_TOKEN="$(figma-bridge token)"
 ```
 
-`npm run import:figma` finds the token by itself, from `FIGMA_BRIDGE_TOKEN` if
+`figma-bridge import` finds the token by itself, from `FIGMA_BRIDGE_TOKEN` if
 that is set and otherwise from the data directory.
 
 The plugin also has a **Bridge token** field under **Advanced**, if you prefer to
@@ -278,8 +391,8 @@ paste the value there yourself.
 
 ### 4a. Sync from the plugin (no Figma token)
 
-Install `plugin/` as a local development plugin (see
-[Figma Plugin](#figma-plugin-token-free-path)), open the file you want and run
+Import the Figma plugin as a local development plugin (see
+[Connect Figma](#connect-figma)), open the file you want and run
 **Plugins → Development → Design Bridge → Open Design Bridge**. Pair it once (see
 step 3), then press **Sync page** or **Sync selection**; the panel posts straight
 to the running server. **Quick Sync → Sync Full Page** does the same without
@@ -289,8 +402,8 @@ opening the panel, once the plugin is paired.
 
 Copy the design URL from Chrome. If the URL contains `node-id`, only that node is imported; otherwise the full file is imported.
 
-```powershell
-npm run import:figma -- "https://www.figma.com/design/FILE_KEY/Design?node-id=1-2"
+```bash
+figma-bridge import "https://www.figma.com/design/FILE_KEY/Design?node-id=1-2"
 ```
 
 Alternatively, ask the running HTTP server to fetch it:
@@ -561,7 +674,7 @@ curl -H "Authorization: Bearer $BRIDGE_TOKEN" http://localhost:3456/snapshots/20
 
 Design snapshots are automatically saved to `snapshots/` in the [data directory](#where-data-lives) after each sync. On restart, the server loads the latest snapshot from disk, so your design survives server restarts. The server keeps a maximum of 50 snapshots, pruning the oldest automatically.
 
-`latest.json` is shared: when another process — the MCP server or a second `npm start` on the same data directory — writes a newer one, the next read picks it up without a restart.
+`latest.json` is shared: when another process — the MCP server or a second `figma-bridge start` on the same data directory — writes a newer one, the next read picks it up without a restart.
 
 ### Graceful Shutdown
 
@@ -569,7 +682,7 @@ Every sync is written to disk when it arrives, so nothing is lost on exit. SIGIN
 
 ### Logging
 
-All requests and events are logged with structured output including timestamps and severity levels (`info`, `warn`, `error`). The log level is configurable via the `logLevel` setting in `server/config.json`.
+All requests and events are logged with structured output including timestamps and severity levels (`info`, `warn`, `error`). The log level is configurable via the `logLevel` setting in `config.json`.
 
 ### Error Handling
 
@@ -650,7 +763,7 @@ line.
 Full route contract, request/response schemas and error codes:
 **[docs/BRIDGE_PROTOCOL.md](docs/BRIDGE_PROTOCOL.md)**.
 Phase breakdown and acceptance cases:
-[docs/PLAN_PLUGIN_ON_DEMAND_MCP.md](docs/PLAN_PLUGIN_ON_DEMAND_MCP.md).
+[docs/PLAN_PLUGIN_ON_DEMAND_MCP.md](https://github.com/nathanpixodeo/figma-design-bridge/blob/main/docs/PLAN_PLUGIN_ON_DEMAND_MCP.md), in the repository.
 
 ### Running the tests
 
@@ -684,11 +797,12 @@ The Figma plugin in `plugin/` is a fully supported way to get design data in,
 and the only one that needs no Figma access token: it runs inside the document
 you already have open and posts to your local bridge directly. Install it as a
 local development plugin via **Plugins → Development → Import plugin from
-manifest…**, pointing at `plugin/manifest.json`.
+manifest…**, pointing at the `plugin/manifest.json` path `figma-bridge status` prints.
 
-It still needs the local bridge token. Paste the output of
-`npm run bridge:token` into the panel's **Bridge token** field; the plugin stores
-it per Figma user, so this is a one-time step per machine.
+It still needs the local bridge token. Press **Pair with bridge** and approve
+the code, or paste the output of `figma-bridge token` into the panel's **Bridge
+token** field under **Advanced**; the plugin stores it per Figma user, so this is
+a one-time step per machine.
 
 ### Network access
 
@@ -719,7 +833,7 @@ never both required.
 
 **Plugins → Development → Design Bridge → Open Design Bridge** opens one panel for everything:
 
-- **Pair with bridge** (first time only) shows a 6-digit code. Approve it in Claude Code with `/figma-bridge:pair <code>`, or in a terminal with `npm run bridge:pair -- <code>`. The plugin then saves the token per Figma user.
+- **Pair with bridge** (first time only) shows a 6-digit code. Approve it in Claude Code with `/figma-bridge:pair <code>`, or in a terminal with `figma-bridge pair <code>`. The plugin then saves the token per Figma user.
 - **Connect / Disconnect.** Once paired, the panel connects by itself whenever it opens. While it is open, agents can read any node of this file by its link, on any page, without changing your selection. Keep the panel open.
 - **Sync page / Sync selection** post the current page, or the selected nodes and their descendants, to the bridge's snapshot cache.
 - **Auto-sync page changes** is off by default. When on, edits and page switches re-sync the current page, debounced for 800 ms. Only one upload runs at a time; changes made during an upload are coalesced into one fresh snapshot.
@@ -727,7 +841,7 @@ never both required.
 
 The panel shows the file, the last node an agent read and the last sync. HTTP and network errors are shown, and a stalled upload times out after 30 seconds.
 
-- **Waiting for the bridge...** Nothing answers at the bridge URL yet, because neither Claude Code nor `npm start` is running. This is not an error: the panel keeps trying every few seconds and connects as soon as one starts.
+- **Waiting for the bridge...** Nothing answers at the bridge URL yet, because no AI client with the bridge, and no `figma-bridge start`, is running. This is not an error: the panel keeps trying every few seconds and connects as soon as one starts.
 - **Pairing needed.** The bridge refused the saved token: it was rotated, or this bridge keeps its own data directory. The panel stops retrying and shows **Pair with bridge** again.
 
 ### Menu Commands
@@ -775,16 +889,13 @@ The serializer caps recursion at 30 levels of nesting to prevent stack overflows
 
 Figma Design Bridge includes a built-in MCP server (`server/mcp.mjs`) that adds native support for Claude Code and any MCP-compatible client. Instead of writing `curl` commands, you configure the MCP server once and then Claude can read your design directly.
 
-### Setup
-
-```bash
-# Install dependencies (MCP SDK)
-npm install
-```
-
 ### Install as a Claude Code plugin (recommended)
 
-The repository is also a Claude Code plugin marketplace. Installing it registers the MCP server and four slash commands in one step, for every project on the machine:
+`figma-bridge setup` installs the plugin (see [Install](#install)). The package
+is also a Claude Code plugin marketplace, so the plugin registers the MCP server,
+four slash commands and the [approvals](#approvals) hook in one step, for every
+project on the machine. With access to the GitHub repository, Claude Code can
+also install it from there:
 
 ```bash
 claude plugin marketplace add nathanpixodeo/figma-design-bridge
@@ -798,20 +909,26 @@ claude plugin install figma-bridge@figma-design-bridge
 | `/figma-bridge:sync <figma-url>` | Pulls a file or node through the REST API (needs a Figma token) |
 | `/figma-bridge:pair <code>` | Approves the Figma plugin that shows this 6-digit pairing code, so it receives the bridge token without anyone copying it |
 
-The plugin resolves its own paths through `${CLAUDE_PLUGIN_ROOT}`, so nothing breaks when the clone moves. Its MCP server keeps the token and the cached designs in the [shared data directory](#where-data-lives), the same one `npm start` and Codex use, and on its first start copies over what earlier versions kept in `${CLAUDE_PLUGIN_DATA}`.
+The plugin resolves its own paths through `${CLAUDE_PLUGIN_ROOT}`, so nothing breaks when the clone moves. Its MCP server keeps the token and the cached designs in the [shared data directory](#where-data-lives), the same one Codex, agy and `figma-bridge start` use, and on its first start copies over what earlier versions kept in `${CLAUDE_PLUGIN_DATA}`.
 
-The MCP server tries to listen on port 3456, and when it succeeds it is itself the endpoint the Figma plugin talks to — it serves both the Sync commands' `/design` and the `/bridge/*` routes — so install, open the panel in Figma, pair, done. It hosts the bridge while Claude Code runs; in between, the panel waits and reconnects by itself. When `npm start` or another session already holds the port, the MCP server reuses that bridge: they share the token, so it makes no difference to the Figma plugin which of them runs.
+The MCP server tries to listen on port 3456, and when it succeeds it is itself the endpoint the Figma plugin talks to — it serves both the Sync commands' `/design` and the `/bridge/*` routes — so install, open the panel in Figma, pair, done. It hosts the bridge while Claude Code runs; in between, the panel waits and reconnects by itself. When `figma-bridge start` or another session already holds the port, the MCP server reuses that bridge: they share the token, so it makes no difference to the Figma plugin which of them runs.
 
-Only a bridge that keeps its own data directory gets in the way — one older than 1.3.0, or one started with `FIGMA_BRIDGE_DATA_DIR`. If it holds port 3456, the plugin's bridge tools fail with `NO_TOKEN` or `UNAUTHORIZED`, naming the fix: update or stop that bridge. `/figma-bridge:page` shows the directory the MCP server reads, and `curl http://127.0.0.1:3456/health` shows the one the running bridge uses.
+Only a bridge that keeps its own data directory gets in the way — one older than 1.3.0, or one started with `FIGMA_BRIDGE_DATA_DIR`. If it holds port 3456, the plugin's bridge tools fail with `NO_TOKEN` or `UNAUTHORIZED`, naming the fix: update or stop that bridge. `figma-bridge status` shows both directories when they differ.
 
 #### Updating
+
+```bash
+figma-bridge update
+```
+
+Without the `figma-bridge` command, update the plugin directly:
 
 ```bash
 claude plugin marketplace update figma-design-bridge
 claude plugin update figma-bridge@figma-design-bridge
 ```
 
-Then restart Claude Code (`/exit`, then `claude -c` to resume the conversation): a running session keeps the MCP server it started with, and that server keeps port 3456. Each Claude Code profile (`CLAUDE_CONFIG_DIR`) has its own plugin install, so update every profile you use. The Figma plugin runs from your clone: `git pull`, then close and reopen the panel. [CHANGELOG.md](CHANGELOG.md) lists what changed and any upgrade steps.
+Then restart Claude Code (`/exit`, then `claude -c` to resume the conversation): a running session keeps the MCP server it started with, and that server keeps port 3456. Each Claude Code profile (`CLAUDE_CONFIG_DIR`) has its own plugin install, so update every profile you use. Close and reopen the Design Bridge panel in Figma to load the new plugin code. [CHANGELOG.md](CHANGELOG.md) lists what changed and any upgrade steps.
 
 For Codex CLI, see [`integrations/codex/README.md`](integrations/codex/README.md).
 
@@ -823,8 +940,8 @@ If you would rather not install the plugin, add to your `claude.json` or MCP con
 {
   "mcpServers": {
     "figma-design-bridge": {
-      "command": "node",
-      "args": ["/absolute/path/to/figma-design-bridge/server/mcp.mjs"],
+      "command": "figma-bridge",
+      "args": ["mcp"],
       "env": {
         "FIGMA_ACCESS_TOKEN": "${FIGMA_ACCESS_TOKEN}"
       }
@@ -841,7 +958,7 @@ The MCP server communicates with Claude Code via stdio and also starts the local
 bridge on port 3456 — `/bridge/*` plus the `/design` routes the plugin's Sync
 commands post to — or reuses the one already running there:
 
-- `node server/index.js` is reused: both use the [shared data
+- `figma-bridge start` is reused: both use the [shared data
   directory](#where-data-lives) unless one of them is given another, so running
   both is safe.
 - Anything else on that port — another program, or a bridge on a different data
@@ -853,11 +970,15 @@ commands post to — or reuses the one already running there:
   the port over within about 10 seconds, or at its next bridge call.
 - When its MCP client closes stdin, the server answers the calls in flight,
   exits and frees the port. Started without any client (stdin already closed),
-  it keeps hosting the bridge; `npm start` is the usual way to do that.
+  it keeps hosting the bridge; `figma-bridge start` is the usual way to do that.
 
 Restart the MCP client after changing its environment configuration.
 
-> **Note:** Use the absolute path to `server/mcp.mjs` in your MCP config.
+> **Note:** On Windows, npm installs `figma-bridge` as a `.cmd` file, which an
+> MCP client may not start directly. Use `"command": "cmd"` with
+> `"args": ["/c", "figma-bridge", "mcp"]`, or `"command": "node"` with the
+> absolute path to `server/mcp.mjs` in the install directory that
+> `figma-bridge status` prints.
 
 ### Available MCP Tools
 
@@ -901,7 +1022,7 @@ If you prefer the HTTP API instead of MCP:
 
 ```bash
 # Start the HTTP server
-npm start
+figma-bridge start
 
 # In another terminal, query the design
 curl -H "Authorization: Bearer $BRIDGE_TOKEN" http://localhost:3456/design/summary | \
@@ -921,9 +1042,9 @@ claude -p "Based on these text nodes, write better copy for the landing page: $T
 
 | Problem | Solution |
 |---------|----------|
-| HTTP `401` from `/design` or `/snapshots` | Send the bridge token: `npm run bridge:token`, then `-H "Authorization: Bearer <token>"`. In the Figma plugin, press **Pair with bridge**, or paste the token under **Advanced**. |
-| The plugin says "No bridge is running at http://localhost:3456" | Open Claude Code with the figma-bridge plugin, or run `npm start`, then press **Pair with bridge** again. |
-| The panel stays on **Waiting for the bridge...** | Nothing runs at the bridge URL. Open Claude Code with the figma-bridge plugin — restart it if the plugin was installed during the session, and check that `/mcp` lists it — or run `npm start`. The panel connects by itself. |
+| HTTP `401` from `/design` or `/snapshots` | Send the bridge token: `figma-bridge token`, then `-H "Authorization: Bearer <token>"`. In the Figma plugin, press **Pair with bridge**, or paste the token under **Advanced**. |
+| The plugin says "No bridge is running at http://localhost:3456" | Open Claude Code, Codex or agy with the bridge set up, or run `figma-bridge start`, then press **Pair with bridge** again. |
+| The panel stays on **Waiting for the bridge...** | Nothing runs at the bridge URL. Open Claude Code with the figma-bridge plugin — restart it if the plugin was installed during the session, and check that `/mcp` lists it — or run `figma-bridge start`. `figma-bridge status` shows what holds the port. The panel connects by itself. |
 | The panel says **Pairing needed** | The bridge refused the saved token: it was rotated, or the bridge keeps its own data directory (older than 1.3.0, or started with `FIGMA_BRIDGE_DATA_DIR`). Press **Pair with bridge**. |
 | "No Figma plugin is waiting with that code" | The pairing code expired (codes last two minutes) or was mistyped. Press **Pair with bridge** again and approve the new code. |
 | HTTP `403` "addressed to a loopback host" | Reach the server as `localhost` or `127.0.0.1`, not through another host name or a reverse proxy that rewrites `Host`. |
@@ -931,12 +1052,12 @@ claude -p "Based on these text nodes, write better copy for the landing page: $T
 | `Missing FIGMA_ACCESS_TOKEN` | Export the token before starting the HTTP/MCP process, then restart it. |
 | Figma API `403` | Verify `file_content:read` scope and that the token owner can view the file. |
 | Figma API `429` | Wait for the reported retry period; use cached design tools instead of repeatedly syncing. |
-| Import command cannot connect | Start `npm start` or the MCP server first; override with `FIGMA_BRIDGE_URL` if using a custom port. |
-| Server port conflict | Set a custom port: `FIGMA_BRIDGE_PORT=4567 node server/index.js` |
+| Import command cannot connect | Run `figma-bridge start` or an AI client with the bridge first; override with `FIGMA_BRIDGE_URL` if using a custom port. |
+| Server port conflict | Set a custom port: `FIGMA_BRIDGE_PORT=4567 figma-bridge start` |
 | Design seems incomplete | Import the full-file URL without `node-id`, or pass the required `nodeIds` explicitly. |
-| MCP server not connecting | Make sure `npm install` was run. Use absolute path to `server/mcp.mjs` in config. |
-| `npm run bridge:pair` says the bridge "rejected the token" | The bridge on port 3456 keeps a different data directory — usually a Claude Code session still running a plugin older than 1.3.0. [Update the plugin](#updating), restart Claude Code, then press **Pair with bridge** again. `curl http://127.0.0.1:3456/health` shows the data directory the running bridge uses. |
-| `npm start` says a bridge "uses another data directory" | A launcher that keeps its own data directory, or a version older than 1.3.0, holds port 3456 and would keep the Figma plugin on a different token. Stop or update it, then run `npm start` again. When the running bridge shares the data directory, `npm start` just says it is not needed. |
+| MCP server not connecting | Run `figma-bridge status`, then `figma-bridge setup` to reinstall the plugin, and restart the client. In a hand-written MCP config, use `figma-bridge mcp` as the command. |
+| `figma-bridge pair` says the bridge "rejected the token" | The bridge on port 3456 keeps a different data directory — usually a Claude Code session still running a plugin older than 1.3.0. [Update the plugin](#updating), restart Claude Code, then press **Pair with bridge** again. `figma-bridge status` shows whether the running bridge uses another data directory. |
+| `figma-bridge start` says a bridge "uses another data directory" | A launcher that keeps its own data directory, or a version older than 1.3.0, holds port 3456 and would keep the Figma plugin on a different token. Stop or update it, then run `figma-bridge start` again. When the running bridge shares the data directory, `figma-bridge start` just says it is not needed. |
 | `get_design_context` returns `TIMEOUT` | Figma loads a large page slowly the first time it is read. Retry with a larger `timeoutMs` (up to 120000) or a smaller `depth` or `maxNodes`, and keep the panel open. |
 | Figma's console shows `Plugin runtime aborted` and the panel closes; the read fails with `SESSION_LOST` | The read was too large for the plugin's memory. Reopen Design Bridge, then read one screen frame rather than a section of many screens, or pass a smaller `depth` or `maxNodes`, or `includeHidden: false`. A panel left open for hours is closer to the limit; reopening it starts fresh. |
 | MCP tools return "No design data" | Call `sync_figma_design` with a Figma URL first. |
@@ -946,13 +1067,20 @@ claude -p "Based on these text nodes, write better copy for the landing page: $T
 ## Project Structure
 
 ```
-figma-bridge/
+figma-design-bridge/
+├── bin/
+│   └── figma-bridge.js        # The figma-bridge command npm puts on PATH
+├── hooks/
+│   ├── hooks.json             # Claude Code PreToolUse hook: reads run without a prompt while approvals is auto
+│   └── allow-reads.js         # The hook itself; says nothing for manual or on any error
 ├── plugin/
 │   ├── manifest.json          # Figma plugin manifest (networkAccess, enablePrivatePluginApi)
 │   └── code.js                # Plugin panel: pairing, live /bridge/* reads, Sync to /design
 ├── server/
 │   ├── data/                  # Data of versions before 1.3.0, copied to the shared directory (gitignored)
-│   ├── config.json            # Auto-created config (port, maxSnapshots, logLevel; dataDir only if you set one)
+│   ├── config.json            # Optional settings in a clone (gitignored); config.json in the data directory wins
+│   ├── cli/                   # figma-bridge setup, status, approvals, update, and the AI client setup
+│   ├── tool-policy.js         # Which MCP tools only read, for annotations and approvals
 │   ├── figma-api.js           # Figma REST client + schema normalizer
 │   ├── figma-api.test.js      # Normalizer/import tests
 │   ├── import-figma.mjs       # CLI importer
@@ -981,7 +1109,8 @@ figma-bridge/
 │   ├── SERVER_API.md          # REST/snapshot server API
 │   ├── BRIDGE_PROTOCOL.md     # /bridge/* route contract
 │   └── PLAN_PLUGIN_ON_DEMAND_MCP.md  # Implementation plan and acceptance cases
-├── .github/workflows/ci.yml   # Tests on Linux + Windows, Node 20/22/24
+├── .github/workflows/ci.yml   # Tests on Linux + Windows, Node 20/22/24, and the npm package contents
+├── .github/workflows/release.yml  # Publishes @pixodeo/figma-bridge to npm, run by hand
 ├── SECURITY.md                # Threat model and how to report a vulnerability
 ├── README.md
 ├── LICENSE

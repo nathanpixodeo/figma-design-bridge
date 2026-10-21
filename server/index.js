@@ -1,6 +1,4 @@
 const http = require('http')
-const fs = require('fs')
-const path = require('path')
 const { fetchFigmaDesign } = require('./figma-api')
 const createBridgeRoutes = require('./bridge/routes')
 const createBridgeCache = require('./bridge/cache')
@@ -9,31 +7,20 @@ const bridgeIdentity = require('./bridge/identity')
 const { getOrCreateToken, createTokenSource } = require('./bridge/token')
 const createSnapshotStore = require('./snapshot-store')
 const createLegacyRoutes = require('./legacy-routes')
-const { prepareDataDir, samePath } = require('./data-dir')
+const { prepareDataDir, readConfig, samePath } = require('./data-dir')
 
 // ── Config ────────────────────────────────────────────────
 
-const CONFIG_PATH = path.join(__dirname, 'config.json')
-
 // There is no dataDir default here: data-dir.js picks the directory every
-// launcher shares unless config.json or FIGMA_BRIDGE_DATA_DIR names one.
+// launcher shares unless config.json or FIGMA_BRIDGE_DATA_DIR names one. No
+// config file is written: the defaults apply until someone writes one.
 function loadConfig() {
   const defaults = {
     port: 3456,
     maxSnapshots: 50,
     logLevel: 'info',
   }
-  try {
-    if (fs.existsSync(CONFIG_PATH)) {
-      const user = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'))
-      return { ...defaults, ...user }
-    }
-    fs.writeFileSync(CONFIG_PATH, JSON.stringify(defaults, null, 2) + '\n')
-    console.log(`[figma-bridge] Created default config: ${CONFIG_PATH}`)
-  } catch (e) {
-    console.warn(`[figma-bridge] Config error: ${e.message}`)
-  }
-  return defaults
+  return { ...defaults, ...readConfig({ log: message => console.warn(`[figma-bridge] ${message}`) }) }
 }
 
 const config = loadConfig()
@@ -73,7 +60,7 @@ function log(level, ...args) {
 const { dataDir } = prepareDataDir({ log: message => log('info', message) })
 
 // The legacy snapshot API and the request-driven bridge deliberately share one
-// listener. This keeps `npm start` compatible with existing /design consumers
+// listener. This keeps `figma-bridge start` compatible with existing /design consumers
 // while allowing MCP adapters to safely probe/reuse the same process.
 // Read from the token file on each request, so a rotation revokes the old
 // token without restarting this server.
@@ -177,7 +164,7 @@ server.on('error', async error => {
     }
     log('error', `A Figma Design Bridge is already running on port ${port}, but it uses `
       + (theirs ? `another data directory (${theirs})` : 'another data directory, or is older than 1.3.0')
-      + `, so it does not accept this setup's token. Stop or update that bridge, then run npm start again.`)
+      + `, so it does not accept this setup's token. Stop or update that bridge, then run figma-bridge start again.`)
     process.exit(1)
   }
   if (bridge && bridge.timedOut) {
@@ -213,7 +200,7 @@ server.listen(port, host, () => {
   console.log(`  🎨 Design Bridge Server — http://localhost:${port}`)
   console.log(`  ${'─'.repeat(47)}`)
   if (!currentDesign) {
-    console.log(`  Import with: npm run import:figma -- <figma-url>`)
+    console.log(`  Import with: figma-bridge import <figma-url>`)
   } else {
     console.log(`  Restored from disk: "${currentDesign.pageName}" (${currentDesign.nodeCount} nodes)`)
   }

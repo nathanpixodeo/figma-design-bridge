@@ -11,6 +11,8 @@ const {
   prepareDataDir,
   migrateDataDir,
   userDataDir,
+  readConfig,
+  writeConfig,
 } = require('./data-dir')
 
 // Every client that has to authenticate against the bridge finds the token by
@@ -354,4 +356,62 @@ test('without FIGMA_BRIDGE_DATA_DIR the token printer prints the token an earlie
   assert.match(printed.stderr, /Copied .* and the pairing token/)
   const shared = userDataDir({ env: { LOCALAPPDATA: home }, homedir: home })
   assert.equal(readJson(shared, 'bridge-token.json').token, 'e'.repeat(64))
+})
+
+test('readConfig layers the data directory config over the one next to the code, and writes nothing', t => {
+  const dir = tempDir(t)
+  const dataDir = path.join(dir, 'data')
+  const configPath = path.join(dir, 'config.json')
+  writeJson(configPath, { port: 4000, approvals: 'manual' })
+  writeJson(path.join(dataDir, 'config.json'), { approvals: 'auto' })
+
+  assert.deepEqual(readConfig({ dataDir, configPath }), { port: 4000, approvals: 'auto' })
+  assert.deepEqual(readConfig({ dataDir: path.join(dir, 'none'), configPath: path.join(dir, 'none.json') }), {})
+  assert.equal(fs.existsSync(path.join(dir, 'none')), false)
+})
+
+test('readConfig skips a file it cannot parse and says so', t => {
+  const dir = tempDir(t)
+  const configPath = path.join(dir, 'config.json')
+  fs.writeFileSync(configPath, '{ not json')
+  writeJson(path.join(dir, 'data', 'config.json'), ['not', 'an', 'object'])
+  const notes = []
+
+  assert.deepEqual(readConfig({ dataDir: path.join(dir, 'data'), configPath, log: note => notes.push(note) }), {})
+  assert.equal(notes.length, 1)
+  assert.match(notes[0], /Ignored .*config.json/)
+})
+
+test('writeConfig merges into the data directory config and keeps the other keys', t => {
+  const dir = tempDir(t)
+  const dataDir = path.join(dir, 'data')
+  writeJson(path.join(dataDir, 'config.json'), { port: 4000 })
+
+  const file = writeConfig({ approvals: 'manual' }, { dataDir })
+  assert.equal(file, path.join(dataDir, 'config.json'))
+  assert.deepEqual(readJson(file), { port: 4000, approvals: 'manual' })
+
+  writeConfig({ approvals: 'auto' }, { dataDir: path.join(dir, 'fresh') })
+  assert.deepEqual(readJson(dir, 'fresh', 'config.json'), { approvals: 'auto' })
+  assert.deepEqual(fs.readdirSync(dataDir), ['config.json'], 'left a temporary file behind')
+})
+
+test('writeConfig refuses to replace a config file it cannot parse', t => {
+  const dir = tempDir(t)
+  fs.writeFileSync(path.join(dir, 'config.json'), '{ hand edited')
+
+  assert.throws(() => writeConfig({ approvals: 'manual' }, { dataDir: dir }), /cannot read .*config\.json/)
+  assert.equal(fs.readFileSync(path.join(dir, 'config.json'), 'utf8'), '{ hand edited')
+
+  fs.writeFileSync(path.join(dir, 'config.json'), '[]')
+  assert.throws(() => writeConfig({ approvals: 'manual' }, { dataDir: dir }), /does not hold a JSON object/)
+})
+
+test('readConfig and writeConfig accept a byte order mark', t => {
+  const dir = tempDir(t)
+  fs.writeFileSync(path.join(dir, 'config.json'), `${String.fromCharCode(0xfeff)}{"port": 4000}`)
+
+  assert.deepEqual(readConfig({ dataDir: dir, configPath: path.join(dir, 'none.json') }), { port: 4000 })
+  writeConfig({ approvals: 'manual' }, { dataDir: dir })
+  assert.deepEqual(readJson(dir, 'config.json'), { port: 4000, approvals: 'manual' })
 })

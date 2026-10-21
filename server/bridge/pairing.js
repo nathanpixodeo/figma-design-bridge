@@ -2,7 +2,7 @@
 //
 // The plugin asks to pair and shows the 6-digit code it gets back. Someone who
 // already holds the token approves that code: Claude Code through the MCP
-// server, or a terminal running `npm run bridge:pair -- <code>`. The plugin then
+// server, or a terminal running `figma-bridge pair <code>`. The plugin then
 // collects the token, once.
 //
 // Anything can ask, including a web page through a sandboxed iframe, whose
