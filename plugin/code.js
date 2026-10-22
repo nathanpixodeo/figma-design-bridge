@@ -361,6 +361,9 @@ async function startPairing(){
     showError('No bridge is running at '+base+'. Open Claude Code with the figma-bridge plugin, or run figma-bridge start, then press Pair with bridge again.')
     return
   }
+  // Asking to pair needs no token since 1.2.0. A bridge that wants one for it,
+  // or does not know the route, is older and cannot pair at all.
+  if(r.status===401||r.status===404){showError('The bridge running at '+base+' is too old to pair: pairing needs 1.2.0 or later. Update the figma-bridge plugin in Claude Code or Codex, or the clone that runs the bridge, restart it, then press Pair with bridge again.');return}
   if(!r.ok||!body||!body.code){showError((body&&body.error)||('Bridge HTTP '+r.status));return}
   pairing={id:body.pairingId,secret:body.pairingSecret,code:body.code,expiresAt:Date.parse(body.expiresAt)||Date.now()+120000,base}
   q('pairCode').textContent=pairing.code.slice(0,3)+' '+pairing.code.slice(3)

@@ -4,6 +4,15 @@ All notable changes to Figma Design Bridge. Versions follow
 [Semantic Versioning](https://semver.org/); the Claude Code plugin, the
 marketplace entry and both `package.json` files always carry the same number.
 
+## [1.4.1] - 2026-10-22
+
+### Fixed
+
+- **Pair with bridge** against a bridge older than 1.2.0 reported `Missing or
+  invalid bridge token`, as if the token were the problem. Those bridges cannot
+  pair at all, so the panel now says the bridge is too old and how to update
+  it.
+
 ## [1.4.0] - 2026-10-21
 
 One command installs everything, a `figma-bridge` command works from any
@@ -252,7 +261,9 @@ audit. Nothing to migrate.
   with page and selection sync and Watch mode, and the MCP server for Claude
   Code.
 
-[1.3.2]: https://github.com/nathanpixodeo/figma-design-bridge/compare/b093ebf...main
+[1.4.1]: https://github.com/nathanpixodeo/figma-design-bridge/compare/1559101...main
+[1.4.0]: https://github.com/nathanpixodeo/figma-design-bridge/compare/7b63529...1559101
+[1.3.2]: https://github.com/nathanpixodeo/figma-design-bridge/compare/b093ebf...7b63529
 [1.3.1]: https://github.com/nathanpixodeo/figma-design-bridge/compare/a392ce3...b093ebf
 [1.3.0]: https://github.com/nathanpixodeo/figma-design-bridge/compare/398c555...a392ce3
 [1.2.0]: https://github.com/nathanpixodeo/figma-design-bridge/compare/6ed2cf9...398c555

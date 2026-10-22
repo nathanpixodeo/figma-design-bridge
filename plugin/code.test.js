@@ -887,6 +887,23 @@ test('an expired pairing code asks the user to pair again', async () => {
   assert.equal(panel.messages.some(message => message.type === 'paired'), false)
 })
 
+test('a bridge too old to pair says so instead of asking for a token', async () => {
+  for (const [status, body] of [
+    [401, { code: 'UNAUTHORIZED', error: 'Missing or invalid bridge token. Send it as "Authorization: Bearer <token>".' }],
+    [404, { error: 'Not found' }],
+  ]) {
+    const panel = ui(async () => respondWith(status, body))
+    panel.click('pairBtn')
+    await settleUi()
+
+    const shown = panel.element('errorMsg').textContent
+    assert.match(shown, /too old to pair: pairing needs 1\.2\.0 or later/, String(status))
+    assert.doesNotMatch(shown, /bridge token/, String(status))
+    assert.equal(panel.element('pairBtn').disabled, false)
+    assert.equal(panel.time.timers.size, 0)
+  }
+})
+
 test('UI aborts a stalled upload and reports a timeout instead of hanging', async () => {
   const panel = ui((_, options) => new Promise((resolve, reject) => {
     options.signal.addEventListener('abort', () => {
