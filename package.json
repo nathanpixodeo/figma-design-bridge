@@ -1,6 +1,6 @@
 {
   "name": "@pixodeo/figma-bridge",
-  "version": "1.4.1",
+  "version": "1.5.0",
   "description": "Local REST and MCP bridge that serves Figma designs to AI coding assistants, from either the Figma plugin or the official REST API",
   "license": "Apache-2.0",
   "author": "Nathan Pixodeo",
