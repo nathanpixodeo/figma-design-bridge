@@ -26,6 +26,16 @@ const DEFAULT_MAX_REPLY_BODY_BYTES = MAX_READ_BYTES + REPLY_ENVELOPE_BYTES
 const MAX_POLL_WAIT_MS = 30_000
 const DEFAULT_POLL_WAIT_MS = 25_000
 const DEFAULT_READ_TIMEOUT_MS = 30_000
+// A node read through the plugin's native REST JSON export; see representationFor.
+const REST_REPRESENTATION = 'figma-rest'
+// A live read may be answered with the plugin's earlier answer while the
+// plugin's edit count shows nothing changed since that read began. Figma
+// reports no edit to a variable's value, so the answer is reused for this long
+// at most.
+const REUSE_MAX_AGE_MS = 300_000
+// The plugin answers its edit count at once, even mid-read. Past this, the
+// read goes to the plugin as usual.
+const EDIT_SEQ_TIMEOUT_MS = 2_000
 
 // Figma plugin iframes post from an opaque origin, so the literal string "null"
 // is the origin that has to be allow-listed for the plugin transport to work.
@@ -53,7 +63,8 @@ const BROKER_STATUS = {
   NODE_NOT_FOUND: 404,
 }
 
-const READ_FIELDS = new Set(['source', 'options', 'mode', 'timeoutMs'])
+const READ_FIELDS = new Set(['source', 'options', 'mode', 'timeoutMs', 'fresh'])
+const READ_OPS = new Set(['read-node', 'read-document-index'])
 const SESSION_FIELDS = new Set(['fileKey', 'fileName', 'pluginInstanceId', 'capabilities'])
 const REPLY_FIELDS = new Set(['requestId', 'ok', 'result', 'error'])
 const INVALIDATE_FIELDS = new Set(['reason', 'fileKey'])
@@ -88,6 +99,15 @@ function toIso(value) {
   if (typeof value === 'number' && Number.isFinite(value)) return new Date(value).toISOString()
   if (typeof value === 'string' && value) return value
   return null
+}
+
+function isRestRepresentation(value) {
+  return typeof value === 'string' && value.split('+')[0] === REST_REPRESENTATION
+}
+
+function withoutRepresentation(opts) {
+  const { representation: _ignored, ...rest } = opts
+  return rest
 }
 
 function isLoopbackHost(host) {
@@ -313,6 +333,7 @@ function createRoutes(options = {}) {
     if (body.timeoutMs !== undefined && !isInteger(body.timeoutMs, 1, 120_000)) {
       return 'Field "timeoutMs" must be an integer between 1 and 120000'
     }
+    if (body.fresh !== undefined && typeof body.fresh !== 'boolean') return 'Field "fresh" must be a boolean'
     if (body.options !== undefined) {
       if (!isPlainObject(body.options)) return 'Field "options" must be an object'
       for (const key of Object.keys(body.options)) {
@@ -501,6 +522,7 @@ function createRoutes(options = {}) {
     } catch (error) {
       return sendBrokerError(req, res, error)
     }
+    if (result && result.late && body.ok === true) keepLateResult(result.late, body.result)
 
     // A late or mis-addressed reply is ignored rather than treated as a client
     // error: the broker reports accepted:false and the plugin can move on.
@@ -573,21 +595,45 @@ function createRoutes(options = {}) {
     }
 
     const fileKey = parsed.fileKey
-    const opts = isPlainObject(body.options) ? body.options : {}
+    let opts = isPlainObject(body.options) ? body.options : {}
     // A file URL without node-id gets a lightweight index, not a whole-document dump.
     const op = nodeId ? 'read-node' : 'read-document-index'
-    const representation = representationFor(op, opts)
     const mode = body.mode || 'live'
+    let pluginOutdated = false
+    let cachedFallback = null
+    if (isRestRepresentation(opts.representation)) {
+      // REST JSON describes nodes; a file link reads the document index.
+      if (op !== 'read-node') {
+        opts = withoutRepresentation(opts)
+      } else if (mode === 'cached') {
+        // What a plugin too old to export REST JSON read live is stored as node-subtree.
+        cachedFallback = representationFor(op, withoutRepresentation(opts))
+      } else {
+        const target = sessionFor(fileKey)
+        if (target && !target.capabilities.includes(REST_REPRESENTATION)) {
+          // That plugin reads the way it always did, and the answer says it is out of date.
+          opts = withoutRepresentation(opts)
+          pluginOutdated = true
+        }
+      }
+    }
+    const representation = representationFor(op, opts)
     const envelope = readEnvelope({ fileKey, nodeId })
 
-    if (mode === 'cached') return serveCached(req, res, { fileKey, nodeId, representation, envelope })
-    return serveLive(req, res, { fileKey, nodeId, representation, op, opts, envelope, timeoutMs: body.timeoutMs })
+    if (mode === 'cached') return serveCached(req, res, { fileKey, nodeId, representation, cachedFallback, envelope })
+    return serveLive(req, res, {
+      fileKey, nodeId, representation, op, opts, envelope, timeoutMs: body.timeoutMs, fresh: body.fresh === true, pluginOutdated,
+    })
   }
 
-  function serveCached(req, res, { fileKey, nodeId, representation, envelope }) {
+  function serveCached(req, res, { fileKey, nodeId, representation, cachedFallback, envelope }) {
     let entry = null
     try {
       entry = cache.get({ fileKey, nodeId, representation })
+      if (!entry && cachedFallback) {
+        entry = cache.get({ fileKey, nodeId, representation: cachedFallback })
+        if (entry) representation = cachedFallback
+      }
     } catch (error) {
       log('warn', `bridge: cache lookup failed: ${safeText(error.message)}`)
       entry = null
@@ -618,12 +664,15 @@ function createRoutes(options = {}) {
       completeness: entry.completeness ? normalizeCompleteness(entry.completeness) : null,
       mode: 'cached',
       representation,
+      ...(typeof entry.format === 'string' ? { format: entry.format } : {}),
       payload: entry.payload === undefined ? null : entry.payload,
     })
   }
 
-  async function serveLive(req, res, { fileKey, nodeId, representation, op, opts, envelope, timeoutMs }) {
-    // A live read is live or it is an error. No cache fallback, no REST fallback.
+  async function serveLive(req, res, { fileKey, nodeId, representation, op, opts, envelope, timeoutMs, fresh, pluginOutdated }) {
+    // A live read is the plugin's answer, either read now or read earlier and
+    // confirmed by the plugin as unchanged since, or it is an error. No cache
+    // fallback, no REST fallback.
     let hasSession = false
     try { hasSession = Boolean(broker.hasSessionForFile(fileKey)) } catch { hasSession = false }
     if (!hasSession) {
@@ -633,6 +682,34 @@ function createRoutes(options = {}) {
         + '(press Pair with bridge the first time), then retry. '
         + 'Pass mode "cached" to read explicitly unverified data instead.',
         { ...envelope, mode: 'live', representation })
+    }
+
+    const reusable = fresh ? null : await reusableEntry({ fileKey, nodeId, representation })
+    if (reusable) {
+      const { entry, ageMs } = reusable
+      return sendJSON(req, res, 200, {
+        ...envelope,
+        fileName: entry.fileName || null,
+        nodeId: entry.nodeId || nodeId,
+        pageId: entry.pageId || null,
+        pageName: entry.pageName || null,
+        source: 'plugin',
+        fetchedAt: toIso(entry.fetchedAt),
+        freshness: 'live',
+        verifiedFresh: true,
+        stale: false,
+        ageMs,
+        reused: true,
+        truncated: Boolean(entry.truncated),
+        completeness: normalizeCompleteness(entry.completeness),
+        mode: 'live',
+        representation,
+        sessionId: entry.sessionId,
+        requestId: null,
+        cached: true,
+        ...(typeof entry.format === 'string' ? { format: entry.format } : {}),
+        payload: entry.payload === undefined ? null : entry.payload,
+      })
     }
 
     let dedupeKey
@@ -656,47 +733,11 @@ function createRoutes(options = {}) {
     }
 
     const result = answer && answer.result
-    if (!isPlainObject(result)) {
-      return sendError(req, res, 502, 'UPSTREAM_INVALID', 'The plugin returned an unusable result',
-        { ...envelope, mode: 'live', representation })
-    }
+    const refused = refuseResult(result, { fileKey, nodeId })
+    if (refused) return sendError(req, res, refused.status, refused.code, refused.message, { ...envelope, mode: 'live', representation })
 
-    const resultCode = (isPlainObject(result.error) && result.error.code) || result.code
-    if (result.found === false || resultCode === 'NODE_NOT_FOUND') {
-      return sendError(req, res, 404, 'NODE_NOT_FOUND',
-        `The plugin could not find node ${nodeId || '(document)'} in file ${fileKey}. `
-        + 'It may have been deleted, or the link may point at a different file.',
-        { ...envelope, mode: 'live', representation })
-    }
-
-    // Defence in depth on top of the broker's routing: never accept a payload
-    // that claims to come from another file, and never cache it.
-    if (typeof result.fileKey === 'string' && !identity.sameFile(result.fileKey, fileKey)) {
-      log('error', 'bridge: discarded a plugin result whose file key did not match the request')
-      return sendError(req, res, 502, 'FILE_MISMATCH',
-        'The answering plugin session reported a different file; the result was discarded',
-        { ...envelope, mode: 'live', representation })
-    }
-
-    const completeness = normalizeCompleteness(result.completeness)
-    const truncated = Boolean(result.truncated || completeness.limitHit)
     const fetchedAt = toIso(answer.respondedAt) || new Date(now()).toISOString()
-    const entry = {
-      fileKey,
-      fileName: typeof result.fileName === 'string' ? result.fileName : null,
-      nodeId: typeof result.nodeId === 'string' ? result.nodeId : nodeId,
-      pageId: typeof result.pageId === 'string' ? result.pageId : null,
-      pageName: typeof result.pageName === 'string' ? result.pageName : null,
-      representation,
-      source: 'plugin',
-      fetchedAt,
-      sessionId: answer.sessionId || null,
-      pluginInstanceId: typeof result.pluginInstanceId === 'string' ? result.pluginInstanceId : null,
-      verifiedFresh: true,
-      truncated,
-      completeness,
-      payload: result.payload === undefined ? null : result.payload,
-    }
+    const entry = entryFor({ fileKey, nodeId, representation, result, sessionId: answer.sessionId || null, fetchedAt })
 
     let cached = false
     try {
@@ -719,15 +760,139 @@ function createRoutes(options = {}) {
       verifiedFresh: true,
       stale: false,
       ageMs: 0,
-      truncated,
-      completeness,
+      truncated: entry.truncated,
+      completeness: entry.completeness,
       mode: 'live',
       representation,
       sessionId: answer.sessionId || null,
       requestId: answer.requestId || null,
       cached,
+      ...readDetails(result),
+      ...(pluginOutdated ? { pluginOutdated: true } : {}),
       payload: entry.payload,
     })
+  }
+
+  // Why a plugin result cannot be served or cached, or null when it can.
+  function refuseResult(result, { fileKey, nodeId }) {
+    if (!isPlainObject(result)) {
+      return { status: 502, code: 'UPSTREAM_INVALID', message: 'The plugin returned an unusable result' }
+    }
+    const resultCode = (isPlainObject(result.error) && result.error.code) || result.code
+    if (result.found === false || resultCode === 'NODE_NOT_FOUND') {
+      return {
+        status: 404,
+        code: 'NODE_NOT_FOUND',
+        message: `The plugin could not find node ${nodeId || '(document)'} in file ${fileKey}. `
+          + 'It may have been deleted, or the link may point at a different file.',
+      }
+    }
+    // Defence in depth on top of the broker's routing: never accept a payload
+    // that claims to come from another file, and never cache it.
+    if (typeof result.fileKey === 'string' && !identity.sameFile(result.fileKey, fileKey)) {
+      log('error', 'bridge: discarded a plugin result whose file key did not match the request')
+      return {
+        status: 502,
+        code: 'FILE_MISMATCH',
+        message: 'The answering plugin session reported a different file; the result was discarded',
+      }
+    }
+    return null
+  }
+
+  function entryFor({ fileKey, nodeId, representation, result, sessionId, fetchedAt }) {
+    const completeness = normalizeCompleteness(result.completeness)
+    return {
+      fileKey,
+      fileName: typeof result.fileName === 'string' ? result.fileName : null,
+      nodeId: typeof result.nodeId === 'string' ? result.nodeId : nodeId,
+      pageId: typeof result.pageId === 'string' ? result.pageId : null,
+      pageName: typeof result.pageName === 'string' ? result.pageName : null,
+      representation,
+      source: 'plugin',
+      fetchedAt,
+      sessionId,
+      pluginInstanceId: typeof result.pluginInstanceId === 'string' ? result.pluginInstanceId : null,
+      verifiedFresh: true,
+      truncated: Boolean(result.truncated || completeness.limitHit),
+      completeness,
+      format: typeof result.format === 'string' ? result.format : null,
+      editSeq: Number.isInteger(result.editSeq) ? result.editSeq : null,
+      payload: result.payload === undefined ? null : result.payload,
+    }
+  }
+
+  // How the plugin read: the payload's layout, why it fell back to its own
+  // reading, and how long the read took.
+  function readDetails(result) {
+    const details = {}
+    if (typeof result.format === 'string') details.format = safeText(result.format, 40)
+    if (typeof result.fallbackReason === 'string') details.fallbackReason = safeText(result.fallbackReason)
+    if (isPlainObject(result.timing)) {
+      const timing = {}
+      for (const key of ['countMs', 'exportMs', 'totalMs']) {
+        if (Number.isFinite(result.timing[key])) timing[key] = result.timing[key]
+      }
+      details.timing = timing
+    }
+    return details
+  }
+
+  // The session a read for this file would go to, and what its plugin can do.
+  // null when the broker cannot say.
+  function sessionFor(fileKey) {
+    if (typeof broker.sessionFor !== 'function') return null
+    try {
+      const target = broker.sessionFor(fileKey)
+      if (!target) return null
+      return { sessionId: target.sessionId, capabilities: Array.isArray(target.capabilities) ? target.capabilities : [] }
+    } catch {
+      return null
+    }
+  }
+
+  // A read the plugin answered before is answered again without reading, when
+  // the plugin that answered it confirms nothing was edited since that read
+  // began: its edit count, which every edit Figma reports moves on, still
+  // matches the count the read began at. The plugin answers that at once, even
+  // in the middle of another read, so a reused read never waits in its queue.
+  async function reusableEntry({ fileKey, nodeId, representation }) {
+    const target = sessionFor(fileKey)
+    if (!target || !target.capabilities.includes('edit-seq')) return null
+    let entry = null
+    try { entry = cache.get({ fileKey, nodeId, representation }) } catch { return null }
+    if (!entry || entry.source !== 'plugin' || entry.sessionId !== target.sessionId || !Number.isInteger(entry.editSeq)) return null
+    const ageMs = now() - Date.parse(entry.fetchedAt)
+    if (!(ageMs >= 0 && ageMs <= REUSE_MAX_AGE_MS)) return null
+
+    let answer
+    try {
+      answer = await broker.request({ fileKey, op: 'edit-seq', params: { fileKey }, timeoutMs: EDIT_SEQ_TIMEOUT_MS, dedupeKey: 'edit-seq' })
+    } catch {
+      return null
+    }
+    const result = answer && answer.result
+    if (!answer || answer.sessionId !== entry.sessionId || !isPlainObject(result) || result.editSeq !== entry.editSeq) return null
+    return { entry, ageMs }
+  }
+
+  // A read the plugin finished after its caller gave up is still the plugin's
+  // answer. Kept, it lets the caller's retry be served without reading again.
+  // It never replaces a newer read of the same node by the same plugin.
+  function keepLateResult(late, result) {
+    if (!isPlainObject(late) || !READ_OPS.has(late.op) || !isPlainObject(late.params)) return
+    const { params, fileKey, sessionId } = late
+    const nodeId = late.op === 'read-node' && typeof params.nodeId === 'string' ? params.nodeId : null
+    const representation = typeof params.representation === 'string' ? params.representation : null
+    if (!representation || !sessionId || refuseResult(result, { fileKey, nodeId })) return
+    try {
+      const existing = cache.get({ fileKey, nodeId, representation })
+      if (existing && existing.sessionId === sessionId && Number.isInteger(existing.editSeq)
+        && !(Number.isInteger(result.editSeq) && result.editSeq >= existing.editSeq)) return
+      cache.put(entryFor({ fileKey, nodeId, representation, result, sessionId, fetchedAt: new Date(now()).toISOString() }))
+    } catch (error) {
+      log('warn', `bridge: could not cache a late read result: ${safeText(error.message)}`)
+    }
   }
 
   // ── Pairing routes ──────────────────────────────────────

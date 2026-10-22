@@ -222,7 +222,9 @@ test('queued manual sync survives disabling auto sync and a failed request', asy
 
 test('mixed text and corner properties do not break full-page serialization or messaging', async () => {
   const currentPage = page()
-  currentPage.children[0].cornerRadius = Symbol('mixed')
+  Object.assign(currentPage.children[0], {
+    cornerRadius: Symbol('mixed'), topLeftRadius: 12, topRightRadius: 12, bottomRightRadius: 0, bottomLeftRadius: 4,
+  })
   Object.assign(currentPage.children[0].children[0], {
     fontSize: Symbol('mixed'), fontName: Symbol('mixed'), letterSpacing: Symbol('mixed'),
   })
@@ -231,6 +233,7 @@ test('mixed text and corner properties do not break full-page serialization or m
   assert.equal(p.notifications.length, 0)
   const frame = p.syncs()[0].data.nodes[0]
   assert.equal(frame.cornerRadius, undefined)
+  assert.deepEqual(frame.rectangleCornerRadii, [12, 12, 0, 4])
   assert.equal(frame.children[0].fontSize, undefined)
   assert.equal(frame.children[0].characters, 'Hello')
 })
@@ -1138,4 +1141,295 @@ test('a heartbeat of a replaced session does not start a second heartbeat chain'
   await settleUi()
   assert.equal(sessions, 2)
   assert.equal(heartbeats(), 1, 'the old heartbeat scheduled another one for the new session')
+})
+
+test('the panel tells the bridge it can export REST JSON and report its edit count', async () => {
+  const calls = []
+  const panel = ui(async (url, options = {}) => {
+    calls.push({ url, body: options.body ? JSON.parse(options.body) : null })
+    if (url.endsWith('/bridge/session')) return respondWith(201, { sessionId: 'sess-1', sessionSecret: 'secret-1' })
+    return new Promise(() => {})
+  })
+  await panel.post({ type: 'bridge-start', config: savedConfig })
+  await settleUi()
+  const register = calls.find(call => call.url.endsWith('/bridge/session'))
+  assert.deepEqual(register.body.capabilities, ['read-node', 'read-document-index', 'figma-rest', 'edit-seq'])
+})
+
+// What Figma's JSON_REST_V1 export gives for a fake layer: the REST API's
+// shape, with the REST-only fields a test puts under `rest`.
+function restDocument(node) {
+  const rest = { id: node.id, name: node.name, type: node.type, ...(node.rest || {}) }
+  if (node.visible === false) rest.visible = false
+  if (typeof node.characters === 'string') rest.characters = node.characters
+  if (node.children) rest.children = node.children.map(restDocument)
+  return rest
+}
+
+// Gives every layer under node an exportAsync, and records which were exported.
+function exportable(node, exports = []) {
+  node.exportAsync = async settings => {
+    // The settings come from the plugin's realm: compare the value, not the object.
+    assert.equal(settings.format, 'JSON_REST_V1')
+    exports.push(node.id)
+    return { document: restDocument(node), components: node.components || {}, componentSets: {}, styles: {}, schemaVersion: 0 }
+  }
+  for (const child of node.children || []) exportable(child, exports)
+  return exports
+}
+
+async function readRest(p, nodeId, options, representation = 'figma-rest') {
+  await p.message({
+    type: 'bridge-request', sessionId: 'session-1',
+    request: { requestId: `rest-${nodeId}`, op: 'read-node', params: { fileKey: 'AAAAfileKeyAAAA', nodeId, representation, options } },
+  })
+  return p.sent.filter(message => message.type === 'bridge-result').at(-1)
+}
+
+test('Bridge reads a node through the REST export, with mixed corners, text runs and variables', async () => {
+  const p = await connectedBridgePlugin()
+  const frame = p.target.parent
+  frame.rest = { rectangleCornerRadii: [12, 12, 0, 4] }
+  p.target.rest = {
+    style: { fontFamily: 'Inter', fontSize: 14, fontWeight: 400 },
+    characterStyleOverrides: [0, 0, 0, 0, 0, 1, 1],
+    styleOverrideTable: { 1: { fontWeight: 700 } },
+    fills: [{
+      blendMode: 'NORMAL', type: 'SOLID', color: { r: 1, g: 0, b: 0, a: 1 },
+      boundVariables: { color: { type: 'VARIABLE_ALIAS', id: 'VariableID:7:1' } },
+    }],
+  }
+  const exports = exportable(frame)
+  p.figma.variables = {
+    getVariableByIdAsync: async id => (id === 'VariableID:7:1' ? {
+      id, name: 'color/danger', resolvedType: 'COLOR', variableCollectionId: 'VariableCollectionId:7:0',
+      codeSyntax: { WEB: 'var(--color-danger)' },
+    } : null),
+    getVariableCollectionByIdAsync: async id => ({ id, name: 'Tokens' }),
+  }
+
+  const reply = await readRest(p, frame.id)
+  assert.equal(reply.ok, true)
+  assert.equal(reply.result.format, 'figma-rest')
+  assert.deepEqual(exports, [frame.id], 'one export for the whole subtree')
+  const { document, variables } = reply.result.payload
+  assert.deepEqual(document.rectangleCornerRadii, [12, 12, 0, 4])
+  assert.deepEqual(document.children[0].styleOverrideTable, { 1: { fontWeight: 700 } })
+  assert.deepEqual(document.children[0].characterStyleOverrides, [0, 0, 0, 0, 0, 1, 1])
+  assert.equal(document.children[0].characters, 'Hello from another page')
+  assert.deepEqual(variables, {
+    'VariableID:7:1': { name: 'color/danger', resolvedType: 'COLOR', collection: 'Tokens', codeSyntax: { WEB: 'var(--color-danger)' } },
+  })
+  assert.equal(reply.result.completeness.nodeCount, 2)
+  assert.equal(reply.result.completeness.byteSize, Buffer.byteLength(JSON.stringify(reply.result.payload)))
+  assert.equal(reply.result.truncated, false)
+  assert.equal(reply.result.editSeq, 0)
+  assert.equal(reply.result.pageId, p.otherPage.id)
+  for (const key of ['countMs', 'exportMs', 'totalMs']) assert.equal(typeof reply.result.timing[key], 'number')
+})
+
+test('Bridge outlines a subtree too large to export whole and exports its children one by one', async () => {
+  const p = await connectedBridgePlugin()
+  const { screen, nodes } = nestedScreen(p.otherPage)
+  p.figma.getNodeByIdAsync = async id => nodes.get(id) || null
+  Object.assign(screen, {
+    layoutMode: 'VERTICAL', itemSpacing: 24,
+    cornerRadius: Symbol('mixed'), topLeftRadius: 16, topRightRadius: 16, bottomRightRadius: 0, bottomLeftRadius: 0,
+  })
+  const exports = exportable(screen)
+
+  const reply = await readRest(p, screen.id, { maxNodes: 100 })
+  const { document } = reply.result.payload
+  assert.equal(reply.ok, true)
+  assert.equal(document.partial, true)
+  assert.equal(document.layoutMode, 'VERTICAL')
+  assert.equal(document.itemSpacing, 24)
+  assert.deepEqual(document.rectangleCornerRadii, [16, 16, 0, 0])
+  assert.equal(document.truncated, true)
+  // Nineteen cards fit whole; the twentieth is outlined down to the two text
+  // layers that still fit.
+  assert.equal(document.children.length, 20)
+  assert.equal(document.children[0].partial, undefined)
+  assert.equal(document.children[0].children[0].children.length, 3)
+  assert.equal(document.children[19].partial, true)
+  assert.equal(document.children[19].children[0].partial, true)
+  assert.equal(document.children[19].children[0].children.length, 2)
+  assert.equal(reply.result.completeness.nodeCount, 100)
+  assert.equal(reply.result.completeness.limitHit, true)
+  assert.equal(exports.length, 21)
+  assert.ok(!exports.includes(screen.id))
+})
+
+test('Bridge outlines layers within the depth asked for and exports nothing deeper', async () => {
+  const p = await connectedBridgePlugin()
+  const { screen, nodes } = nestedScreen(p.otherPage)
+  p.figma.getNodeByIdAsync = async id => nodes.get(id) || null
+  const exports = exportable(screen)
+
+  const reply = await readRest(p, screen.id, { depth: 1 })
+  const { document } = reply.result.payload
+  assert.equal(document.partial, true)
+  assert.equal(document.children.length, 60)
+  assert.equal(document.children[0].partial, true)
+  assert.deepEqual(document.children[0].children, [{ id: '3:3', name: 'Body', type: 'FRAME', truncated: true }])
+  assert.deepEqual(exports, [])
+  assert.equal(reply.result.truncated, true)
+})
+
+test('Bridge outlines a layer Figma fails to export once exports work, and keeps going', async () => {
+  const p = await connectedBridgePlugin()
+  const { screen, nodes } = nestedScreen(p.otherPage)
+  p.figma.getNodeByIdAsync = async id => nodes.get(id) || null
+  exportable(screen)
+  screen.children[1].exportAsync = async () => { throw new Error('Unsupported layer') }
+
+  const reply = await readRest(p, screen.id, { maxNodes: 100 })
+  const card = reply.result.payload.document.children[1]
+  assert.equal(reply.ok, true)
+  assert.equal(card.partial, true)
+  assert.match(card.exportError, /Unsupported layer/)
+  assert.equal(card.children[0].children.length, 3)
+})
+
+test('Bridge falls back to its own reading when Figma cannot export JSON, and says why', async () => {
+  const p = await connectedBridgePlugin()
+  const reply = await readRest(p, p.target.parent.id)
+  assert.equal(reply.ok, true)
+  assert.equal(reply.result.format, 'node-subtree')
+  assert.match(reply.result.fallbackReason, /could not export layer 2:1 as JSON/)
+  assert.equal(reply.result.payload.children[0].characters, 'Hello from another page')
+})
+
+test('Bridge leaves hidden layers out of an export when includeHidden is false', async () => {
+  const p = await connectedBridgePlugin()
+  const frame = p.target.parent
+  frame.children.push({ id: '2:9', name: 'Hidden note', type: 'TEXT', characters: 'Draft', visible: false, parent: frame })
+  exportable(frame)
+
+  const all = await readRest(p, frame.id)
+  assert.deepEqual(all.result.payload.document.children.map(child => child.id), ['2:2', '2:9'])
+  const visible = await readRest(p, frame.id, { includeHidden: false })
+  assert.deepEqual(visible.result.payload.document.children.map(child => child.id), ['2:2'])
+  assert.equal(visible.result.completeness.nodeCount, 2)
+})
+
+test('Bridge trims an exported tree to maxBytes and measures the whole payload', async () => {
+  const p = await connectedBridgePlugin()
+  const { screen, nodes } = nestedScreen(p.otherPage)
+  p.figma.getNodeByIdAsync = async id => nodes.get(id) || null
+  screen.components = { '9:1': { key: 'abc', name: 'Card', description: '' } }
+  exportable(screen)
+
+  const reply = await readRest(p, screen.id, { maxBytes: 8000 })
+  const payload = reply.result.payload
+  const bytes = Buffer.byteLength(JSON.stringify(payload))
+  assert.equal(reply.result.truncated, true)
+  assert.ok(bytes <= 8000, `${bytes} bytes`)
+  assert.ok(bytes > 6000, `trimmed too far: ${bytes} bytes`)
+  assert.equal(reply.result.completeness.byteSize, bytes)
+  assert.equal(payload.document.children[0].name, 'Card 0')
+  assert.deepEqual(payload.components, { '9:1': { key: 'abc', name: 'Card', description: '' } })
+  assert.equal(reply.result.completeness.nodeCount, countTree(payload.document))
+})
+
+test('Bridge caps exported text together with its per-character styles', async () => {
+  const p = await connectedBridgePlugin({ characters: 'a'.repeat(100_010) })
+  p.target.rest = { characterStyleOverrides: new Array(100_010).fill(1), lineTypes: ['NONE'] }
+  exportable(p.target.parent)
+
+  const reply = await readRest(p, p.target.parent.id)
+  const text = reply.result.payload.document.children[0]
+  assert.equal(text.characters.length, 100_000)
+  assert.equal(text.characterStyleOverrides.length, 100_000)
+  assert.equal(text.textTruncated, true)
+  assert.ok(reply.result.completeness.truncatedNodeIds.includes(p.target.id))
+})
+
+test('Bridge adds vector paths only when the read asks for geometry', async () => {
+  const p = await connectedBridgePlugin()
+  const frame = p.target.parent
+  const icon = {
+    id: '2:5', name: 'Icon', type: 'VECTOR', parent: frame,
+    fillGeometry: [{ windingRule: 'NONZERO', data: 'M0 0L10 0L10 10Z' }], strokeGeometry: [],
+  }
+  frame.children.push(icon)
+  const nodes = new Map([[frame.id, frame], [icon.id, icon], [p.target.id, p.target]])
+  p.figma.getNodeByIdAsync = async id => nodes.get(id) || null
+  exportable(frame)
+
+  const plain = await readRest(p, frame.id)
+  assert.equal(plain.result.payload.document.children[1].fillGeometry, undefined)
+  const shaped = await readRest(p, frame.id, undefined, 'figma-rest+geometry')
+  assert.deepEqual(shaped.result.payload.document.children[1].fillGeometry, [{ path: 'M0 0L10 0L10 10Z', windingRule: 'NONZERO' }])
+  assert.equal(shaped.result.payload.document.children[1].strokeGeometry, undefined)
+})
+
+test('Bridge answers its edit count at once, even mid-read, and stamps each read with the count it began at', async () => {
+  const p = await connectedBridgePlugin({ now: steppingClock(), manualYield: true })
+  const { screen, nodes } = flatScreen(p.otherPage, 40)
+  p.figma.getNodeByIdAsync = async id => nodes.get(id) || null
+  const askEditSeq = requestId => p.message({
+    type: 'bridge-request', sessionId: 'session-1',
+    request: { requestId, op: 'edit-seq', params: { fileKey: 'AAAAfileKeyAAAA' } },
+  })
+  const results = () => p.sent.filter(message => message.type === 'bridge-result')
+
+  const pending = p.message(readRequest('paced', screen.id))
+  await new Promise(resolve => setImmediate(resolve))
+  p.emit('documentchange')
+  await askEditSeq('seq-1')
+  assert.deepEqual(results().map(message => message.requestId), ['seq-1'], 'answered before the read')
+  assert.deepEqual(results()[0].result, { fileKey: 'AAAAfileKeyAAAA', editSeq: 1 })
+  await settle(p, pending)
+
+  const read = results().at(-1)
+  assert.equal(read.requestId, 'paced')
+  assert.equal(read.result.editSeq, 0, 'the read began before the edit')
+  await askEditSeq('seq-2')
+  assert.equal(results().at(-1).result.editSeq, 1)
+})
+
+test('Bridge skips a read whose deadline passed while it waited', async () => {
+  const p = await connectedBridgePlugin()
+  const results = () => p.sent.filter(message => message.type === 'bridge-result')
+  const read = (requestId, expiresAt) => p.message({
+    type: 'bridge-request', sessionId: 'session-1',
+    request: { requestId, op: 'read-node', expiresAt, params: { fileKey: 'AAAAfileKeyAAAA', nodeId: p.target.id } },
+  })
+
+  await read('expired', Date.now() - 1)
+  assert.equal(results().length, 0)
+  await read('current', Date.now() + 60_000)
+  assert.deepEqual(results().map(message => message.requestId), ['current'])
+})
+
+test('Bridge answers a read waiting right behind the same read with its answer, unless an edit came in between', async () => {
+  const p = await connectedBridgePlugin({ now: steppingClock(), manualYield: true })
+  const { screen, nodes } = flatScreen(p.otherPage, 30)
+  let reads = 0
+  p.figma.getNodeByIdAsync = async id => {
+    if (id === screen.id) reads++
+    return nodes.get(id) || null
+  }
+  const results = () => p.sent.filter(message => message.type === 'bridge-result')
+  const index = { type: 'bridge-request', sessionId: 'session-1', request: { requestId: 'index', op: 'read-document-index', params: { fileKey: 'AAAAfileKeyAAAA' } } }
+
+  // A caller timed out and asked again while the first read was still running.
+  await settle(p, Promise.all([p.message(readRequest('first', screen.id)), p.message(readRequest('retry', screen.id))]))
+  assert.deepEqual(results().map(message => message.requestId), ['first', 'retry'])
+  assert.equal(reads, 1)
+  assert.deepEqual(results()[1].result, results()[0].result)
+
+  const edited = p.message(readRequest('edited', screen.id))
+  const after = p.message(readRequest('after-edit', screen.id))
+  await new Promise(resolve => setImmediate(resolve))
+  p.emit('documentchange')
+  await settle(p, Promise.all([edited, after]))
+  assert.equal(reads, 3, 'an edit during the read made the next one read again')
+  assert.equal(results().at(-1).result.editSeq, 1)
+
+  // Another read in between: the answer is not held while it runs.
+  await settle(p, Promise.all([p.message(readRequest('before', screen.id)), p.message(index), p.message(readRequest('behind', screen.id))]))
+  assert.equal(reads, 5)
+  assert.deepEqual(results().slice(-3).map(message => message.requestId), ['before', 'index', 'behind'])
 })

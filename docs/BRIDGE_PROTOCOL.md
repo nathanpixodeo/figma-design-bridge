@@ -124,7 +124,7 @@ Registers a plugin instance as the answering session for one Figma file.
   "fileKey": "abc123DEF456",
   "fileName": "Website",
   "pluginInstanceId": "plugin-7f3c",
-  "capabilities": ["read-node", "read-document-index"]
+  "capabilities": ["read-node", "read-document-index", "figma-rest", "edit-seq"]
 }
 ```
 
@@ -134,6 +134,15 @@ Registers a plugin instance as the answering session for one Figma file.
 | `fileName` | No | Display name, max 200 characters |
 | `pluginInstanceId` | Yes | Identifies this plugin instance |
 | `capabilities` | No | Up to 16 short identifiers |
+
+| Capability | Meaning |
+|------------|---------|
+| `read-node`, `read-document-index` | Answers those ops |
+| `figma-rest` | Exports a node as Figma's REST JSON (representation `figma-rest`), since 1.5.0 |
+| `edit-seq` | Answers `edit-seq` at once with its edit count, which lets the bridge reuse its reads, since 1.5.0 |
+
+A read asking for `figma-rest` from a session without that capability is
+served as `node-subtree` instead, and the response says `pluginOutdated: true`.
 
 **Response `201 Created`:**
 
@@ -180,9 +189,11 @@ empty when `waitMs` elapses.
       "params": {
         "fileKey": "abc123DEF456",
         "nodeId": "1:23",
-        "representation": "node-subtree",
-        "options": {}
-      }
+        "representation": "figma-rest",
+        "options": { "representation": "figma-rest" }
+      },
+      "enqueuedAt": 1789639205000,
+      "expiresAt": 1789639235000
     }
   ],
   "waitMs": 25000
@@ -190,7 +201,17 @@ empty when `waitMs` elapses.
 ```
 
 `op` is `read-node` when the read named a node, or `read-document-index` when it
-named a bare file URL.
+named a bare file URL. `edit-seq` asks for the plugin's edit count, which every
+edit Figma reports to the plugin moves on; the plugin answers it at once with
+`{ "fileKey": "…", "editSeq": 7 }`, outside its read queue, even in the middle
+of a read.
+
+The plugin serves reads one at a time, in the order they arrive. A read still
+waiting when its `expiresAt` passes is skipped: its caller already has its
+`TIMEOUT`. A read waiting right behind the same read (same op, node,
+representation and options) is answered with that read's result when no edit
+came in since it began, which is what a caller retrying after a timeout asks
+for.
 
 If the plugin's connection closes before the answer was fully sent, the poll is
 dropped and the requests it held go back to the front of the session's queue,
@@ -222,10 +243,17 @@ Delivers a result for one polled request.
     "found": true,
     "truncated": false,
     "completeness": { "nodeCount": 142, "byteSize": 28416, "limitHit": false, "truncatedNodeIds": [] },
+    "format": "figma-rest",
+    "editSeq": 7,
+    "timing": { "countMs": 12, "exportMs": 180, "totalMs": 240 },
     "payload": { }
   }
 }
 ```
+
+`editSeq` is the plugin's edit count when the read began. `format` says how the
+payload is laid out, `timing` how long the read took, and `fallbackReason` why a
+`figma-rest` read came back as `node-subtree`.
 
 **Response `200 OK`:**
 
@@ -236,7 +264,10 @@ Delivers a result for one polled request.
 A reply that arrives after its request already timed out, or that names a
 request belonging to a different session, is **not** an error — it answers
 `200 { "accepted": false, "reason": "…" }` so the plugin can discard the work and
-move on. Such a reply never reaches a waiting caller and is never cached.
+move on. Such a reply never reaches a waiting caller. A successful read reply
+from the session the request went to is still cached as a live read, so the
+caller's retry can be answered from it, unless the cache already holds a read of
+that node from that session that began at a higher edit count.
 
 ---
 
@@ -287,7 +318,7 @@ The route an MCP adapter calls with the URL a user pasted.
   "source": "https://www.figma.com/design/FILE_KEY/Design?node-id=1-23",
   "mode": "live",
   "timeoutMs": 30000,
-  "options": { "depth": 12, "maxNodes": 5000 }
+  "options": { "representation": "figma-rest", "depth": 12, "maxNodes": 5000 }
 }
 ```
 
@@ -296,6 +327,7 @@ The route an MCP adapter calls with the URL a user pasted.
 | `source` | Yes | Figma URL or bare file key, max 2000 characters |
 | `mode` | No | `"live"` (default) or `"cached"` |
 | `timeoutMs` | No | 1–120000, default 30000 |
+| `fresh` | No | `true` reads again instead of reusing an unchanged read (see [Reuse](#reuse)). Since 1.5.0; send it only when `true`, since an older bridge rejects the field |
 | `options` | No | See below |
 
 | Option | Range | Plugin default |
@@ -306,11 +338,36 @@ The route an MCP adapter calls with the URL a user pasted.
 | `maxBytes` | integer 1024–10000000, in UTF-8 bytes of the serialized payload | 2000000 |
 | `includeHidden` | boolean; hidden layers come back with `visible: false` | `true` |
 
-The caps keep a read inside what the plugin can serve. It walks roughly 270–600
-nodes a second, so 20,000 nodes take about 90 s, close to the 120 s `timeoutMs`
-ceiling. The walk runs in slices of about 50 ms and hands control back to Figma
-between them, so Figma, the panel and its heartbeats stay responsive during a
-long read. The plugin serves one read at a time, in the order they arrive.
+`representation` names how a node is read:
+
+- `figma-rest` (what the MCP server asks for since 1.5.0): Figma's REST API JSON,
+  the same as `GET /v1/files/:key/nodes?ids=:id`, exported inside Figma with
+  `exportAsync({ format: 'JSON_REST_V1' })`. The payload is
+  `{ document, components, componentSets, styles, variables }`, where
+  `variables` maps every variable id the tree binds to its `name`,
+  `collection`, `resolvedType` and `codeSyntax`. `figma-rest+geometry` adds
+  `fillGeometry` and `strokeGeometry` to vector layers, as REST's
+  `geometry=paths` does.
+- `node-subtree`: the plugin's own reading, property by property.
+
+A file link reads the document index whatever representation was asked for.
+
+For `figma-rest`, the plugin first counts a subtree by walking its `children`
+only, and exports it whole when it fits what is left of `maxNodes` (at most 5,000
+nodes per export) and of `depth`. A layer that does not fit is marked
+`partial: true`: its own box, layout, paint, effects and bound variables are read
+directly, in the REST API's names, and its children are exported one by one.
+Layers below `depth` become `{ id, name, type, truncated: true }`, text longer
+than 100,000 characters is cut with its per-character styles (`textTruncated:
+true`), and a layer Figma fails to export once others exported carries
+`exportError`. When the first export fails, the plugin reads the whole node as
+`node-subtree` instead and says why in `fallbackReason`.
+
+For `node-subtree`, the plugin walks roughly 270–600 nodes a second, so 20,000
+nodes take about 90 s, close to the 120 s `timeoutMs` ceiling. Both walks run in
+slices of about 50 ms and hand control back to Figma between them, so Figma, the
+panel and its heartbeats stay responsive during a long read. The plugin serves
+one read at a time, in the order they arrive.
 
 A URL `node-id` in dash form (`1-23`) is canonicalized to colon form (`1:23`).
 A source with no node id asks for a lightweight document index rather than a
@@ -348,24 +405,56 @@ listed node may itself have been removed by a later cut.
   "truncated": false,
   "completeness": { "nodeCount": 142, "byteSize": 28416, "limitHit": false, "truncatedNodeIds": [] },
   "mode": "live",
-  "representation": "node-subtree+d12+n5000",
+  "representation": "figma-rest+d12+n5000",
   "sessionId": "s_9f2a…",
   "requestId": "r_41b0…",
   "cached": true,
+  "format": "figma-rest",
+  "timing": { "countMs": 12, "exportMs": 180, "totalMs": 240 },
   "payload": { }
 }
 ```
 
+`format`, `timing` and `fallbackReason` repeat what the plugin reported.
+`pluginOutdated: true` says the plugin could not export `figma-rest`, so the
+read used `node-subtree` (see the capabilities above).
+
 #### Live mode
 
-`mode: "live"` is live or it is an error. There is no cache fallback and no REST
-fallback. If no plugin session is connected for that file, the read fails with
+`mode: "live"` answers with the plugin's reading or with an error: read now, or
+read earlier and confirmed unchanged by the plugin that read it (see
+[Reuse](#reuse)). There is no cache fallback and no REST fallback. If no plugin
+session is connected for that file, the read fails with
 `409 NO_SESSION_FOR_FILE` and an actionable message — it does not quietly return
 older data.
 
 Concurrent identical reads are coalesced: the same file, node and
 representation requested twice while one is in flight produces one plugin round
 trip and two identical answers.
+
+#### Reuse
+
+A live read is answered from the cache, without the plugin reading, when all of
+these hold:
+
+- the cache holds a read of the same file, node and representation, made by the
+  plugin session the read would go to now, at most five minutes ago;
+- that session has the `edit-seq` capability, and the stored read recorded the
+  edit count it began at;
+- the plugin answers `edit-seq` within 2 s with that same count;
+- the request did not pass `fresh: true`.
+
+The response is then the stored read with `freshness: "live"`,
+`verifiedFresh: true`, `reused: true`, `requestId: null`, the original
+`fetchedAt`, and its age in `ageMs`. The plugin answers `edit-seq` at once, even
+while it reads something else, so a reused read never waits in the plugin's
+queue: any number of agents reading the same unchanged node are answered
+together.
+
+The plugin counts the edits Figma reports to it through `documentchange`. Figma
+does not report every change that way, a change to a variable's value alone for
+one, so a read reused within five minutes of such a change can miss it. Pass
+`fresh: true` to read again.
 
 #### Cached mode
 
@@ -388,9 +477,9 @@ a field:
 | `mode` | How *this* response was served: `"live"` or `"cached"` |
 | `fetchedAt` | When the data was produced |
 | `freshness` | `"live"` or `"unknown"` |
-| `verifiedFresh` | `true` only when a live plugin reply produced this response |
+| `verifiedFresh` | `true` only when a live plugin reply produced this response, now or as a read the plugin confirmed unchanged (`reused: true`) |
 | `stale` | "not verified against the live document", not "known out of date" |
-| `ageMs` | Age of the entry, `0` for a live read |
+| `ageMs` | Age of the entry, `0` for a read made now |
 | `truncated` | Whether a limit cut the payload |
 | `completeness` | `{ nodeCount, byteSize, limitHit, truncatedNodeIds }` |
 
@@ -547,7 +636,7 @@ Errors are distinguishable by design: an agent can tell "plugin offline" from
 | `FILE_MISMATCH` | 502 | A result claimed a different file and was discarded |
 | `UPSTREAM_INVALID` | 502 | The plugin returned an unusable result |
 | `SESSION_LOST` | 503 | The answering session went away mid-request |
-| `TIMEOUT` | 504 | The plugin did not answer within `timeoutMs` |
+| `TIMEOUT` | 504 | The plugin did not answer within `timeoutMs`. The message says how many reads of that session were ahead of it |
 
 An error body is **flat**: `error` is the human-readable message string and
 `code` is the machine-readable code. They are siblings, not nested.
@@ -646,6 +735,12 @@ re-probes and reuses the winner.
   reads it, which for a large page can take longer than the default 30 s
   `timeoutMs`. The read fails with `TIMEOUT`; retry with a larger `timeoutMs`
   (up to 120000) or a smaller `depth` or `maxNodes`.
+- **Reads of one file take turns.** Figma runs a plugin on one thread, so the
+  panel open on a file reads one node at a time. Reads of different files run
+  in parallel, and reused reads do not wait (see [Reuse](#reuse)).
+- **Reuse can miss an edit Figma does not report.** A change to a variable's
+  value alone, for one, does not move the plugin's edit count. Pass
+  `fresh: true` after such a change.
 - **A lone plugin that dies abruptly is noticed late.** Closing the panel sends
   the session's `DELETE` with `keepalive`, so it normally ends at once, and a
   reopened panel takes the reads straight away (see the poll route). But a

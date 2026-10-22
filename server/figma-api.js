@@ -103,6 +103,8 @@ function normalizeFigmaNode(node, context = {}, depth = 0) {
     'layoutGrow', 'layoutAlign', 'layoutPositioning', 'minWidth', 'maxWidth',
     'minHeight', 'maxHeight', 'sectionContentsHidden', 'expanded',
   ])
+  // What the Design Bridge plugin marks on a layer it could not export whole.
+  copyDefined(result, node, ['partial', 'truncated', 'textTruncated', 'exportError'])
 
   if (node.type === 'TEXT') {
     const style = node.style || {}
@@ -114,7 +116,8 @@ function normalizeFigmaNode(node, context = {}, depth = 0) {
     if (style.fontFamily || style.fontPostScriptName || style.fontWeight) {
       result.fontName = {
         family: style.fontFamily || null,
-        style: style.fontPostScriptName || (style.fontWeight ? String(style.fontWeight) : null),
+        // fontStyle, such as "Semi Bold Italic", is what Figma itself calls the style.
+        style: style.fontStyle || style.fontPostScriptName || (style.fontWeight ? String(style.fontWeight) : null),
       }
     }
     if (style.lineHeightPx !== undefined) result.lineHeight = { unit: 'PIXELS', value: style.lineHeightPx }

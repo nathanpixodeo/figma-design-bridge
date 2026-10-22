@@ -115,14 +115,21 @@ function createClient(options = {}) {
       return send('GET', '/bridge/status', { signal })
     },
 
-    read({ source, options: readOptions, mode, timeoutMs: readTimeoutMs, signal } = {}) {
+    read({ source, options: readOptions, mode, timeoutMs: readTimeoutMs, fresh, signal } = {}) {
       const body = { source }
       if (readOptions !== undefined) body.options = readOptions
       if (mode !== undefined) body.mode = mode
       if (readTimeoutMs !== undefined) body.timeoutMs = readTimeoutMs
+      // Sent only when asked for: a bridge older than 1.5.0 rejects the field.
+      if (fresh === true) body.fresh = true
       // Give the server room to hit its own deadline before the socket does.
       const timeout = readTimeoutMs ? readTimeoutMs + 5000 : timeoutMs
-      return send('POST', '/bridge/read', { body, signal, timeout })
+      return send('POST', '/bridge/read', { body, signal, timeout }).catch(error => {
+        // Such a bridge reuses nothing, so every live read it serves is fresh.
+        if (!body.fresh || error.status !== 400 || !/Unknown field "fresh"/.test(error.message)) throw error
+        const { fresh: _fresh, ...older } = body
+        return send('POST', '/bridge/read', { body: older, signal, timeout })
+      })
     },
 
     // Hands the token to the Figma plugin showing this code.

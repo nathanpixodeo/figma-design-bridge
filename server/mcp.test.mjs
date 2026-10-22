@@ -353,12 +353,13 @@ test("a read whose plugin goes away says how to retry with a smaller read", asyn
 });
 
 // Plays the Figma plugin: registers a session for fileKey and answers every
-// read with answer(request) until the test ends.
-async function fakePlugin(t, port, dataDir, fileKey, answer) {
+// read with answer(request) until the test ends. Without capabilities it plays
+// a plugin older than 1.5.0.
+async function fakePlugin(t, port, dataDir, fileKey, answer, capabilities) {
   const base = `http://127.0.0.1:${port}`;
   const auth = { authorization: `Bearer ${tokenIn(dataDir)}`, "content-type": "application/json" };
   const session = await (await fetch(`${base}/bridge/session`, {
-    method: "POST", headers: auth, body: JSON.stringify({ fileKey, fileName: "Checkout", pluginInstanceId: `fake-${fileKey}` }),
+    method: "POST", headers: auth, body: JSON.stringify({ fileKey, fileName: "Checkout", pluginInstanceId: `fake-${fileKey}`, capabilities }),
   })).json();
   const headers = { ...auth, "x-session-secret": session.sessionSecret };
   let running = true;
@@ -416,6 +417,63 @@ test("texts, colors and search refuse a file link, and a truncated read says so"
   assert.match(textOf(texts), /^> Source: Checkout, node 1:2, live read at /);
   assert.match(textOf(texts), /Pay now/);
   assert.match(textOf(texts), /truncated \(1 subtree\(s\) cut\)/);
+  // This plugin registered no capabilities, as one older than 1.5.0 does.
+  assert.match(textOf(texts), /too old to export Figma's REST JSON.*reopen Design Bridge/);
+  const context = JSON.parse(textOf(await client.callTool({ name: "get_design_context", arguments: { source: `${fileLink}?node-id=1-2` } })));
+  assert.equal(context.pluginOutdated, true);
+  assert.equal(context.representation, "node-subtree");
+  assert.match(context.notes.join(" "), /reopen Design Bridge/);
+});
+
+test("a node is read as Figma's REST JSON, and the same read is reused until the plugin reports an edit", async t => {
+  const dataDir = tempDataDir(t);
+  const port = await freePort();
+  const client = await connectMcp(t, { FIGMA_BRIDGE_DATA_DIR: dataDir, FIGMA_BRIDGE_PORT: String(port) });
+  await waitFor(() => bridgeHealthy(port));
+  const reads = [];
+  let editSeq = 4;
+  await fakePlugin(t, port, dataDir, "RestFile1", request => {
+    if (request.op === "edit-seq") return { fileKey: "RestFile1", editSeq };
+    reads.push(request.params.representation);
+    return {
+      fileKey: "RestFile1", fileName: "Checkout", nodeId: request.params.nodeId, pageId: "0:1", pageName: "Home",
+      format: "figma-rest", editSeq,
+      completeness: { nodeCount: 2, byteSize: 400, limitHit: false, truncatedNodeIds: [] },
+      payload: {
+        document: {
+          id: request.params.nodeId, name: "Card", type: "FRAME", rectangleCornerRadii: [12, 12, 0, 4],
+          absoluteBoundingBox: { x: 0, y: 0, width: 320, height: 200 },
+          children: [{
+            id: "1:3", name: "Title", type: "TEXT", characters: "Pay now",
+            style: { fontFamily: "Inter", fontPostScriptName: "Inter-SemiBold", fontStyle: "Semi Bold", fontSize: 16 },
+            fills: [{ type: "SOLID", color: { r: 1, g: 0, b: 0, a: 1 } }],
+          }],
+        },
+        components: {}, componentSets: {}, styles: {}, variables: {},
+      },
+    };
+  }, ["read-node", "read-document-index", "figma-rest", "edit-seq"]);
+
+  const source = "https://www.figma.com/design/RestFile1/Checkout?node-id=1-2";
+  const first = JSON.parse(textOf(await client.callTool({ name: "get_design_context", arguments: { source } })));
+  assert.equal(first.format, "figma-rest");
+  assert.deepEqual(first.payload.document.rectangleCornerRadii, [12, 12, 0, 4]);
+  assert.equal(first.notes, undefined);
+
+  // Another tool asking for the same node: the plugin only confirms no edit.
+  const texts = await client.callTool({ name: "get_design_texts", arguments: { source } });
+  assert.equal(texts.isError, undefined, textOf(texts));
+  assert.match(textOf(texts), /reused: the plugin reported no edit since/);
+  assert.match(textOf(texts), /\| Card > Title \| Pay now \| Inter \| 16 \|/);
+  const colors = await client.callTool({ name: "get_design_colors", arguments: { source } });
+  assert.match(textOf(colors), /\| #FF0000 \| 1 \| Title \|/);
+  assert.deepEqual(reads, ["figma-rest"]);
+
+  editSeq = 5;
+  await client.callTool({ name: "get_design_texts", arguments: { source } });
+  await client.callTool({ name: "get_design_context", arguments: { source, fresh: true } });
+  await client.callTool({ name: "get_design_context", arguments: { source, geometry: true } });
+  assert.deepEqual(reads, ["figma-rest", "figma-rest", "figma-rest", "figma-rest+geometry"]);
 });
 
 test("the MCP server that owns the bridge keeps working after the token is rotated", async t => {

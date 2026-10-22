@@ -7,7 +7,10 @@
 
 const crypto = require('crypto')
 
-const ALLOWED_OPS = new Set(['read-node', 'read-document-index', 'ping'])
+const ALLOWED_OPS = new Set(['read-node', 'read-document-index', 'ping', 'edit-seq'])
+// Answered by the plugin at once, outside its one-read-at-a-time queue, so it
+// never counts as a read waiting ahead of another.
+const INSTANT_OPS = new Set(['ping', 'edit-seq'])
 const MAX_PARAMS_BYTES = 256 * 1024
 const MAX_PLUGIN_ERROR_MESSAGE = 400
 const PLUGIN_ERROR_CODES = new Set(['NODE_NOT_FOUND'])
@@ -40,8 +43,14 @@ const errors = {
   sessionLost(message = 'Session is no longer connected', extra) {
     return brokerError('SESSION_LOST', message, extra)
   },
-  timeout(fileKey, requestId) {
-    return brokerError('TIMEOUT', 'Request timed out waiting for a plugin reply', { fileKey, requestId })
+  timeout(fileKey, requestId, ahead = 0) {
+    // The plugin serves one read at a time, so a read can time out only
+    // because others were served first. Saying so tells the caller why.
+    const message = ahead > 0
+      ? `Request timed out waiting for a plugin reply: ${ahead} earlier ${ahead === 1 ? 'read was' : 'reads were'} ahead of it, `
+        + 'and the Figma plugin serves one read at a time'
+      : 'Request timed out waiting for a plugin reply'
+    return brokerError('TIMEOUT', message, { fileKey, requestId, ahead })
   },
   queueFull(fileKey, sessionId) {
     return brokerError('QUEUE_FULL', `Session queue is full for file "${fileKey}"`, { fileKey, sessionId })
@@ -267,7 +276,17 @@ function createBroker(options = {}) {
   function handleRequestTimeout(requestId) {
     const req = requests.get(requestId)
     if (!req || req.settled) return
-    settleRequest(req, false, null, errors.timeout(req.fileKey, req.requestId))
+    settleRequest(req, false, null, errors.timeout(req.fileKey, req.requestId, req.ahead))
+  }
+
+  // Reads already waiting for the session, which the plugin serves before this one.
+  function readsAhead(session) {
+    let ahead = 0
+    for (const requestId of session.pendingRequestIds) {
+      const req = requests.get(requestId)
+      if (req && !req.settled && !INSTANT_OPS.has(req.op)) ahead++
+    }
+    return ahead
   }
 
   // Hands the whole queue to a poll and remembers what went out, so the poll
@@ -414,6 +433,17 @@ function createBroker(options = {}) {
     return false
   }
 
+  // The session a request for this file would go to now, and what its plugin
+  // said it can do when it registered.
+  function sessionFor(fileKey) {
+    const session = sessionToServe(fileKey)
+    if (!session) return null
+    return {
+      sessionId: session.sessionId,
+      capabilities: Array.isArray(session.capabilities) ? session.capabilities.slice() : [],
+    }
+  }
+
   function request({ fileKey, op, params, timeoutMs, dedupeKey } = {}) {
     sweep()
     return new Promise((resolve, reject) => {
@@ -465,6 +495,7 @@ function createBroker(options = {}) {
         dedupeKey: validated.dedupeKey,
         enqueuedAt,
         expiresAt: enqueuedAt + validated.timeoutMs,
+        ahead: INSTANT_OPS.has(validated.op) ? 0 : readsAhead(targetSession),
         settled: false,
         settledAt: null,
         timedOut: false,
@@ -527,7 +558,17 @@ function createBroker(options = {}) {
 
     const req = requests.get(requestId)
     if (!req) return { accepted: false, reason: 'UNKNOWN_REQUEST' }
-    if (req.settled) return { accepted: false, reason: req.timedOut ? 'REQUEST_TIMED_OUT' : 'ALREADY_SETTLED' }
+    if (req.settled) {
+      if (!req.timedOut) return { accepted: false, reason: 'ALREADY_SETTLED' }
+      // Nobody waits for it any more, but the plugin did the work: the caller
+      // may keep the result, for whoever asks next.
+      if (!ok || req.sessionId !== session.sessionId) return { accepted: false, reason: 'REQUEST_TIMED_OUT' }
+      return {
+        accepted: false,
+        reason: 'REQUEST_TIMED_OUT',
+        late: { requestId: req.requestId, fileKey: req.fileKey, op: req.op, params: req.params, sessionId: req.sessionId },
+      }
+    }
     if (req.sessionId !== session.sessionId) return { accepted: false, reason: 'WRONG_SESSION' }
 
     if (ok) {
@@ -593,6 +634,7 @@ function createBroker(options = {}) {
     closeSession,
     listSessions,
     hasSessionForFile,
+    sessionFor,
     request,
     poll,
     reply,

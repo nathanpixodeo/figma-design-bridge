@@ -9,7 +9,7 @@ import path from "node:path";
 import { createRequire } from "node:module";
 import figmaApi from "./figma-api.js";
 
-const { fetchFigmaDesign } = figmaApi;
+const { fetchFigmaDesign, normalizeFigmaNode } = figmaApi;
 const require = createRequire(import.meta.url);
 const { startOrReuse } = require("./bridge/daemon.js");
 const { createClient } = require("./bridge/client.js");
@@ -253,7 +253,8 @@ function describeError(error, { read = false } = {}) {
       + "data directory: it is older than 1.3.0, or it was started with FIGMA_BRIDGE_DATA_DIR. Update or stop it, "
       + "or start both with the same FIGMA_BRIDGE_DATA_DIR.";
   } else if (error.code === "TIMEOUT" && read) {
-    hint = " Figma loads a large page slowly the first time it is read. Retry with a larger timeoutMs "
+    hint = " Figma loads a large page slowly the first time it is read. Retrying is safe: a read the plugin "
+      + "was already working on is kept when it finishes and answers the retry. Otherwise pass a larger timeoutMs "
       + "(up to 120000), or a smaller depth or maxNodes. Keep the Design Bridge panel open in Figma.";
   } else if (error.code === "SESSION_LOST" && read) {
     hint = " The Design Bridge panel closed or stopped answering during this read. If Figma's console shows "
@@ -265,12 +266,35 @@ function describeError(error, { read = false } = {}) {
   return `${prefix}${message}${hint}`;
 }
 
+// A node is read as Figma's own REST JSON, which the plugin exports with every
+// attribute, unless the caller names another representation. A plugin too old
+// to export it is read the old way, and the answer says so.
 function readOptionsFromArgs(args = {}) {
   const options = {};
   for (const key of ["depth", "maxNodes", "maxBytes", "includeHidden", "representation"]) {
     if (args[key] !== undefined) options[key] = args[key];
   }
-  return Object.keys(options).length ? options : undefined;
+  if (options.representation === undefined) {
+    options.representation = args.geometry === true ? "figma-rest+geometry" : "figma-rest";
+  }
+  return options;
+}
+
+// A node read as REST JSON has the layer under payload.document, with the
+// components, styles and variables it uses beside it. A bridge older than
+// 1.5.0 does not pass the format on, so the payload's shape decides then.
+function isRestResult(result) {
+  if (typeof result?.format === "string") return result.format === "figma-rest";
+  const payload = result?.payload;
+  return Boolean(payload && typeof payload === "object" && payload.type === undefined
+    && payload.document && typeof payload.document === "object");
+}
+
+function countMarked(node, key) {
+  if (!node || typeof node !== "object") return 0;
+  let count = node[key] ? 1 : 0;
+  for (const child of Array.isArray(node.children) ? node.children : []) count += countMarked(child, key);
+  return count;
 }
 
 // A file link (no node-id) reads the document index: pages and their top-level
@@ -292,15 +316,14 @@ function provenance(design) {
   if (bridge) {
     const what = bridge.nodeId ? `node ${bridge.nodeId}` : "document index";
     const freshness = bridge.freshness || (bridge.stale ? "cached" : "live");
-    return `> Source: ${design.fileName || "Figma file"}, ${what}, ${freshness} read at ${bridge.fetchedAt || "an unknown time"}`;
+    const reused = bridge.reused ? ", reused: the plugin reported no edit since" : "";
+    return `> Source: ${design.fileName || "Figma file"}, ${what}, ${freshness} read at ${bridge.fetchedAt || "an unknown time"}${reused}`;
   }
   return `> Source: legacy snapshot "${design?.pageName || "unnamed"}", synced at ${design?.syncedAt || design?.savedAt || "an unknown time"}`;
 }
 
-// What limits how far an answer can be trusted.
-function caveats(design) {
-  const bridge = design?.bridge;
-  if (!bridge) return "";
+// What limits how far a bridge read can be trusted.
+function readNotes(bridge) {
   const notes = [];
   if (!bridge.nodeId) {
     notes.push("This is the document index: pages and their top-level frames only. Pass a link that includes node-id to read inside a frame.");
@@ -310,6 +333,28 @@ function caveats(design) {
     notes.push(`The read was truncated${cut ? ` (${cut} subtree(s) cut)` : ""} at depth, maxNodes or maxBytes. Raise them or read a child node before concluding that something is missing.`);
   }
   if (bridge.stale || bridge.freshness === "cached") notes.push("Cached data, not verified against the open file.");
+  if (bridge.reused) {
+    const age = Number.isFinite(bridge.ageMs) ? ` from ${Math.round(bridge.ageMs / 1000)} s ago` : "";
+    notes.push(`Reused the plugin's read${age}: it reported no edit since. Figma does not report every edit to plugins, such as a change to a variable's value alone; pass fresh: true to read again after one.`);
+  }
+  if (bridge.pluginOutdated) {
+    notes.push("The Design Bridge plugin open in Figma is too old to export Figma's REST JSON, so this read can miss attributes such as per-corner radii and mixed text styles. Ask the user to close and reopen Design Bridge in Figma.");
+  } else if (bridge.nodeId && String(bridge.representation || "").startsWith("figma-rest") && !isRestResult(bridge)) {
+    notes.push(typeof bridge.format === "string"
+      ? `Figma could not export this node as REST JSON${bridge.fallbackReason ? ` (${bridge.fallbackReason})` : ""}, so the plugin read it its own way, which can miss attributes such as mixed text styles.`
+      : "The bridge that answered is older than this MCP server and read the node the old way, which can miss attributes such as per-corner radii. Close every agent session so the bridge restarts on the new version, and reopen Design Bridge in Figma.");
+  }
+  if (bridge.nodeId && isRestResult(bridge)) {
+    const partial = countMarked(bridge.payload?.document, "partial");
+    if (partial) notes.push(`${partial} layer(s) too large to export in one piece are marked partial: their own box, layout, paint and variables were read directly, and their children were exported one by one.`);
+    const failed = countMarked(bridge.payload?.document, "exportError");
+    if (failed) notes.push(`Figma could not export ${failed} layer(s), marked exportError: only the attributes read directly are there.`);
+  }
+  return notes;
+}
+
+function caveats(design) {
+  const notes = design?.bridge ? readNotes(design.bridge) : [];
   return notes.length ? "\n\n" + notes.map(note => `> **Note:** ${note}`).join("\n") : "";
 }
 
@@ -320,9 +365,10 @@ function readTimeoutFromArgs(args = {}) {
 
 function bridgeResultToDesign(result) {
   const payload = result?.payload;
-  const nodes = result?.nodeId
-    ? (payload ? [payload] : [])
-    : (Array.isArray(payload?.pages) ? payload.pages : []);
+  let nodes = [];
+  if (!result?.nodeId) nodes = Array.isArray(payload?.pages) ? payload.pages : [];
+  else if (isRestResult(result)) nodes = [normalizeFigmaNode(payload?.document, payload || {})].filter(Boolean);
+  else if (payload) nodes = [payload];
   return {
     fileName: result?.fileName || null,
     pageName: result?.pageName || result?.fileName || (result?.nodeId ? "Requested node" : "Document index"),
@@ -342,6 +388,7 @@ async function resolveDesign(args = {}) {
       mode: args.mode || "live",
       timeoutMs: readTimeoutFromArgs(args),
       options: readOptionsFromArgs(args),
+      fresh: args.fresh === true,
     }));
     return bridgeResultToDesign(result);
   }
@@ -359,6 +406,11 @@ const TIMEOUT_PROPERTY = {
   description: "How long to wait for the Figma plugin, in milliseconds (default 30000). Figma loads a large page slowly the first time it is read; raise this after a TIMEOUT.",
 };
 
+const FRESH_PROPERTY = {
+  type: "boolean",
+  description: "Read again even when the plugin reports no edit since an earlier read of the same node, which is otherwise answered at once with reused: true (default false). Figma does not report every edit, such as a change to a variable's value alone.",
+};
+
 const SOURCE_PROPERTIES = {
   source: { type: "string", description: "Figma URL or file key. When provided, this tool reads through the live plugin bridge instead of global legacy state. Prefer a link to one screen frame: a section or page holding many screens is slow to read and can run the Figma plugin out of memory." },
   mode: { type: "string", enum: ["live", "cached"], description: "Live by default. Cached mode is explicit opt-in to unverified stale data." },
@@ -367,6 +419,7 @@ const SOURCE_PROPERTIES = {
   maxBytes: { type: "integer", minimum: 1024, maximum: 10000000, description: "Payload limit in UTF-8 bytes (default 2000000)" },
   includeHidden: { type: "boolean", description: "Include hidden layers (default true). Pass false unless hidden layers matter; it keeps a large read smaller." },
   timeoutMs: TIMEOUT_PROPERTY,
+  fresh: FRESH_PROPERTY,
 };
 
 // ── MCP server ─────────────────────────────────────────────
@@ -394,7 +447,7 @@ async function startMCP() {
     tools: annotate([
       {
         name: "get_design_context",
-        description: "Read a Figma file or exact node through the connected Figma plugin. A node URL returns that node and subtree; a file URL returns a lightweight document index. Live mode never silently falls back to REST or stale cache.",
+        description: "Read a Figma file or exact node through the connected Figma plugin. A node URL returns that node and its subtree as Figma's REST API JSON, exported by the plugin with no token: payload.document holds every attribute, such as per-corner radii (rectangleCornerRadii), per-character text styles (characterStyleOverrides, styleOverrideTable) and bound variables, and payload.components, componentSets, styles and variables describe what it uses. A file URL returns a lightweight document index. A read the plugin confirms unchanged since an earlier one is answered at once (reused: true). Live mode never falls back to the Figma REST API or to stale cache.",
         // Design payloads are large by nature. Let Claude Code show up to its
         // per-tool ceiling inline instead of diverting the result to a file.
         _meta: { "anthropic/maxResultSizeChars": 500000 },
@@ -407,7 +460,9 @@ async function startMCP() {
             maxNodes: { type: "integer", minimum: 1, maximum: 20000, description: "Most nodes to read (default 5000)" },
             maxBytes: { type: "integer", minimum: 1024, maximum: 10000000, description: "Payload limit in UTF-8 bytes (default 2000000)" },
             includeHidden: { type: "boolean", description: "Include hidden layers (default true). Pass false unless hidden layers matter; it keeps a large read smaller." },
+            geometry: { type: "boolean", description: "Add vector paths (fillGeometry, strokeGeometry) to vector layers, as the REST API's geometry=paths does (default false)." },
             timeoutMs: TIMEOUT_PROPERTY,
+            fresh: FRESH_PROPERTY,
           },
           required: ["source"],
         },
@@ -495,9 +550,11 @@ async function startMCP() {
             mode: args.mode || "live",
             timeoutMs: readTimeoutFromArgs(args),
             options: readOptionsFromArgs(args),
+            fresh: args.fresh === true,
           }));
+          const notes = readNotes(result);
           // Compact: indentation alone made a 150 KB payload 3.7 times larger.
-          return ok(JSON.stringify(result));
+          return ok(JSON.stringify(notes.length ? { ...result, notes } : result));
         } catch (error) {
           return err(describeError(error, { read: true }));
         }

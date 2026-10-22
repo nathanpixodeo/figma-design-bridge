@@ -736,9 +736,11 @@ What phase 1 delivers:
 
 Design rules it enforces:
 
-- **A live read is live or it is an error.** No cache fallback, no REST fallback.
-  With the plugin offline, a live read returns `409 NO_SESSION_FOR_FILE` and
-  says what to do, rather than quietly handing back older data.
+- **A live read is the plugin's answer or an error.** It is read now, or read
+  earlier and confirmed unchanged by the plugin (`reused: true`). No cache
+  fallback, no REST fallback. With the plugin offline, a live read returns
+  `409 NO_SESSION_FOR_FILE` and says what to do, rather than quietly handing
+  back older data.
 - **Freshness is asserted, never inferred.** `verifiedFresh: true` is written
   only when a live plugin reply produced the entry. A cached read always reports
   `freshness: "unknown"` and `stale: true`, however recently it was written.
@@ -759,6 +761,26 @@ Design rules it enforces:
 The token lives in `<dataDir>/bridge-token.json`, which `.gitignore` excludes. It
 is never included in a health response, a session listing, a snapshot or a log
 line.
+
+### Reads from several agents
+
+Every agent session shares one bridge, and every read of a file goes to the
+Design Bridge panel open on that file. Figma runs a plugin on one thread, so the
+panel reads one node at a time; reads of different files run in parallel. Since
+1.5.0, agents reading the same file wait on each other far less:
+
+- **One native export instead of a walk.** A node is read with Figma's own
+  `exportAsync({ format: 'JSON_REST_V1' })` instead of property by property in
+  JavaScript. Each read reports `timing: { countMs, exportMs, totalMs }`.
+- **Unchanged reads are reused.** A read of a node the same panel read in the
+  last five minutes is answered from the cache once the panel confirms no edit
+  since (`reused: true`, with `ageMs` and the original `fetchedAt`). The panel
+  answers that check at once, even in the middle of another read, so a reused
+  read never waits in its queue. Pass `fresh: true` to read again.
+- **No read is wasted.** A read whose caller timed out before its turn is
+  skipped. One the panel was already working on is kept when it finishes, and
+  answers the caller's retry. Identical reads waiting together share one answer.
+- **A timeout says why.** `TIMEOUT` counts the reads that were ahead of it.
 
 Full route contract, request/response schemas and error codes:
 **[docs/BRIDGE_PROTOCOL.md](docs/BRIDGE_PROTOCOL.md)**.
@@ -787,6 +809,9 @@ the same command on Linux and Windows against Node 20, 22 and 24.
 - A read is capped at 20,000 nodes and 10 MB. Figma can still close the plugin
   when a large read runs it out of memory; read one screen frame rather than a
   section of many screens.
+- Figma does not report every edit to plugins, a change to a variable's value
+  alone for one, so a read reused within five minutes of such a change can miss
+  it. Pass `fresh: true` to read again.
 - More in [docs/BRIDGE_PROTOCOL.md](docs/BRIDGE_PROTOCOL.md#known-limitations).
 
 ---
@@ -862,14 +887,52 @@ The plugin uses Figma's [`documentchange` and `currentpagechange` events](https:
 
 ### What Gets Serialized
 
-The plugin captures a rich set of properties for each node:
+**A live read of a node** (1.5.0 and later) returns Figma's REST API JSON for
+it, the same as `GET /v1/files/:key/nodes?ids=:id`, exported inside Figma by
+the plugin with `exportAsync({ format: 'JSON_REST_V1' })`. No REST token, API
+quota or Dev Mode seat is involved. Every attribute comes through as Figma
+stores it, for instance:
+
+| Area | Fields |
+|------|--------|
+| Corners | `cornerRadius`, `rectangleCornerRadii` (one per corner), `cornerSmoothing` |
+| Text | `characters`, `style`, `characterStyleOverrides`, `styleOverrideTable`, `lineTypes`, `lineIndentations` |
+| Layout | `layoutMode`, padding, `itemSpacing`, `layoutSizingHorizontal`, `layoutSizingVertical`, `constraints`, min and max sizes, `layoutGrids` |
+| Paint | `fills`, `strokes`, `strokeWeight`, `individualStrokeWeights`, `strokeDashes`, `effects`, `blendMode` |
+| Tokens | `boundVariables`, `styles` |
+| Components | `componentId`, `componentProperties`, `overrides` |
+
+The payload is `{ document, components, componentSets, styles, variables }`.
+`variables` names every variable the tree binds: `name`, `collection`,
+`resolvedType` and `codeSyntax`. `geometry: true` adds vector paths
+(`fillGeometry`, `strokeGeometry`), as REST's `geometry=paths` does.
+
+The read limits still apply. Figma exports a layer whole when its subtree fits
+what is left of `maxNodes` and `depth`, up to 5,000 layers in one export. A
+larger layer, and every page, is marked `partial: true`: its own box, layout,
+paint and bound variables are read from the plugin API, and its children are
+exported one by one. Layers below `depth` become
+`{ id, name, type, truncated: true }`, and text is cut at 100,000 characters
+(`textTruncated: true`). REST JSON is larger than the plugin's own reading, so a
+read fills `maxBytes` (2 MB by default) sooner: read one screen frame, or pass
+`includeHidden: false`.
+
+If the first export of a read fails, this Figma may not export JSON at all: the
+plugin reads the node its own way and says why in `fallbackReason`. A later
+export that fails leaves that layer as a `partial` outline, with the reason in
+`exportError`. A panel older than 1.5.0 always reads its own way, and the answer
+carries `pluginOutdated: true`: close Design Bridge and open it again to load
+the new plugin.
+
+**The plugin's own reading**, used by Quick Sync, the Sync buttons and the
+fallback above, captures these properties:
 
 | Property | Included |
 |----------|----------|
 | Identity | `id`, `name`, `type` |
 | Geometry | `x`, `y`, `width`, `height`, `rotation`, `opacity` |
 | Visibility | `visible`, `locked`, `clipsContent` |
-| Corner radius | `cornerRadius` |
+| Corner radius | `cornerRadius`, or `rectangleCornerRadii` when the corners differ |
 | **Text** | `characters`, `fontSize`, `fontName`, `textAlignHorizontal`, `lineHeight`, `letterSpacing`, `textCase`, `textDecoration`, `paragraphSpacing` |
 | **Fills** | SOLID (`color` hex, `opacity`), GRADIENT (stops with positions), IMAGE (`imageHash`, `scaleMode`) |
 | **Strokes** | Same as fills + `strokeWeight`, `strokeAlign`, `dashPattern` |
@@ -984,7 +1047,7 @@ Restart the MCP client after changing its environment configuration.
 
 | Tool | Description |
 |------|-------------|
-| `get_design_context` | Read a Figma file or exact node through the connected plugin (`source` required; live by default). `depth`, `maxNodes` and `maxBytes` bound the result; `timeoutMs` (default 30000, up to 120000) bounds the wait |
+| `get_design_context` | Read a Figma file or exact node through the connected plugin (`source` required; live by default). A node comes back as Figma's REST JSON with every attribute. `depth`, `maxNodes` and `maxBytes` bound the result; `timeoutMs` (default 30000, up to 120000) bounds the wait; `fresh: true` reads again instead of reusing an unchanged read; `geometry: true` adds vector paths |
 | `get_bridge_status` | Show bridge readiness, live plugin sessions, how many plugins wait for pairing approval, cache statistics, and setup hints |
 | `approve_figma_pairing` | Approve the Figma plugin that shows this 6-digit pairing code (`code` required). Use only a code the user reads from the plugin |
 | `sync_figma_design` | Explicitly fetch a Figma URL/file key, normalize it, and cache it locally |
@@ -1059,7 +1122,9 @@ claude -p "Based on these text nodes, write better copy for the landing page: $T
 | MCP server not connecting | Run `figma-bridge status`, then `figma-bridge setup` to reinstall the plugin, and restart the client. In a hand-written MCP config, use `figma-bridge mcp` as the command. |
 | `figma-bridge pair` says the bridge "rejected the token" | The bridge on port 3456 keeps a different data directory — usually a Claude Code session still running a plugin older than 1.3.0. [Update the plugin](#updating), restart Claude Code, then press **Pair with bridge** again. `figma-bridge status` shows whether the running bridge uses another data directory. |
 | `figma-bridge start` says a bridge "uses another data directory" | A launcher that keeps its own data directory, or a version older than 1.3.0, holds port 3456 and would keep the Figma plugin on a different token. Stop or update it, then run `figma-bridge start` again. When the running bridge shares the data directory, `figma-bridge start` just says it is not needed. |
-| `get_design_context` returns `TIMEOUT` | Figma loads a large page slowly the first time it is read. Retry with a larger `timeoutMs` (up to 120000) or a smaller `depth` or `maxNodes`, and keep the panel open. |
+| `get_design_context` returns `TIMEOUT` | Reads of one file take turns in the plugin, and the error says how many were ahead. Figma also loads a large page slowly the first time it is read. Retry: a read the plugin was already working on answers the retry when it finishes. Otherwise pass a larger `timeoutMs` (up to 120000) or a smaller `depth` or `maxNodes`, and keep the panel open. |
+| A read says `pluginOutdated: true`, or that Design Bridge is too old to export REST JSON | The panel open in Figma runs a plugin older than 1.5.0, which reads its own way and can miss attributes such as per-corner radii. Close Design Bridge and open it again: Figma loads the plugin's code anew. With a clone, `git pull` first. |
+| A read says the bridge is older than the MCP server | Every agent session shares the bridge the first one started, and that one runs an older version. Close every Claude Code, Codex and agy session so the next one starts the new bridge, then reopen Design Bridge in Figma. |
 | Figma's console shows `Plugin runtime aborted` and the panel closes; the read fails with `SESSION_LOST` | The read was too large for the plugin's memory. Reopen Design Bridge, then read one screen frame rather than a section of many screens, or pass a smaller `depth` or `maxNodes`, or `includeHidden: false`. A panel left open for hours is closer to the limit; reopening it starts fresh. |
 | MCP tools return "No design data" | Call `sync_figma_design` with a Figma URL first. |
 

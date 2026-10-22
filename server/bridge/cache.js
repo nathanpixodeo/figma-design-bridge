@@ -246,6 +246,8 @@ function createCache({
       verifiedFresh = false,
       truncated = false,
       completeness = {},
+      format = null,
+      editSeq = null,
       payload = null,
     } = entryInput
 
@@ -288,6 +290,11 @@ function createCache({
         limitHit: completeness.limitHit ?? null,
         truncatedNodeIds: completeness.truncatedNodeIds ?? [],
       },
+      // How the payload is laid out ("figma-rest" or "node-subtree"), and the
+      // plugin's edit count when the read began, which decides whether the
+      // result may be reused.
+      format: typeof format === 'string' ? format : null,
+      editSeq: Number.isInteger(editSeq) ? editSeq : null,
       payload,
     }
 

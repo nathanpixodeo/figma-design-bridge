@@ -65,6 +65,24 @@ test('put/get round-trips an entry, filling defaults and computing ageMs', (t) =
   assert.ok(got)
   assert.equal(got.ageMs, 5000)
   assert.deepEqual(got.payload, { a: 1 })
+  assert.equal(got.format, null)
+  assert.equal(got.editSeq, null)
+})
+
+test('a plugin entry keeps its payload format and the edit count its read began at', (t) => {
+  const cache = createCache({ dataDir: mkTempDir(t) })
+  const where = { fileKey: 'F1', nodeId: '1:2', representation: 'figma-rest' }
+  cache.put({ ...where, source: 'plugin', sessionId: 's1', verifiedFresh: true, format: 'figma-rest', editSeq: 7, payload: { document: {} } })
+  const got = cache.get(where)
+  assert.equal(got.format, 'figma-rest')
+  assert.equal(got.editSeq, 7)
+
+  // Anything else is not a count the bridge can compare.
+  for (const editSeq of [1.5, '7', -0.5, null]) {
+    cache.put({ ...where, source: 'plugin', sessionId: 's1', editSeq, format: 42, payload: {} })
+    assert.equal(cache.get(where).editSeq, null, String(editSeq))
+    assert.equal(cache.get(where).format, null)
+  }
 })
 
 test('get returns null for a missing entry', (t) => {

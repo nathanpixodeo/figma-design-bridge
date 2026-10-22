@@ -70,8 +70,8 @@ async function startBridge(t, { dataDir } = {}) {
     })
   }
 
-  function plugin({ fileKey = FILE_A, fileName = 'Test File A', instanceId = 'plugin-1' } = {}) {
-    return createFakePlugin({ t, url: daemon.url, token: daemon.token, fileKey, fileName, instanceId })
+  function plugin({ fileKey = FILE_A, fileName = 'Test File A', instanceId = 'plugin-1', capabilities } = {}) {
+    return createFakePlugin({ t, url: daemon.url, token: daemon.token, fileKey, fileName, instanceId, capabilities })
   }
 
   return { daemon, dataDir: dir, url: daemon.url, token: daemon.token, api, raw, plugin }
@@ -79,7 +79,7 @@ async function startBridge(t, { dataDir } = {}) {
 
 // A plain HTTP client that registers a session, long-polls for work and
 // replies — the smallest thing that behaves like the plugin.
-function createFakePlugin({ t, url, token, fileKey, fileName, instanceId }) {
+function createFakePlugin({ t, url, token, fileKey, fileName, instanceId, capabilities = ['read-node'] }) {
   let sessionId = null
   let secret = null
   let stopped = false
@@ -106,7 +106,7 @@ function createFakePlugin({ t, url, token, fileKey, fileName, instanceId }) {
 
   async function start() {
     const res = await call('POST', '/bridge/session', {
-      body: { fileKey, fileName, pluginInstanceId: instanceId, capabilities: ['read-node'] },
+      body: { fileKey, fileName, pluginInstanceId: instanceId, capabilities },
     })
     assert.equal(res.status, 201, `register failed: ${res.status} ${res.raw}`)
     sessionId = res.body.sessionId
@@ -419,4 +419,72 @@ test('two plugins on two files are served independently', async t => {
   assert.equal(rb.body.pageName, 'From B')
   assert.equal(a.seen.length, 1)
   assert.equal(b.seen.length, 1)
+})
+
+const CURRENT_PLUGIN = ['read-node', 'read-document-index', 'figma-rest', 'edit-seq']
+
+test('a second read of an unchanged node is answered without the plugin reading it again', async t => {
+  const { api, plugin } = await startBridge(t)
+  const p = plugin({ capabilities: CURRENT_PLUGIN })
+  await p.start()
+  let editSeq = 2
+  let reads = 0
+  p.setHandler(async request => {
+    if (request.op === 'edit-seq') return { fileKey: FILE_A, editSeq }
+    reads++
+    return nodeResult(FILE_A, request.params.nodeId, { format: 'figma-rest', editSeq })
+  })
+  p.run()
+
+  const body = { source: sourceFor(FILE_A, '4-4'), options: { representation: 'figma-rest' } }
+  const first = await api('POST', '/bridge/read', { body })
+  assert.equal(first.status, 200)
+  assert.equal(first.body.format, 'figma-rest')
+  assert.equal(first.body.reused, undefined)
+
+  const second = await api('POST', '/bridge/read', { body })
+  assert.equal(second.status, 200)
+  assert.equal(second.body.reused, true)
+  assert.equal(second.body.verifiedFresh, true)
+  assert.equal(second.body.fetchedAt, first.body.fetchedAt)
+  assert.equal(reads, 1)
+
+  // An edit in Figma moves the count on, and the next read reads again.
+  editSeq = 3
+  const third = await api('POST', '/bridge/read', { body })
+  assert.equal(third.status, 200)
+  assert.equal(third.body.reused, undefined)
+  assert.equal(reads, 2)
+})
+
+test('a read that timed out is kept when the plugin finishes it, so the retry does not read again', async t => {
+  const { api, plugin } = await startBridge(t)
+  const p = plugin({ capabilities: CURRENT_PLUGIN })
+  await p.start()
+  let reads = 0
+  p.setHandler(async request => {
+    if (request.op === 'edit-seq') return { fileKey: FILE_A, editSeq: 7 }
+    reads++
+    await new Promise(r => setTimeout(r, 600))
+    return nodeResult(FILE_A, request.params.nodeId, { format: 'figma-rest', editSeq: 7 })
+  })
+  p.run()
+
+  const body = { source: sourceFor(FILE_A, '6-6'), options: { representation: 'figma-rest' } }
+  const slow = await api('POST', '/bridge/read', { body: { ...body, timeoutMs: 300 } })
+  assert.equal(slow.status, 504)
+  assert.equal(slow.body.code, 'TIMEOUT')
+
+  let kept = null
+  for (let attempt = 0; attempt < 40 && !kept; attempt++) {
+    const cached = await api('POST', '/bridge/read', { body: { ...body, mode: 'cached' } })
+    if (cached.status === 200) kept = cached
+    else await new Promise(r => setTimeout(r, 50))
+  }
+  assert.ok(kept, 'the late reply should have been kept')
+
+  const retry = await api('POST', '/bridge/read', { body })
+  assert.equal(retry.status, 200)
+  assert.equal(retry.body.reused, true)
+  assert.equal(reads, 1)
 })

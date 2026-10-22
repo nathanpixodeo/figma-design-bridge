@@ -4,6 +4,70 @@ All notable changes to Figma Design Bridge. Versions follow
 [Semantic Versioning](https://semver.org/); the Claude Code plugin, the
 marketplace entry and both `package.json` files always carry the same number.
 
+## [1.5.0] - 2026-10-22
+
+A live read returns every attribute Figma stores, and agents reading the same
+file wait on each other far less.
+
+### Upgrading
+
+- Close every Claude Code, Codex and agy session, so the next one starts the
+  new bridge: every session shares the bridge the first one started. Until
+  then the MCP tools say the bridge is older than the MCP server.
+- Close Design Bridge in Figma and open it again to load the new plugin. A panel
+  opened before the upgrade keeps reading the old way, and every answer it gives
+  carries `pluginOutdated: true` with a note saying to reopen it.
+
+### Added
+
+- A live read of a node returns Figma's REST API JSON for it, exported inside
+  Figma with `exportAsync({ format: 'JSON_REST_V1' })`. It needs no REST token,
+  API quota or Dev Mode seat. Values the plugin's own reading dropped come
+  through: per-corner radii (`rectangleCornerRadii`), mixed text styles
+  (`characterStyleOverrides`, `styleOverrideTable`), constraints, sizing,
+  per-side strokes, bound variables and style ids. The payload is
+  `{ document, components, componentSets, styles, variables }`, and `variables`
+  names every bound variable with its collection, type and code syntax.
+- A subtree too large for one export, or deeper than the read allows, becomes
+  an outline marked `partial: true`, and its children are exported one by one.
+  The read limits and the memory bound of 1.3.2 still hold. An export that fails
+  after another one worked leaves an outline with `exportError`. When the first
+  export fails, the plugin reads the old way and says why in `fallbackReason`.
+  Every read reports its `timing`.
+- An unchanged read is reused. A read of a node the same panel read in the last
+  five minutes is answered from the cache once the panel confirms no edit since
+  (`reused: true`, `ageMs`). The panel answers that check at once, even in the
+  middle of another read. `fresh: true` reads again.
+- `get_design_context` takes `fresh` and `geometry` (vector paths, as REST's
+  `geometry=paths`). The other tools that take a `source` take `fresh`.
+- Protocol: the `figma-rest` and `edit-seq` capabilities, the `edit-seq` op,
+  the `fresh` field of `POST /bridge/read`, and the reply fields `format`,
+  `editSeq`, `timing` and `fallbackReason`. See
+  [docs/BRIDGE_PROTOCOL.md](docs/BRIDGE_PROTOCOL.md).
+
+### Changed
+
+- The MCP tools ask for the REST JSON. `get_design_summary`, `get_design_tree`,
+  `get_design_texts`, `get_design_colors`, `search_design` and
+  `get_design_info` read it through the normalizer REST sync uses.
+  `get_design_context` returns it as the plugin sent it, with notes inside the
+  JSON on reuse, partial layers, a fallback or an outdated plugin.
+- A text's `fontName.style` is Figma's style name (`Semi Bold Italic`) instead
+  of the PostScript name when Figma gives one, in REST sync too.
+- `TIMEOUT` counts the reads that were ahead in the queue, and says a retry is
+  safe.
+
+### Fixed
+
+- Per-corner radii were lost: the plugin wrote `cornerRadius` only when the
+  four corners matched. The plugin's own reading, used by Quick Sync and the
+  Sync buttons, now writes `rectangleCornerRadii` when they differ.
+- Reads of one file waited on each other longer than needed. A read whose caller
+  had timed out was still walked, and one that timed out during its walk was
+  walked again on retry. The panel now skips a read nobody waits for, the
+  bridge keeps a late answer for the retry unless the cache holds a newer one,
+  and identical reads waiting together share one answer.
+
 ## [1.4.1] - 2026-10-22
 
 ### Fixed

@@ -79,6 +79,8 @@ function createFakeBroker() {
     nextRequestError: null,
     nextResult: null,
     nextPollRequests: [],
+    // What the plugin answers when asked for its edit count.
+    editSeq: 0,
 
     registerSession(input) {
       counter += 1
@@ -120,10 +122,19 @@ function createFakeBroker() {
     hasSessionForFile(fileKey) {
       return [...sessions.values()].some(session => session.fileKey === fileKey && session.alive)
     },
+    // The session registered last serves the file, as the real broker's most
+    // recently heard-from one does.
+    sessionFor(fileKey) {
+      const session = [...sessions.values()].filter(s => s.fileKey === fileKey && s.alive).at(-1)
+      return session ? { sessionId: session.sessionId, capabilities: session.capabilities } : null
+    },
     async request(input) {
       calls.requests.push(input)
       if (broker.nextRequestError) throw broker.nextRequestError
-      const session = [...sessions.values()].find(s => s.fileKey === input.fileKey)
+      const session = broker.sessionFor(input.fileKey)
+      if (input.op === 'edit-seq') {
+        return { result: { fileKey: input.fileKey, editSeq: broker.editSeq }, sessionId: session && session.sessionId, requestId: 'req-seq' }
+      }
       return {
         result: broker.nextResult || defaultResult(),
         sessionId: session ? session.sessionId : null,
@@ -242,12 +253,12 @@ async function withServer(t, options = {}) {
     port, broker, cache, identity, fellThrough, auth,
     call: options => request(port, options),
     authed: options => request(port, { ...options, headers: { ...auth, ...(options.headers || {}) } }),
-    async register(fileKey = 'FILE1', pluginInstanceId = 'plugin-a') {
+    async register(fileKey = 'FILE1', pluginInstanceId = 'plugin-a', capabilities) {
       const res = await request(port, {
         method: 'POST',
         path: '/bridge/session',
         headers: auth,
-        body: { fileKey, fileName: 'App', pluginInstanceId },
+        body: { fileKey, fileName: 'App', pluginInstanceId, ...(capabilities ? { capabilities } : {}) },
       })
       assert.equal(res.status, 201)
       return res.body
@@ -490,6 +501,7 @@ test('unknown, missing and wrong-typed read fields are refused with 400', async 
     { source: FILE_URL, options: { maxBytes: 10_000_001 } },
     { source: FILE_URL, options: { maxNodes: 20_001 } },
     { source: FILE_URL, options: { includeHidden: 'yes' } },
+    { source: FILE_URL, fresh: 'yes' },
     { source: FILE_URL, timeoutMs: -1 },
     { source: 'x'.repeat(2400) },
     { source: 'https://example.com/design/FILE1/App' },
@@ -761,6 +773,206 @@ test('a cache write failure does not fail a read that already succeeded', async 
   assert.equal(res.status, 200)
   assert.equal(res.body.cached, false)
   assert.equal(res.body.verifiedFresh, true)
+})
+
+// ── REST JSON and reuse ───────────────────────────────────
+
+const CURRENT_PLUGIN = ['read-node', 'read-document-index', 'figma-rest', 'edit-seq']
+const REST_READ = { source: FILE_URL, options: { representation: 'figma-rest' } }
+// The fake broker answers at 10:05, so at 10:06 its answer is a minute old.
+const A_MINUTE_LATER = Date.parse('2026-09-17T10:06:00.000Z')
+
+function restResult(extra = {}) {
+  return {
+    ...defaultResult(),
+    format: 'figma-rest',
+    editSeq: 3,
+    timing: { countMs: 4, exportMs: 30, totalMs: 41 },
+    payload: {
+      document: { id: '12:34', name: 'Hero', type: 'FRAME', rectangleCornerRadii: [8, 8, 0, 0] },
+      components: {}, componentSets: {}, styles: {}, variables: {},
+    },
+    ...extra,
+  }
+}
+
+test('a node read asks a current plugin for REST JSON and reports how the plugin read it', async t => {
+  const ctx = await withServer(t)
+  await ctx.register('FILE1', 'plugin-a', CURRENT_PLUGIN)
+  ctx.broker.nextResult = restResult()
+
+  const res = await ctx.authed({ method: 'POST', path: '/bridge/read', body: REST_READ })
+  assert.equal(res.status, 200)
+  assert.equal(res.body.representation, 'figma-rest')
+  assert.equal(res.body.format, 'figma-rest')
+  assert.deepEqual(res.body.timing, { countMs: 4, exportMs: 30, totalMs: 41 })
+  assert.equal(res.body.pluginOutdated, undefined)
+  assert.deepEqual(res.body.payload.document.rectangleCornerRadii, [8, 8, 0, 0])
+  const [read] = ctx.broker.calls.requests
+  assert.equal(read.params.representation, 'figma-rest')
+  assert.equal(read.dedupeKey, 'FILE1|12:34|figma-rest')
+  const [stored] = ctx.cache.calls.puts
+  assert.equal(stored.format, 'figma-rest')
+  assert.equal(stored.editSeq, 3)
+
+  // Vector paths are part of the representation, so they get their own entry.
+  await ctx.authed({
+    method: 'POST', path: '/bridge/read',
+    body: { source: FILE_URL, options: { representation: 'figma-rest+geometry', depth: 2 } },
+  })
+  assert.equal(ctx.cache.calls.puts[1].representation, 'figma-rest+geometry+d2')
+})
+
+test('a plugin too old to export REST JSON reads the way it always did, and the answer says so', async t => {
+  const ctx = await withServer(t)
+  await ctx.register('FILE1', 'plugin-a', ['read-node', 'read-document-index'])
+
+  const res = await ctx.authed({
+    method: 'POST', path: '/bridge/read',
+    body: { source: FILE_URL, options: { representation: 'figma-rest', depth: 2 } },
+  })
+  assert.equal(res.status, 200)
+  assert.equal(res.body.pluginOutdated, true)
+  assert.equal(res.body.representation, 'node-subtree+d2')
+  const [read] = ctx.broker.calls.requests
+  assert.equal(read.params.representation, 'node-subtree+d2')
+  assert.deepEqual(read.params.options, { depth: 2 })
+
+  // A file link reads the document index whatever representation was asked for.
+  ctx.broker.nextResult = { ...defaultResult(), nodeId: null, payload: { type: 'DOCUMENT_INDEX', pages: [] } }
+  const index = await ctx.authed({
+    method: 'POST', path: '/bridge/read',
+    body: { source: 'https://www.figma.com/design/FILE1/App', options: { representation: 'figma-rest' } },
+  })
+  assert.equal(index.body.representation, 'document-index')
+  assert.equal(index.body.pluginOutdated, undefined)
+})
+
+test('a cached REST read falls back to what an older plugin stored', async t => {
+  const ctx = await withServer(t)
+  ctx.cache.seed({
+    fileKey: 'FILE1', nodeId: '12:34', representation: 'node-subtree', source: 'plugin',
+    fetchedAt: '2026-09-17T09:00:00.000Z', payload: { id: '12:34', type: 'FRAME' },
+  })
+
+  const old = await ctx.authed({ method: 'POST', path: '/bridge/read', body: { ...REST_READ, mode: 'cached' } })
+  assert.equal(old.status, 200)
+  assert.equal(old.body.representation, 'node-subtree')
+  assert.equal(old.body.verifiedFresh, false)
+  assert.deepEqual(ctx.cache.calls.gets.map(get => get.representation), ['figma-rest', 'node-subtree'])
+
+  ctx.cache.seed({
+    fileKey: 'FILE1', nodeId: '12:34', representation: 'figma-rest', source: 'plugin', format: 'figma-rest',
+    fetchedAt: '2026-09-17T09:30:00.000Z', payload: { document: { id: '12:34' } },
+  })
+  const rest = await ctx.authed({ method: 'POST', path: '/bridge/read', body: { ...REST_READ, mode: 'cached' } })
+  assert.equal(rest.body.representation, 'figma-rest')
+  assert.equal(rest.body.format, 'figma-rest')
+  assert.equal(rest.body.verifiedFresh, false)
+})
+
+test('a read the plugin confirms unchanged is answered again without reading', async t => {
+  const ctx = await withServer(t, { routeOptions: { now: () => A_MINUTE_LATER } })
+  await ctx.register('FILE1', 'plugin-a', CURRENT_PLUGIN)
+  ctx.broker.nextResult = restResult()
+  ctx.broker.editSeq = 3
+  const read = (extra = {}) => ctx.authed({ method: 'POST', path: '/bridge/read', body: { ...REST_READ, ...extra } })
+  const ops = () => ctx.broker.calls.requests.map(request => request.op)
+
+  const first = await read()
+  assert.equal(first.body.reused, undefined)
+  assert.deepEqual(ops(), ['read-node'])
+
+  const second = await read()
+  assert.equal(second.status, 200)
+  assert.deepEqual(ops(), ['read-node', 'edit-seq'], 'the plugin was asked for its edit count, not to read')
+  assert.equal(second.body.reused, true)
+  assert.equal(second.body.freshness, 'live')
+  assert.equal(second.body.verifiedFresh, true)
+  assert.equal(second.body.stale, false)
+  assert.equal(second.body.mode, 'live')
+  assert.equal(second.body.ageMs, 60_000)
+  assert.equal(second.body.fetchedAt, '2026-09-17T10:05:00.000Z')
+  assert.equal(second.body.format, 'figma-rest')
+  assert.deepEqual(second.body.payload, first.body.payload)
+  const check = ctx.broker.calls.requests[1]
+  assert.equal(check.dedupeKey, 'edit-seq')
+  assert.ok(check.timeoutMs <= 2000)
+
+  // An edit moves the count on, so the next read goes to the plugin.
+  ctx.broker.editSeq = 4
+  ctx.broker.nextResult = restResult({ editSeq: 4 })
+  assert.equal((await read()).body.reused, undefined)
+  assert.deepEqual(ops().slice(2), ['edit-seq', 'read-node'])
+  assert.equal((await read()).body.reused, true)
+
+  // fresh skips the check and reads.
+  assert.equal((await read({ fresh: true })).body.reused, undefined)
+  assert.deepEqual(ops().slice(5), ['read-node'])
+})
+
+test('nothing is reused past five minutes, from another plugin session, or without an edit count', async t => {
+  let clock = Date.parse('2026-09-17T10:10:00.001Z')
+  const ctx = await withServer(t, { routeOptions: { now: () => clock } })
+  await ctx.register('FILE1', 'plugin-a', CURRENT_PLUGIN)
+  ctx.broker.nextResult = restResult()
+  ctx.broker.editSeq = 3
+  const read = () => ctx.authed({ method: 'POST', path: '/bridge/read', body: REST_READ })
+  const ops = () => ctx.broker.calls.requests.map(request => request.op)
+
+  await read()
+  assert.equal((await read()).body.reused, undefined)
+  assert.deepEqual(ops(), ['read-node', 'read-node'], 'too old to ask the plugin about')
+
+  clock = A_MINUTE_LATER
+  await ctx.register('FILE1', 'plugin-b', CURRENT_PLUGIN)
+  assert.equal((await read()).body.reused, undefined, 'another plugin session answered that read')
+  assert.equal((await read()).body.reused, true)
+
+  await ctx.register('FILE1', 'plugin-c', ['read-node', 'figma-rest'])
+  assert.equal((await read()).body.reused, undefined, 'that plugin cannot report its edit count')
+
+  await ctx.register('FILE1', 'plugin-d', CURRENT_PLUGIN)
+  ctx.broker.nextResult = restResult({ editSeq: undefined })
+  await read()
+  assert.equal((await read()).body.reused, undefined, 'the read carried no edit count')
+  assert.deepEqual(ops().slice(2), ['read-node', 'edit-seq', 'read-node', 'read-node', 'read-node'])
+})
+
+test('a reply that arrives after its read timed out is kept for the next read, unless it is older', async t => {
+  const ctx = await withServer(t)
+  const session = await ctx.register('FILE1', 'plugin-a', CURRENT_PLUGIN)
+  const late = op => ({
+    requestId: 'req-7', fileKey: 'FILE1', op, sessionId: session.sessionId,
+    params: { fileKey: 'FILE1', nodeId: '12:34', representation: 'figma-rest' },
+  })
+  let lateRead = late('read-node')
+  ctx.broker.reply = () => ({ accepted: false, reason: 'REQUEST_TIMED_OUT', late: lateRead })
+  const reply = result => ctx.authed({
+    method: 'POST', path: `/bridge/session/${session.sessionId}/reply`,
+    headers: { 'x-session-secret': session.sessionSecret },
+    body: { requestId: 'req-7', ok: true, result },
+  })
+
+  const res = await reply(restResult({ editSeq: 5 }))
+  assert.equal(res.status, 200)
+  assert.equal(res.body.accepted, false)
+  assert.equal(res.body.reason, 'REQUEST_TIMED_OUT')
+  assert.equal(ctx.cache.calls.puts.length, 1)
+  const [stored] = ctx.cache.calls.puts
+  assert.equal(stored.representation, 'figma-rest')
+  assert.equal(stored.nodeId, '12:34')
+  assert.equal(stored.sessionId, session.sessionId)
+  assert.equal(stored.editSeq, 5)
+  assert.equal(stored.verifiedFresh, true)
+
+  // Older than what is cached, from another file, or no read at all: dropped.
+  await reply(restResult({ editSeq: 4 }))
+  await reply(restResult({ editSeq: 6, fileKey: 'OTHERFILE' }))
+  await reply({ found: false })
+  lateRead = late('edit-seq')
+  await reply({ fileKey: 'FILE1', editSeq: 9 })
+  assert.equal(ctx.cache.calls.puts.length, 1)
 })
 
 // ── Cached reads ──────────────────────────────────────────

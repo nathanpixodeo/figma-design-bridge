@@ -18,7 +18,14 @@ Prefer the official Figma MCP server when it is connected, because it is the onl
 Otherwise use this plugin's bridge tools: call `get_bridge_status` first for
 setup diagnostics. If the first argument is a Figma node link (it contains
 `node-id`), call `get_design_context` with it as `source`, then pass the same
-`source` to `search_design`, `get_design_texts`, and `get_design_colors`. A file
+`source` to `search_design`, `get_design_texts`, and `get_design_colors`.
+`get_design_context` returns the node as Figma's REST JSON, the source for exact
+values: per-corner radii in `rectangleCornerRadii`, mixed text styles in
+`characterStyleOverrides` and `styleOverrideTable`, and tokens in
+`boundVariables`, named in its `variables` map. A hard-coded value where the
+design binds a variable is a finding, as above. If its notes say Design Bridge
+is too old to export REST JSON, ask the user to reopen Design Bridge before
+reporting a radius or a text style as missing. A file
 link or a bare file key returns only the document index — pages and their
 top-level frames — and those three tools refuse it: use the index to find the
 frame, then ask the user for that frame's link (in Figma, right-click the frame

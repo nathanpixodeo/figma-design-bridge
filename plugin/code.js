@@ -289,7 +289,7 @@ async function connectBridge(){
   if(!waitingForBridge) setStatus('connecting','Connecting...')
   let data
   try{
-    data=await bridgeFetch('/bridge/session',{method:'POST',body:{fileKey:bridgeConfig.fileKey,fileName:bridgeConfig.fileName,pluginInstanceId:bridgeConfig.pluginInstanceId,capabilities:['read-node','read-document-index']}},false)
+    data=await bridgeFetch('/bridge/session',{method:'POST',body:{fileKey:bridgeConfig.fileKey,fileName:bridgeConfig.fileName,pluginInstanceId:bridgeConfig.pluginInstanceId,capabilities:['read-node','read-document-index','figma-rest','edit-seq']}},false)
   }catch(err){
     // Registering checks the token alone, so a 401 here means the token is wrong.
     if(err.status===401) err.tokenRejected=true
@@ -556,6 +556,10 @@ function describeNode(node, limits) {
   const isBox = node.type === 'RECTANGLE' || node.type === 'FRAME' || node.type === 'COMPONENT' || node.type === 'INSTANCE' || node.type === 'ELLIPSE'
   if (isBox && typeof node.cornerRadius === 'number' && node.cornerRadius > 0) {
     obj.cornerRadius = node.cornerRadius
+  } else if (isBox && typeof node.cornerRadius === 'symbol' && typeof node.topLeftRadius === 'number') {
+    // Corners that differ read as figma.mixed, so each one is read on its own,
+    // in the order the REST API gives them.
+    obj.rectangleCornerRadii = [node.topLeftRadius, node.topRightRadius, node.bottomRightRadius, node.bottomLeftRadius]
   }
 
   if (node.type === 'TEXT') {
@@ -925,17 +929,19 @@ function fitDocumentIndexToLimit(payload, limits) {
   return payload
 }
 
+function missingBridgeNode(nodeId) {
+  return {
+    fileKey: state.bridgeFileKey, fileName: state.bridgeFileName, nodeId,
+    pageId: null, pageName: null, found: false, truncated: false,
+    completeness: { nodeCount: 0, byteSize: 0, limitHit: false, truncatedNodeIds: [] }, payload: null,
+  }
+}
+
 async function readBridgeNode(request) {
   const params = request.params || {}
   const limits = bridgeLimits(params.options || {})
   const node = await figma.getNodeByIdAsync(params.nodeId)
-  if (!node) {
-    return {
-      fileKey: state.bridgeFileKey, fileName: state.bridgeFileName, nodeId: params.nodeId,
-      pageId: null, pageName: null, found: false, truncated: false,
-      completeness: { nodeCount: 0, byteSize: 0, limitHit: false, truncatedNodeIds: [] }, payload: null,
-    }
-  }
+  if (!node) return missingBridgeNode(params.nodeId)
 
   // The walked tree is released as soon as it is serialized, and parsing that
   // text gives the copy structured clone accepts (no figma.mixed symbols), so
@@ -955,6 +961,360 @@ async function readBridgeNode(request) {
     fileKey: state.bridgeFileKey, fileName: state.bridgeFileName, nodeId: node.id,
     pageId: page ? page.id : null, pageName: page ? page.name : null, found: true,
     truncated: completeness.limitHit, completeness, payload,
+  }
+}
+
+// The 'figma-rest' representation: Figma serializes the node itself, in the
+// JSON of the REST API's GET /v1/files/:key/nodes. That is every property the
+// file stores, mixed values included (each corner's radius, every text style
+// run, bound variables), much faster than reading properties one at a time,
+// and nothing leaves Figma: no REST token, no API quota.
+//
+// One export holds a subtree whole, so a subtree is measured first and only
+// one that fits what is left of the read's limits is exported. A larger one
+// is described from its own properties, marked partial, and its children are
+// taken one by one.
+const MAX_EXPORT_NODES = 5000
+const MAX_BRIDGE_VARIABLES = 2000
+const REST_MAPS = ['components', 'componentSets', 'styles', 'variables']
+const VECTOR_TYPES = ['VECTOR', 'BOOLEAN_OPERATION', 'STAR', 'LINE', 'ELLIPSE', 'REGULAR_POLYGON', 'RECTANGLE']
+
+// The bridge sends the representation with its limits after a '+', as in
+// 'figma-rest+geometry+d4'.
+function representationParts(request) {
+  return String(request.params?.representation || '').split('+')
+}
+
+function wantsRestFormat(request) {
+  return representationParts(request)[0] === 'figma-rest'
+}
+
+function restNodeType(type) {
+  return type === 'PAGE' ? 'CANVAS' : type
+}
+
+// Measures a subtree before it is exported: how many layers it has and how
+// many levels it goes down, stopping once either is more than the read has
+// room for. A subtree measured in full is remembered, so a container found too
+// large is not measured again when its children are taken one by one.
+async function measureSubtree(node, room, levels, read) {
+  const known = read.sizes.get(node.id)
+  if (known) return known
+  await read.pace()
+  const size = { count: 1, height: 0 }
+  let children = []
+  // A layer deleted while the walk was paused counts as nothing.
+  try { if ('children' in node) children = node.children } catch { return { count: 0, height: 0 } }
+  for (const child of children) {
+    if (size.count > room || size.height > levels) return size
+    const below = await measureSubtree(child, room - size.count, levels - 1, read)
+    size.count += below.count
+    size.height = Math.max(size.height, below.height + 1)
+  }
+  if (size.count <= room && size.height <= levels) read.sizes.set(node.id, size)
+  return size
+}
+
+function exportFailure(node, reason) {
+  const error = new Error(`Figma could not export layer ${node.id} as JSON: ${reason}`)
+  error.exportFailed = true
+  return error
+}
+
+// One call into Figma. The components, component sets and styles the subtree
+// uses are merged into the read's maps.
+async function exportRestNode(node, read) {
+  const started = Date.now()
+  let exported
+  try {
+    exported = await node.exportAsync({ format: 'JSON_REST_V1' })
+  } catch (error) {
+    throw exportFailure(node, (error && error.message) || String(error))
+  } finally {
+    read.timing.exportMs += Date.now() - started
+  }
+  if (typeof exported === 'string') exported = JSON.parse(exported)
+  if (!exported || typeof exported !== 'object') throw exportFailure(node, 'the export is empty')
+  const document = exported.document && typeof exported.document === 'object'
+    ? exported.document
+    : (exported.id && exported.type ? exported : null)
+  if (!document) throw exportFailure(node, 'the export has no document')
+  for (const key of ['components', 'componentSets', 'styles']) {
+    if (exported[key] && typeof exported[key] === 'object') Object.assign(read[key], exported[key])
+  }
+  read.exports++
+  return document
+}
+
+// Applies the read's limits to a subtree Figma exported whole: hidden layers
+// left out when asked, and text capped along with its per-character styles.
+function trimExport(restNode, depth, read) {
+  const { limits } = read
+  if (depth > 0 && !limits.includeHidden && restNode.visible === false) return null
+  limits.state.nodeCount++
+  if (typeof restNode.characters === 'string' && restNode.characters.length > limits.maxTextChars) {
+    restNode.characters = restNode.characters.slice(0, limits.maxTextChars)
+    if (Array.isArray(restNode.characterStyleOverrides)) {
+      restNode.characterStyleOverrides = restNode.characterStyleOverrides.slice(0, limits.maxTextChars)
+    }
+    const lines = restNode.characters.split('\n').length
+    for (const key of ['lineTypes', 'lineIndentations']) {
+      if (Array.isArray(restNode[key])) restNode[key] = restNode[key].slice(0, lines)
+    }
+    restNode.textTruncated = true
+    markBridgeTruncated(limits, restNode.id)
+  }
+  if (read.geometry && VECTOR_TYPES.includes(restNode.type)) read.vectors.push(restNode)
+  if (Array.isArray(restNode.children)) {
+    const kept = []
+    for (const child of restNode.children) {
+      const trimmed = trimExport(child, depth + 1, read)
+      if (trimmed) kept.push(trimmed)
+    }
+    restNode.children = kept
+  }
+  return restNode
+}
+
+// Read as they are: the plugin API and the REST API use the same names and
+// values for these.
+const OUTLINE_FIELDS = [
+  'blendMode', 'opacity', 'clipsContent', 'layoutMode', 'layoutWrap',
+  'primaryAxisSizingMode', 'counterAxisSizingMode', 'primaryAxisAlignItems', 'counterAxisAlignItems',
+  'counterAxisAlignContent', 'paddingLeft', 'paddingRight', 'paddingTop', 'paddingBottom',
+  'itemSpacing', 'counterAxisSpacing', 'itemReverseZIndex', 'strokesIncludedInLayout',
+  'layoutAlign', 'layoutGrow', 'layoutPositioning', 'layoutSizingHorizontal', 'layoutSizingVertical',
+  'minWidth', 'maxWidth', 'minHeight', 'maxHeight', 'strokeWeight', 'strokeAlign',
+  'cornerRadius', 'cornerSmoothing',
+]
+
+function restPaint(paint) {
+  const rest = { blendMode: paint.blendMode || 'NORMAL', type: paint.type }
+  if (paint.visible === false) rest.visible = false
+  if (typeof paint.opacity === 'number' && paint.opacity !== 1) rest.opacity = paint.opacity
+  if (paint.color) rest.color = { r: paint.color.r, g: paint.color.g, b: paint.color.b, a: 1 }
+  if (paint.gradientStops) rest.gradientStops = sanitizeForMessage(paint.gradientStops)
+  if (paint.gradientTransform) rest.gradientTransform = sanitizeForMessage(paint.gradientTransform)
+  if (paint.imageHash) rest.imageRef = paint.imageHash
+  if (paint.scaleMode) rest.scaleMode = paint.scaleMode
+  if (paint.boundVariables && Object.keys(paint.boundVariables).length) {
+    rest.boundVariables = sanitizeForMessage(paint.boundVariables)
+  }
+  return rest
+}
+
+// A layer too large to export whole: its own box, layout and paint, read from
+// the plugin API in the REST API's names. Its children follow under it.
+function outlineNode(node) {
+  const outline = { id: node.id, name: node.name, type: restNodeType(node.type), partial: true }
+  const read = key => { try { return node[key] } catch { return undefined } }
+  const visible = read('visible')
+  if (typeof visible === 'boolean') outline.visible = visible
+  for (const field of ['absoluteBoundingBox', 'absoluteRenderBounds']) {
+    const box = read(field)
+    if (box && typeof box === 'object') outline[field] = { x: box.x, y: box.y, width: box.width, height: box.height }
+  }
+  for (const field of OUTLINE_FIELDS) {
+    const value = read(field)
+    if (typeof value === 'number' || typeof value === 'string' || typeof value === 'boolean') outline[field] = value
+  }
+  if (typeof read('cornerRadius') === 'symbol' && typeof read('topLeftRadius') === 'number') {
+    outline.rectangleCornerRadii = [node.topLeftRadius, node.topRightRadius, node.bottomRightRadius, node.bottomLeftRadius]
+  }
+  if (typeof read('strokeWeight') === 'symbol' && typeof read('strokeTopWeight') === 'number') {
+    outline.individualStrokeWeights = {
+      top: node.strokeTopWeight, right: node.strokeRightWeight, bottom: node.strokeBottomWeight, left: node.strokeLeftWeight,
+    }
+  }
+  for (const field of ['fills', 'strokes']) {
+    const paints = read(field)
+    if (Array.isArray(paints) && paints.length) outline[field] = paints.map(restPaint)
+  }
+  const effects = read('effects')
+  if (Array.isArray(effects) && effects.length) outline.effects = sanitizeForMessage(effects)
+  const dashes = read('dashPattern')
+  if (Array.isArray(dashes) && dashes.length) outline.strokeDashes = [...dashes]
+  const bound = read('boundVariables')
+  if (bound && typeof bound === 'object' && Object.keys(bound).length) outline.boundVariables = sanitizeForMessage(bound)
+  if (node.type === 'INSTANCE') {
+    const main = read('mainComponent')
+    if (main) outline.componentId = main.id
+    const properties = read('componentProperties')
+    if (properties && typeof properties === 'object') outline.componentProperties = sanitizeForMessage(properties)
+  }
+  if (node.type === 'PAGE') {
+    const background = (read('backgrounds') || [])[0]
+    if (background && background.type === 'SOLID') {
+      outline.backgroundColor = { ...background.color, a: typeof background.opacity === 'number' ? background.opacity : 1 }
+    }
+  }
+  return outline
+}
+
+// Returns the node as Figma exports it when its subtree fits, an outline with
+// its children taken one by one when it does not, a placeholder once a limit
+// is reached, and null for a hidden layer the read leaves out.
+async function exportWithin(node, depth, read) {
+  const { limits } = read
+  await read.pace()
+  if (depth > 0 && !limits.includeHidden && node.visible === false) return null
+  if (depth > limits.maxDepth || bridgeBudgetSpent(limits)) {
+    markBridgeTruncated(limits, node.id)
+    return { id: node.id, name: node.name, type: restNodeType(node.type), truncated: true }
+  }
+
+  let exportError = null
+  // A page is mostly what is on it, and the document has no export.
+  if (node.type !== 'PAGE' && node.type !== 'DOCUMENT') {
+    const room = Math.min(limits.maxNodes - limits.state.nodeCount, MAX_EXPORT_NODES)
+    const levels = limits.maxDepth - depth
+    const measured = Date.now()
+    const size = await measureSubtree(node, room, levels, read)
+    read.timing.countMs += Date.now() - measured
+    if (size.count <= room && size.height <= levels) {
+      try {
+        const exported = trimExport(await exportRestNode(node, read), depth, read)
+        if (depth > 0) limits.state.byteSize += JSON.stringify(exported).length + 1
+        return exported
+      } catch (error) {
+        // Until one export has worked, a failure may mean this Figma cannot
+        // export JSON at all, and the read falls back as a whole.
+        if (!error.exportFailed || read.exports === 0) throw error
+        exportError = error.message
+      }
+    }
+  }
+
+  limits.state.nodeCount++
+  const outline = outlineNode(node)
+  if (exportError) outline.exportError = exportError
+  limits.state.byteSize += JSON.stringify(outline).length + 1
+  let children = []
+  try { if ('children' in node) children = node.children } catch {}
+  if (children.length) {
+    outline.children = []
+    for (const child of children) {
+      if (bridgeBudgetSpent(limits)) {
+        markBridgeTruncated(limits, node.id)
+        outline.truncated = true
+        break
+      }
+      // Figma may apply an edit while the read is paused; a layer deleted by
+      // then is skipped rather than failing the whole read.
+      if (child.removed) continue
+      const exported = await exportWithin(child, depth + 1, read)
+      if (exported) outline.children.push(exported)
+    }
+  }
+  return outline
+}
+
+// Asked for with 'geometry': the vector paths, as REST returns them for
+// geometry=paths. The export leaves them out.
+async function addGeometry(read) {
+  for (const restNode of read.vectors) {
+    await read.pace()
+    let node = null
+    try { node = await figma.getNodeByIdAsync(restNode.id) } catch {}
+    if (!node) continue
+    for (const field of ['fillGeometry', 'strokeGeometry']) {
+      try {
+        const paths = node[field]
+        if (paths && paths.length) restNode[field] = Array.from(paths, path => ({ path: String(path.data), windingRule: path.windingRule }))
+      } catch {}
+    }
+  }
+}
+
+// Bound variables arrive as ids. Each is named here, with its collection and
+// the code syntax set for it, so a value can be traced back to its token.
+async function resolveVariables(ids, read) {
+  const variables = {}
+  const api = figma.variables
+  if (!ids.length || !api || typeof api.getVariableByIdAsync !== 'function') return variables
+  const collections = new Map()
+  for (const id of ids.slice(0, MAX_BRIDGE_VARIABLES)) {
+    await read.pace()
+    let variable = null
+    try { variable = await api.getVariableByIdAsync(id) } catch {}
+    // A library variable the file never imported cannot be looked up.
+    if (!variable) continue
+    const collectionId = variable.variableCollectionId
+    if (!collections.has(collectionId)) {
+      let collection = null
+      try { collection = await api.getVariableCollectionByIdAsync(collectionId) } catch {}
+      collections.set(collectionId, collection)
+    }
+    const collection = collections.get(collectionId)
+    const entry = { name: variable.name, resolvedType: variable.resolvedType }
+    if (collection && collection.name) entry.collection = collection.name
+    if (variable.codeSyntax && Object.keys(variable.codeSyntax).length) entry.codeSyntax = { ...variable.codeSyntax }
+    if (variable.description) entry.description = variable.description
+    if (variable.remote) entry.remote = true
+    if (variable.key) entry.key = variable.key
+    variables[id] = entry
+  }
+  return variables
+}
+
+// The tree gives way first: the maps only say what its layers use. They are
+// cleared only when they alone leave the tree too little room.
+function fitRestPayloadToLimit(payload, limits, nodeId, size) {
+  const documentSize = jsonBytes(payload.document)
+  let room = limits.maxBytes - (size - documentSize)
+  if (room < 1024) {
+    for (const key of REST_MAPS) payload[key] = {}
+    markBridgeTruncated(limits, nodeId)
+    room = limits.maxBytes - (jsonBytes({ ...payload, document: null }) - 4) // "null" is the tree's place
+  }
+  payload.document = fitNodePayloadToLimit(payload.document, { ...limits, maxBytes: room }, nodeId, documentSize)
+  return jsonBytes(payload)
+}
+
+async function readBridgeNodeRest(request) {
+  const started = Date.now()
+  const params = request.params || {}
+  const limits = bridgeLimits(params.options || {})
+  const node = await figma.getNodeByIdAsync(params.nodeId)
+  if (!node) return missingBridgeNode(params.nodeId)
+
+  const read = {
+    limits, pace: createPacer(), sizes: new Map(), exports: 0,
+    geometry: representationParts(request).includes('geometry'), vectors: [],
+    components: {}, componentSets: {}, styles: {},
+    timing: { countMs: 0, exportMs: 0, totalMs: 0 },
+  }
+  let document
+  try {
+    document = await exportWithin(node, 0, read)
+  } catch (error) {
+    if (!error.exportFailed || read.exports > 0) throw error
+    // This Figma did not export the node as JSON: read it the way older
+    // plugins did, and say why.
+    const result = await readBridgeNode(request)
+    result.format = 'node-subtree'
+    result.fallbackReason = error.message
+    return result
+  }
+  read.sizes = null
+  if (read.geometry) await addGeometry(read)
+
+  const payload = { document, components: read.components, componentSets: read.componentSets, styles: read.styles }
+  let text = JSON.stringify(payload)
+  let size = utf8Length(text)
+  const variableIds = [...new Set(text.match(/"VariableID:[^"\\]*"/g) || [])].map(id => id.slice(1, -1))
+  text = null
+  payload.variables = await resolveVariables(variableIds, read)
+  size += utf8Length(',"variables":') + jsonBytes(payload.variables)
+  if (size > limits.maxBytes) size = fitRestPayloadToLimit(payload, limits, node.id, size)
+
+  const completeness = completenessFor(payload.document, limits, size)
+  const page = findPageForNode(node)
+  read.timing.totalMs = Date.now() - started
+  return {
+    fileKey: state.bridgeFileKey, fileName: state.bridgeFileName, nodeId: node.id,
+    pageId: page ? page.id : null, pageName: page ? page.name : null, found: true,
+    truncated: completeness.limitHit, completeness, format: 'figma-rest', timing: read.timing, payload,
   }
 }
 
@@ -998,21 +1358,36 @@ function readBridgeDocumentIndex(request) {
 }
 
 async function handleBridgeRequest(sessionId, request) {
+  const previous = repeatableBridgeRead
+  repeatableBridgeRead = null
   if (!request || !request.requestId) return
+  // The bridge gave up on a read that waited here past its deadline, and the
+  // caller already has its timeout: nobody is left to read it for.
+  if (Number.isFinite(request.expiresAt) && Date.now() > request.expiresAt) return
   if (!state.bridgeFileKey || request.params?.fileKey !== state.bridgeFileKey) {
     figma.ui.postMessage({ type: 'bridge-result', sessionId, requestId: request.requestId, ok: false, error: 'Request file does not match the connected Figma file.' })
     return
   }
+  const key = bridgeReadKey(request)
+  // The read just before this one asked for the same, and nothing was edited
+  // since it began: its answer is this one's too.
+  if (previous && previous.key === key && previous.editSeq === state.editSeq) {
+    keepForNextRead(previous)
+    replyBridgeRead(sessionId, request, previous.result)
+    return
+  }
   state.bridgeReading = true
+  // Taken before the read starts: an edit made while it runs leaves the result
+  // behind the count, so the bridge never reuses it.
+  const editSeq = state.editSeq
   try {
     let result
-    if (request.op === 'read-node') result = await readBridgeNode(request)
+    if (request.op === 'read-node') result = wantsRestFormat(request) ? await readBridgeNodeRest(request) : await readBridgeNode(request)
     else if (request.op === 'read-document-index') result = readBridgeDocumentIndex(request)
     else throw new Error(`Unsupported bridge operation: ${request.op}`)
-    state.lastBridgeNode = result.nodeId || 'Document index'
-    state.lastBridgeRequest = new Date()
-    updateUIStatus()
-    figma.ui.postMessage({ type: 'bridge-result', sessionId, requestId: request.requestId, ok: true, result })
+    result.editSeq = editSeq
+    keepForNextRead({ key, editSeq, result })
+    replyBridgeRead(sessionId, request, result)
   } catch (error) {
     figma.ui.postMessage({ type: 'bridge-result', sessionId, requestId: request.requestId, ok: false, error: error.message || String(error) })
   } finally {
@@ -1024,14 +1399,61 @@ async function handleBridgeRequest(sessionId, request) {
   }
 }
 
+function replyBridgeRead(sessionId, request, result) {
+  state.lastBridgeNode = result.nodeId || 'Document index'
+  state.lastBridgeRequest = new Date()
+  updateUIStatus()
+  figma.ui.postMessage({ type: 'bridge-result', sessionId, requestId: request.requestId, ok: true, result })
+}
+
 // One read at a time: a paced walk lets other work run between its slices, and
 // two walks at once would hold two trees in the plugin's memory.
 let bridgeQueue = Promise.resolve()
+// Reads waiting their turn, oldest first.
+const waitingBridgeReads = []
+// A caller that timed out and retried queues the same read again behind the
+// one still running for it. That read's answer is kept for the retry, but only
+// while the retry is next in line, so it never sits in memory during another read.
+let repeatableBridgeRead = null
+
+function bridgeReadKey(request) {
+  const params = (request && request.params) || {}
+  return JSON.stringify([request && request.op, params.fileKey, params.nodeId, params.representation, params.options])
+}
+
+function keepForNextRead(read) {
+  const next = waitingBridgeReads[0]
+  if (next && bridgeReadKey(next) === read.key) repeatableBridgeRead = read
+}
 
 function queueBridgeRequest(sessionId, request) {
-  const run = bridgeQueue.then(() => handleBridgeRequest(sessionId, request))
+  if (request && request.op === 'edit-seq') {
+    answerEditSeq(sessionId, request)
+    return Promise.resolve()
+  }
+  waitingBridgeReads.push(request)
+  const run = bridgeQueue.then(() => {
+    waitingBridgeReads.shift()
+    return handleBridgeRequest(sessionId, request)
+  })
   bridgeQueue = run.catch(() => {})
   return run
+}
+
+// How many edits Figma reported since the plugin started. Before reusing a
+// read it already has, the bridge asks for this, and reuses it only if the
+// count still matches the one the read began at. Answered at once, outside
+// the queue, even while a read is paused.
+function answerEditSeq(sessionId, request) {
+  if (!request.requestId) return
+  if (!state.bridgeFileKey || request.params?.fileKey !== state.bridgeFileKey) {
+    figma.ui.postMessage({ type: 'bridge-result', sessionId, requestId: request.requestId, ok: false, error: 'Request file does not match the connected Figma file.' })
+    return
+  }
+  figma.ui.postMessage({
+    type: 'bridge-result', sessionId, requestId: request.requestId, ok: true,
+    result: { fileKey: state.bridgeFileKey, editSeq: state.editSeq },
+  })
 }
 
 // An edit invalidates what the bridge cached for this file. One made while a
@@ -1108,7 +1530,7 @@ const state = {
   autoSync: true, lastNodeCount: 0, lastSyncTime: null, lastPageName: null,
   connected: false, ready: false, inFlight: null, pendingSync: null, pendingScope: null, nextRequestId: 0,
   bridgeFileKey: null, bridgeFileName: null, bridgeConnected: false, bridgeToken: '',
-  lastBridgeNode: null, lastBridgeRequest: null, bridgeReading: false, editedDuringRead: false,
+  lastBridgeNode: null, lastBridgeRequest: null, bridgeReading: false, editedDuringRead: false, editSeq: 0,
   pluginInstanceId: `plugin-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
 }
 
@@ -1217,6 +1639,7 @@ function main() {
     // One handler per event: an edit invalidates what the bridge cached for this
     // file, and re-syncs the page as well when auto-sync is on.
     figma.on('documentchange', () => {
+      state.editSeq++
       reportBridgeEdit()
       debouncedSync()
     })

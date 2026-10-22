@@ -20,6 +20,13 @@ Use the `figma-bridge` MCP server:
   (pages and their top-level frames) and those tools refuse it: find the frame
   in the index, then ask for that frame's link (in Figma: right-click, Copy link
   to selection).
+- `get_design_context` returns the node as Figma's REST JSON, the source for
+  exact values: per-corner radii in `rectangleCornerRadii`, mixed text styles
+  in `characterStyleOverrides` and `styleOverrideTable`, and tokens in
+  `boundVariables`, named in its `variables` map. A hard-coded value where the
+  design binds a variable is a finding: it will not follow the token. If the
+  notes say Design Bridge is too old to export REST JSON, ask the user to
+  reopen Design Bridge before reporting a radius or a text style as missing.
 - Prefer a link to one screen frame: a section or group holding many screens is
   slow to read and can run the Figma plugin out of memory. Pass
   `includeHidden: false` unless hidden layers matter.

@@ -155,7 +155,10 @@ test('a reply arriving after the request already timed out is rejected without t
   assert.doesNotThrow(() => {
     lateReply = broker.reply(session.sessionId, session.sessionSecret, { requestId, ok: true, result: { tooLate: true } })
   })
-  assert.deepEqual(lateReply, { accepted: false, reason: 'REQUEST_TIMED_OUT' })
+  assert.equal(lateReply.accepted, false)
+  assert.equal(lateReply.reason, 'REQUEST_TIMED_OUT')
+  // What the late result answers, so the caller can keep it for the next asker.
+  assert.deepEqual(lateReply.late, { requestId, fileKey: 'FILE_DEFAULT', op: 'ping', params: {}, sessionId: session.sessionId })
 
   // State must be clean: nothing left pending/queued for this session.
   const stats = broker.stats()
@@ -607,4 +610,53 @@ test('hasSessionForFile reflects only currently alive sessions', () => {
   assert.equal(broker.hasSessionForFile('FILE_DEFAULT'), true)
   broker.closeSession(session.sessionId, session.sessionSecret)
   assert.equal(broker.hasSessionForFile('FILE_DEFAULT'), false)
+})
+
+test('sessionFor names the session a read would go to and what its plugin can do', () => {
+  const { broker, clock } = makeHarness()
+  assert.equal(broker.sessionFor('FILE_DEFAULT'), null)
+  const old = registerTestSession(broker)
+  assert.deepEqual(broker.sessionFor('FILE_DEFAULT'), { sessionId: old.sessionId, capabilities: [] }, 'capabilities that are not a list count as none')
+
+  clock.advance(10)
+  const current = registerTestSession(broker, { capabilities: ['read-node', 'figma-rest', 'edit-seq'] })
+  assert.deepEqual(broker.sessionFor('FILE_DEFAULT'), { sessionId: current.sessionId, capabilities: ['read-node', 'figma-rest', 'edit-seq'] })
+  broker.sessionFor('FILE_DEFAULT').capabilities.push('changed')
+  assert.deepEqual(broker.sessionFor('FILE_DEFAULT').capabilities, ['read-node', 'figma-rest', 'edit-seq'])
+})
+
+test('a late reply is described only to the session the request went to, and only when it succeeded', async () => {
+  const { broker, clock } = makeHarness()
+  const session = registerTestSession(broker, { fileKey: 'FILE_LATE', pluginInstanceId: 'plugin-late-1' })
+  const other = registerTestSession(broker, { fileKey: 'FILE_LATE', pluginInstanceId: 'plugin-late-2' })
+
+  const pending = broker.request({ fileKey: 'FILE_LATE', op: 'read-node', params: { nodeId: '1:2' }, timeoutMs: 100 })
+  const target = broker.sessionFor('FILE_LATE').sessionId === session.sessionId ? session : other
+  const stranger = target === session ? other : session
+  const { requests } = await broker.poll(target.sessionId, target.sessionSecret, { waitMs: 10 })
+  clock.advance(100)
+  await assert.rejects(pending, { code: 'TIMEOUT' })
+
+  const requestId = requests[0].requestId
+  assert.deepEqual(broker.reply(stranger.sessionId, stranger.sessionSecret, { requestId, ok: true, result: {} }), { accepted: false, reason: 'REQUEST_TIMED_OUT' })
+  assert.deepEqual(broker.reply(target.sessionId, target.sessionSecret, { requestId, ok: false, error: 'Boom' }), { accepted: false, reason: 'REQUEST_TIMED_OUT' })
+  const late = broker.reply(target.sessionId, target.sessionSecret, { requestId, ok: true, result: {} })
+  assert.deepEqual(late.late.params, { nodeId: '1:2' })
+  assert.equal(late.late.op, 'read-node')
+})
+
+test('a read that times out says how many reads the plugin had to serve before it', async () => {
+  const { broker, clock } = makeHarness()
+  registerTestSession(broker)
+
+  const first = broker.request({ fileKey: 'FILE_DEFAULT', op: 'read-node', params: { nodeId: '1:1' }, timeoutMs: 500 })
+  const check = broker.request({ fileKey: 'FILE_DEFAULT', op: 'edit-seq', params: {}, timeoutMs: 500 })
+  const second = broker.request({ fileKey: 'FILE_DEFAULT', op: 'read-node', params: { nodeId: '1:2' }, timeoutMs: 500 })
+  const third = broker.request({ fileKey: 'FILE_DEFAULT', op: 'read-document-index', timeoutMs: 500 })
+  clock.advance(500)
+
+  await assert.rejects(first, error => error.code === 'TIMEOUT' && error.message === 'Request timed out waiting for a plugin reply')
+  await assert.rejects(check, error => error.ahead === 0, 'an edit count is answered at once, never queued behind reads')
+  await assert.rejects(second, error => error.ahead === 1 && /1 earlier read was ahead of it/.test(error.message))
+  await assert.rejects(third, error => error.ahead === 2 && /2 earlier reads were ahead of it, and the Figma plugin serves one read at a time/.test(error.message))
 })

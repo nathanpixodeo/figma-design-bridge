@@ -3,6 +3,7 @@ const assert = require('node:assert/strict')
 const {
   colorToHex,
   fetchFigmaDesign,
+  normalizeFigmaNode,
   normalizeFigmaResponse,
   parseFigmaSource,
 } = require('./figma-api')
@@ -55,6 +56,25 @@ test('normalizeFigmaResponse converts a full REST file to bridge schema', () => 
     family: 'Inter', style: 'Inter-Bold',
   })
   assert.equal(design.nodes[0].children[0].children[0].fills[0].color, '#1A334D')
+})
+
+test('normalizeFigmaNode keeps Figma\'s font style name and what the plugin marks on a layer', () => {
+  const node = normalizeFigmaNode({
+    id: '1:1', name: 'Section', type: 'FRAME', partial: true, truncated: true,
+    absoluteBoundingBox: { x: 0, y: 0, width: 1440, height: 900 },
+    children: [
+      {
+        id: '1:2', name: 'Title', type: 'TEXT', characters: 'Hello', textTruncated: true,
+        style: { fontFamily: 'Inter', fontPostScriptName: 'Inter-SemiBoldItalic', fontStyle: 'Semi Bold Italic', fontSize: 20 },
+      },
+      { id: '1:3', name: 'Chart', type: 'FRAME', partial: true, exportError: 'Unsupported layer' },
+    ],
+  })
+  assert.equal(node.partial, true)
+  assert.equal(node.truncated, true)
+  assert.deepEqual(node.children[0].fontName, { family: 'Inter', style: 'Semi Bold Italic' })
+  assert.equal(node.children[0].textTruncated, true)
+  assert.equal(node.children[1].exportError, 'Unsupported layer')
 })
 
 test('normalizeFigmaResponse imports selected nodes and resolves component metadata', () => {
