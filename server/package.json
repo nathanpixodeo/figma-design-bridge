@@ -1,6 +1,6 @@
 {
   "name": "figma-design-bridge-server",
-  "version": "1.5.1",
+  "version": "1.6.0",
   "description": "Local REST server that imports and exposes Figma designs to AI tools",
   "license": "Apache-2.0",
   "engines": {
