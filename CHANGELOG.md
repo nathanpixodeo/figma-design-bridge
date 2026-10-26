@@ -4,7 +4,7 @@ All notable changes to Figma Design Bridge. Versions follow
 [Semantic Versioning](https://semver.org/); the Claude Code plugin, the
 marketplace entry and both `package.json` files always carry the same number.
 
-## [Unreleased]
+## [1.5.1] - 2026-10-26
 
 A read covers the whole design: no layer is cut without its id.
 
@@ -360,7 +360,9 @@ audit. Nothing to migrate.
   with page and selection sync and Watch mode, and the MCP server for Claude
   Code.
 
-[1.4.1]: https://github.com/nathanpixodeo/figma-design-bridge/compare/1559101...main
+[1.5.1]: https://github.com/nathanpixodeo/figma-design-bridge/compare/334a489...main
+[1.5.0]: https://github.com/nathanpixodeo/figma-design-bridge/compare/fab0416...334a489
+[1.4.1]: https://github.com/nathanpixodeo/figma-design-bridge/compare/1559101...fab0416
 [1.4.0]: https://github.com/nathanpixodeo/figma-design-bridge/compare/7b63529...1559101
 [1.3.2]: https://github.com/nathanpixodeo/figma-design-bridge/compare/b093ebf...7b63529
 [1.3.1]: https://github.com/nathanpixodeo/figma-design-bridge/compare/a392ce3...b093ebf
