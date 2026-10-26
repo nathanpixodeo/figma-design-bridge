@@ -470,6 +470,60 @@ function countTree(node) {
   return node ? 1 + (node.children || []).reduce((sum, child) => sum + countTree(child), 0) : 0
 }
 
+const PLACEHOLDER_KEYS = ['id', 'name', 'type', 'truncated']
+
+// Every layer of the source tree is in the payload, whole or named by a
+// placeholder standing for it and everything under it. Returns the placeholders.
+function assertCovered(payload, source) {
+  const read = new Map()
+  const index = node => { read.set(node.id, node); (node.children || []).forEach(index) }
+  index(payload)
+  const placeholders = []
+  const visit = node => {
+    const found = read.get(node.id)
+    assert.ok(found, `layer ${node.id} (${node.name}) is neither read nor named`)
+    if (found.truncated && !found.children && Object.keys(found).every(key => PLACEHOLDER_KEYS.includes(key))) {
+      placeholders.push(found)
+      return
+    }
+    ;(node.children || []).forEach(visit)
+  }
+  visit(source)
+  return placeholders
+}
+
+// A chain of frames `levels` deep, with a text layer at the bottom.
+function chainScreen(parent, levels) {
+  const root = { id: '6:0', name: 'Level 0', type: 'FRAME', width: 390, height: 844, parent, children: [] }
+  const nodes = new Map([[root.id, root]])
+  let current = root
+  for (let level = 1; level <= levels; level++) {
+    const node = level === levels
+      ? { id: `6:${level}`, name: `Level ${level}`, type: 'TEXT', characters: 'Deep text', parent: current }
+      : { id: `6:${level}`, name: `Level ${level}`, type: 'FRAME', width: 300, height: 100, parent: current, children: [] }
+    current.children.push(node)
+    nodes.set(node.id, node)
+    current = node
+  }
+  return { root, nodes }
+}
+
+test('Bridge reads 50 levels down unless a smaller depth is asked for', async () => {
+  const p = await connectedBridgePlugin()
+  const { root, nodes } = chainScreen(p.otherPage, 45)
+  p.figma.getNodeByIdAsync = async id => nodes.get(id) || null
+
+  const full = await readNode(p, root.id)
+  assert.equal(full.result.truncated, false)
+  assert.equal(countTree(full.result.payload), 46)
+
+  const bounded = await readNode(p, root.id, { depth: 40 })
+  let node = bounded.result.payload
+  for (let level = 0; level < 41; level++) node = node.children[0]
+  assert.deepEqual(node, { id: '6:41', name: 'Level 41', type: 'FRAME', truncated: true })
+  assert.equal(bounded.result.truncated, true)
+})
+
 test('Bridge keeps every node that fits when maxBytes cuts a nested subtree', async () => {
   const p = await connectedBridgePlugin()
   const { screen, nodes } = nestedScreen(p.otherPage)
@@ -491,6 +545,31 @@ test('Bridge keeps every node that fits when maxBytes cuts a nested subtree', as
   assert.equal(bounded.result.completeness.nodeCount, countTree(payload))
   assert.equal(payload.children[0].name, 'Card 0')
   assert.equal(payload.truncated, true)
+  // The cut leaves the layers it took out named, so each can be read by id.
+  const placeholders = assertCovered(payload, screen)
+  assert.ok(placeholders.length > 0)
+  for (const placeholder of placeholders) {
+    assert.ok(bounded.result.completeness.truncatedNodeIds.includes(placeholder.id))
+  }
+})
+
+test('Bridge names every child left once the budget is spent mid-walk', async () => {
+  const p = await connectedBridgePlugin()
+  const { screen, nodes } = flatScreen(p.otherPage, 100)
+  p.figma.getNodeByIdAsync = async id => nodes.get(id) || null
+  const exports = exportable(screen)
+
+  for (const read of [readNode, readRest]) {
+    const reply = await read(p, screen.id, { maxNodes: 50 })
+    const root = reply.result.payload.document || reply.result.payload
+    assert.equal(reply.result.truncated, true)
+    assert.equal(root.truncated, true)
+    assert.equal(root.children[0].characters, 'Label 0')
+    const placeholders = assertCovered(root, screen)
+    assert.equal(placeholders.length, 51)
+    assert.equal(placeholders.at(-1).id, '4:101')
+  }
+  assert.ok(!exports.includes(screen.id))
 })
 
 test('Bridge trims a document index with non-ASCII names to maxBytes exactly', async () => {
@@ -634,7 +713,11 @@ test('Bridge caps maxNodes at 20000 however many a read asks for', async () => {
 
   const reply = await readNode(p, screen.id, { maxNodes: 200_000, maxBytes: 50_000_000 })
   assert.equal(reply.ok, true)
-  assert.equal(reply.result.completeness.nodeCount, 20_000)
+  const { children } = reply.result.payload
+  // The screen and 19,999 children are read; the six left are named only.
+  assert.equal(children.filter(child => !child.truncated).length, 19_999)
+  assert.deepEqual(children.slice(19_999).map(child => Object.keys(child)), new Array(6).fill(['id', 'name', 'type', 'truncated']))
+  assert.equal(reply.result.completeness.nodeCount, 20_006)
   assert.equal(reply.result.completeness.limitHit, true)
   assert.equal(reply.result.payload.truncated, true)
 })
@@ -1247,14 +1330,17 @@ test('Bridge outlines a subtree too large to export whole and exports its childr
   assert.deepEqual(document.rectangleCornerRadii, [16, 16, 0, 0])
   assert.equal(document.truncated, true)
   // Nineteen cards fit whole; the twentieth is outlined down to the two text
-  // layers that still fit.
-  assert.equal(document.children.length, 20)
+  // layers that still fit, and every layer past the budget is named only.
+  assert.equal(document.children.length, 60)
   assert.equal(document.children[0].partial, undefined)
   assert.equal(document.children[0].children[0].children.length, 3)
   assert.equal(document.children[19].partial, true)
   assert.equal(document.children[19].children[0].partial, true)
-  assert.equal(document.children[19].children[0].children.length, 2)
-  assert.equal(reply.result.completeness.nodeCount, 100)
+  assert.equal(document.children[19].children[0].children.length, 3)
+  assert.deepEqual(document.children[19].children[0].children[2], { id: '3:101', name: 'Text 2', type: 'TEXT', truncated: true })
+  assert.deepEqual(document.children[20], { id: '3:102', name: 'Card 20', type: 'FRAME', truncated: true })
+  assert.equal(document.children.slice(20).every(card => card.truncated && !card.children), true)
+  assert.equal(reply.result.completeness.nodeCount, 100 + 1 + 40)
   assert.equal(reply.result.completeness.limitHit, true)
   assert.equal(exports.length, 21)
   assert.ok(!exports.includes(screen.id))
@@ -1330,6 +1416,7 @@ test('Bridge trims an exported tree to maxBytes and measures the whole payload',
   assert.equal(payload.document.children[0].name, 'Card 0')
   assert.deepEqual(payload.components, { '9:1': { key: 'abc', name: 'Card', description: '' } })
   assert.equal(reply.result.completeness.nodeCount, countTree(payload.document))
+  assert.ok(assertCovered(payload.document, screen).length > 0)
 })
 
 test('Bridge caps exported text together with its per-character styles', async () => {

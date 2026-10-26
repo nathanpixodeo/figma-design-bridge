@@ -446,7 +446,7 @@ function cutNode(node, depth, limits) {
   if (limits && limits.state) {
     if (depth > limits.maxDepth || bridgeBudgetSpent(limits)) {
       markBridgeTruncated(limits, node.id)
-      return { id: node.id, name: node.name, type: node.type, truncated: true }
+      return placeholderFor(node)
     }
     if (depth > 0 && limits.includeHidden === false && node.visible === false) return null
     limits.state.nodeCount++
@@ -523,14 +523,18 @@ async function serializeNodePaced(node, depth, limits, pace) {
   if ('children' in node && node.children.length > 0) {
     obj.children = []
     for (const child of node.children) {
-      if (bridgeBudgetSpent(limits)) {
-        markBridgeTruncated(limits, node.id)
-        obj.truncated = true
-        break
-      }
       // Figma may apply an edit while the walk is paused; a layer deleted by
       // then is skipped rather than failing the whole read.
       if (child.removed) continue
+      // Once the budget is spent, each child left comes back as a placeholder,
+      // so the layers not read are still named.
+      if (bridgeBudgetSpent(limits)) {
+        if (limits.includeHidden === false && child.visible === false) continue
+        if (obj.truncated !== true) {
+          markBridgeTruncated(limits, node.id)
+          obj.truncated = true
+        }
+      }
       const serialized = await serializeNodePaced(child, depth + 1, limits, pace)
       if (serialized) obj.children.push(serialized)
     }
@@ -749,11 +753,13 @@ function normalizeBridgeUrl(value) {
 }
 
 // The caps keep a read inside what the plugin can serve: 20,000 nodes take
-// about 90 seconds to walk, and the bridge waits two minutes at most.
+// about 90 seconds to walk, and the bridge waits two minutes at most. Depth
+// is not limited unless asked: nested instances put text 20 levels down, and
+// maxNodes and maxBytes already bound the read.
 function bridgeLimits(options = {}) {
   const integer = (value, fallback, min, max) => Number.isInteger(value) ? Math.max(min, Math.min(max, value)) : fallback
   return {
-    maxDepth: integer(options.depth, 12, 0, 30),
+    maxDepth: integer(options.depth, 50, 0, 50),
     maxNodes: integer(options.maxNodes, 5000, 1, 20_000),
     maxBytes: integer(options.maxBytes, 2_000_000, 1024, 10_000_000),
     maxTextChars: 100_000,
@@ -820,26 +826,55 @@ function completenessFor(payload, limits, knownSize) {
   }
 }
 
-// Removes the last node in document order, repeatedly, until the payload fits.
-// The serializer's running estimate leaves out the nesting overhead, so a cut
-// subtree can still come out over budget; trimming from the end keeps every
-// node that fits instead of dropping the whole subtree. Returns the final size.
+// What a read leaves in place of a layer it did not include: enough to read
+// that layer on its own, by id.
+function placeholderFor(node, type = node.type) {
+  return { id: node.id, name: node.name, type, truncated: true }
+}
+
+function isPlaceholder(node) {
+  return node.truncated === true && !Array.isArray(node.children)
+    && Object.keys(node).every(key => key === 'id' || key === 'name' || key === 'type' || key === 'truncated')
+}
+
+// Trims the payload from the end of the tree until it fits. The last layer
+// still whole, deepest first, becomes a placeholder, and a layer whose
+// children are all placeholders becomes one itself, so every layer left out
+// is still named and can be read by id. The serializer's running estimate
+// leaves out the nesting overhead, so a cut subtree can still come out over
+// budget; trimming from the end keeps every node that fits instead of dropping
+// the whole subtree. Returns the final size.
 function pruneTrailingNodes(root, limits, size = jsonBytes(root)) {
   while (size > limits.maxBytes) {
     let parent = null
+    let index = -1
     let node = root
-    while (Array.isArray(node.children) && node.children.length) {
+    for (;;) {
+      const children = Array.isArray(node.children) ? node.children : []
+      let last = children.length - 1
+      while (last >= 0 && isPlaceholder(children[last])) last--
+      if (last < 0) break
       parent = node
-      node = node.children[node.children.length - 1]
+      index = last
+      node = children[last]
     }
-    if (!parent) break
 
-    parent.children.pop()
-    if (parent.children.length) {
-      size -= jsonBytes(node) + 1 // the node and the comma before it
+    if (parent) {
+      const placeholder = placeholderFor(node)
+      parent.children[index] = placeholder
+      size -= jsonBytes(node) - jsonBytes(placeholder)
+      markBridgeTruncated(limits, node.id)
     } else {
-      delete parent.children
-      size -= jsonBytes(node) + 14 // `,"children":[` + node + `]`
+      // Only placeholders are left under the root: they go too, from the end.
+      if (!Array.isArray(root.children) || !root.children.length) break
+      parent = root
+      const removed = root.children.pop()
+      if (root.children.length) {
+        size -= jsonBytes(removed) + 1 // the placeholder and the comma before it
+      } else {
+        delete root.children
+        size -= jsonBytes(removed) + 14 // `,"children":[` + placeholder + `]`
+      }
     }
     // A parent already flagged was recorded when it was flagged, so each one is
     // recorded once rather than once per removed child.
@@ -1160,7 +1195,7 @@ async function exportWithin(node, depth, read) {
   if (depth > 0 && !limits.includeHidden && node.visible === false) return null
   if (depth > limits.maxDepth || bridgeBudgetSpent(limits)) {
     markBridgeTruncated(limits, node.id)
-    return { id: node.id, name: node.name, type: restNodeType(node.type), truncated: true }
+    return placeholderFor(node, restNodeType(node.type))
   }
 
   let exportError = null
@@ -1194,14 +1229,15 @@ async function exportWithin(node, depth, read) {
   if (children.length) {
     outline.children = []
     for (const child of children) {
-      if (bridgeBudgetSpent(limits)) {
-        markBridgeTruncated(limits, node.id)
-        outline.truncated = true
-        break
-      }
       // Figma may apply an edit while the read is paused; a layer deleted by
       // then is skipped rather than failing the whole read.
       if (child.removed) continue
+      // Once the budget is spent, each child left comes back as a placeholder,
+      // so the layers not read are still named.
+      if (bridgeBudgetSpent(limits) && outline.truncated !== true) {
+        markBridgeTruncated(limits, node.id)
+        outline.truncated = true
+      }
       const exported = await exportWithin(child, depth + 1, read)
       if (exported) outline.children.push(exported)
     }

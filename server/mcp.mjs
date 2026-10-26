@@ -266,12 +266,21 @@ function describeError(error, { read = false } = {}) {
   return `${prefix}${message}${hint}`;
 }
 
+// The deepest read the plugin serves. Nested instances put text 20 levels
+// down, so a read goes all the way unless the caller asks for less.
+const FULL_DEPTH = 50;
+// The bridge's own caps. A tool that answers with something derived from a
+// read, such as its text or colors, never returns the read itself, so when a
+// read at the usual limits comes back cut it reads again up to these.
+const FULL_READ = { depth: FULL_DEPTH, maxNodes: 20000, maxBytes: 10000000 };
+const LIMIT_KEYS = ["depth", "maxNodes", "maxBytes"];
+
 // A node is read as Figma's own REST JSON, which the plugin exports with every
 // attribute, unless the caller names another representation. A plugin too old
 // to export it is read the old way, and the answer says so.
-function readOptionsFromArgs(args = {}) {
-  const options = {};
-  for (const key of ["depth", "maxNodes", "maxBytes", "includeHidden", "representation"]) {
+function readOptionsFromArgs(args = {}, defaults = { depth: FULL_DEPTH }) {
+  const options = { ...defaults };
+  for (const key of [...LIMIT_KEYS, "includeHidden", "representation"]) {
     if (args[key] !== undefined) options[key] = args[key];
   }
   if (options.representation === undefined) {
@@ -322,6 +331,22 @@ function provenance(design) {
   return `> Source: legacy snapshot "${design?.pageName || "unnamed"}", synced at ${design?.syncedAt || design?.savedAt || "an unknown time"}`;
 }
 
+// The layers a node read left out. Each is a placeholder, or a layer whose
+// children were left out, and reads whole on its own by its id.
+function cutLayers(bridge) {
+  const cut = [];
+  const visit = node => {
+    if (!node || typeof node !== "object") return;
+    const children = Array.isArray(node.children) ? node.children : [];
+    if (node.truncated && !children.length) cut.push(node);
+    children.forEach(visit);
+  };
+  visit(isRestResult(bridge) ? bridge.payload?.document : bridge.payload);
+  return cut;
+}
+
+const CUT_LAYERS_LISTED = 15;
+
 // What limits how far a bridge read can be trusted.
 function readNotes(bridge) {
   const notes = [];
@@ -330,7 +355,17 @@ function readNotes(bridge) {
   }
   if (bridge.truncated) {
     const cut = bridge.completeness?.truncatedNodeIds?.length;
-    notes.push(`The read was truncated${cut ? ` (${cut} subtree(s) cut)` : ""} at depth, maxNodes or maxBytes. Raise them or read a child node before concluding that something is missing.`);
+    let note = `The read was truncated${cut ? ` (${cut} subtree(s) cut)` : ""} at depth, maxNodes or maxBytes.`;
+    const layers = bridge.nodeId ? cutLayers(bridge) : [];
+    if (layers.length) {
+      const named = layers.slice(0, CUT_LAYERS_LISTED).map(layer => `"${layer.name ?? ""}" (${layer.id})`).join(", ");
+      const more = layers.length > CUT_LAYERS_LISTED ? `, and ${layers.length - CUT_LAYERS_LISTED} more` : "";
+      note += ` ${layers.length} layer(s) were left out, with everything inside them: ${named}${more}.`
+        + " Read each one with the same link and its id as node-id, or raise maxBytes (up to 10000000).";
+    } else {
+      note += " Raise them or read a child node before concluding that something is missing.";
+    }
+    notes.push(note);
   }
   if (bridge.stale || bridge.freshness === "cached") notes.push("Cached data, not verified against the open file.");
   if (bridge.reused) {
@@ -383,13 +418,19 @@ function bridgeResultToDesign(result) {
 
 async function resolveDesign(args = {}) {
   if (args?.source) {
-    const result = await withBridge(client => client.read({
+    const read = options => withBridge(client => client.read({
       source: args.source,
       mode: args.mode || "live",
       timeoutMs: readTimeoutFromArgs(args),
-      options: readOptionsFromArgs(args),
+      options,
       fresh: args.fresh === true,
     }));
+    // The usual limits first, so a read get_design_context already made is
+    // reused; a cut read is taken again whole unless the caller set a limit.
+    let result = await read(readOptionsFromArgs(args));
+    if (result?.truncated && result.nodeId && LIMIT_KEYS.every(key => args[key] === undefined)) {
+      result = await read(readOptionsFromArgs(args, FULL_READ));
+    }
     return bridgeResultToDesign(result);
   }
   const currentDesign = store.getCurrent();
@@ -411,18 +452,27 @@ const FRESH_PROPERTY = {
   description: "Read again even when the plugin reports no edit since an earlier read of the same node, which is otherwise answered at once with reused: true (default false). Figma does not report every edit, such as a change to a variable's value alone.",
 };
 
+// These tools answer with what they derive from the read, never the read
+// itself, so its limits only decide how much of the design they see.
+const DERIVED_LIMIT = "This limits the plugin's read, not this tool's answer: a smaller value only leaves layers out. Leave it unset; a read cut at the default is read again up to the maximum.";
+
 const SOURCE_PROPERTIES = {
   source: { type: "string", description: "Figma URL or file key. When provided, this tool reads through the live plugin bridge instead of global legacy state. Prefer a link to one screen frame: a section or page holding many screens is slow to read and can run the Figma plugin out of memory." },
   mode: { type: "string", enum: ["live", "cached"], description: "Live by default. Cached mode is explicit opt-in to unverified stale data." },
-  depth: { type: "integer", minimum: 0, maximum: 50 },
-  maxNodes: { type: "integer", minimum: 1, maximum: 20000, description: "Most nodes to read (default 5000)" },
-  maxBytes: { type: "integer", minimum: 1024, maximum: 10000000, description: "Payload limit in UTF-8 bytes (default 2000000)" },
+  depth: { type: "integer", minimum: 0, maximum: 50, description: `Most levels to read below the node (default 50). ${DERIVED_LIMIT}` },
+  maxNodes: { type: "integer", minimum: 1, maximum: 20000, description: `Most nodes to read (default 5000). ${DERIVED_LIMIT}` },
+  maxBytes: { type: "integer", minimum: 1024, maximum: 10000000, description: `Most UTF-8 bytes to read (default 2000000). ${DERIVED_LIMIT}` },
   includeHidden: { type: "boolean", description: "Include hidden layers (default true). Pass false unless hidden layers matter; it keeps a large read smaller." },
   timeoutMs: TIMEOUT_PROPERTY,
   fresh: FRESH_PROPERTY,
 };
 
 // ── MCP server ─────────────────────────────────────────────
+
+// Design payloads, and the tables and trees made from a whole design, are
+// large by nature. Let Claude Code show up to its per-tool ceiling inline
+// instead of diverting the result to a file.
+const INLINE_RESULT_META = { "anthropic/maxResultSizeChars": 500000 };
 
 // Hints for the client's approval policy: Codex runs a read-only tool without
 // asking. Pairing hands a Figma plugin the bridge token, so it is marked
@@ -448,17 +498,15 @@ async function startMCP() {
       {
         name: "get_design_context",
         description: "Read a Figma file or exact node through the connected Figma plugin. A node URL returns that node and its subtree as Figma's REST API JSON, exported by the plugin with no token: payload.document holds every attribute, such as per-corner radii (rectangleCornerRadii), per-character text styles (characterStyleOverrides, styleOverrideTable) and bound variables, and payload.components, componentSets, styles and variables describe what it uses. A file URL returns a lightweight document index. A read the plugin confirms unchanged since an earlier one is answered at once (reused: true). Live mode never falls back to the Figma REST API or to stale cache.",
-        // Design payloads are large by nature. Let Claude Code show up to its
-        // per-tool ceiling inline instead of diverting the result to a file.
-        _meta: { "anthropic/maxResultSizeChars": 500000 },
+        _meta: INLINE_RESULT_META,
         inputSchema: {
           type: "object",
           properties: {
             source: { type: "string", description: "Figma design URL (including node-id when relevant) or a Figma file key. Prefer a link to one screen frame: a section or page holding many screens is slow to read and can run the Figma plugin out of memory." },
             mode: { type: "string", enum: ["live", "cached"], description: "Use live unless the user explicitly asks for cached/offline data." },
-            depth: { type: "integer", minimum: 0, maximum: 50 },
+            depth: { type: "integer", minimum: 0, maximum: 50, description: "Most levels to read below the node (default 50, every level)" },
             maxNodes: { type: "integer", minimum: 1, maximum: 20000, description: "Most nodes to read (default 5000)" },
-            maxBytes: { type: "integer", minimum: 1024, maximum: 10000000, description: "Payload limit in UTF-8 bytes (default 2000000)" },
+            maxBytes: { type: "integer", minimum: 1024, maximum: 10000000, description: "Payload limit in UTF-8 bytes (default 2000000). Layers past it come back as placeholders { id, name, type, truncated: true }; read each by its id as node-id" },
             includeHidden: { type: "boolean", description: "Include hidden layers (default true). Pass false unless hidden layers matter; it keeps a large read smaller." },
             geometry: { type: "boolean", description: "Add vector paths (fillGeometry, strokeGeometry) to vector layers, as the REST API's geometry=paths does (default false)." },
             timeoutMs: TIMEOUT_PROPERTY,
@@ -497,26 +545,31 @@ async function startMCP() {
       },
       {
         name: "get_design_summary",
+        _meta: INLINE_RESULT_META,
         description: "Get a markdown summary for an explicit Figma source through the live plugin bridge, or for the legacy imported snapshot when source is omitted.",
         inputSchema: { type: "object", properties: { ...SOURCE_PROPERTIES } },
       },
       {
         name: "get_design_tree",
+        _meta: INLINE_RESULT_META,
         description: "Get an ASCII layer tree for an explicit Figma source or the legacy imported snapshot.",
         inputSchema: { type: "object", properties: { ...SOURCE_PROPERTIES } },
       },
       {
         name: "get_design_texts",
+        _meta: INLINE_RESULT_META,
         description: "Extract text content from a Figma node link (with node-id) through the live plugin bridge, or from the legacy imported snapshot when source is omitted. A file link only has the document index and is refused.",
         inputSchema: { type: "object", properties: { ...SOURCE_PROPERTIES } },
       },
       {
         name: "get_design_colors",
+        _meta: INLINE_RESULT_META,
         description: "Get solid fill/stroke colors from a Figma node link (with node-id) through the live plugin bridge, or from the legacy imported snapshot when source is omitted. A file link only has the document index and is refused.",
         inputSchema: { type: "object", properties: { ...SOURCE_PROPERTIES } },
       },
       {
         name: "search_design",
+        _meta: INLINE_RESULT_META,
         description: "Search a Figma node link (with node-id) through the live plugin bridge, or the legacy imported snapshot when source is omitted, by node name or text content. A file link only has the document index and is refused.",
         inputSchema: {
           type: "object",

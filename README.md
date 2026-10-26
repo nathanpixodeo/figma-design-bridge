@@ -756,7 +756,8 @@ Design rules it enforces:
   `completeness: { nodeCount, byteSize, limitHit, truncatedNodeIds }`, so a
   bounded response never claims to be the whole design. `maxBytes` counts UTF-8
   bytes, and a cut keeps the subtree in document order up to the limit rather
-  than collapsing it to the requested node.
+  than collapsing it to the requested node. Every cut layer stays as a
+  placeholder with its id, so it can be read on its own.
 
 The token lives in `<dataDir>/bridge-token.json`, which `.gitignore` excludes. It
 is never included in a health response, a session listing, a snapshot or a log
@@ -907,15 +908,27 @@ The payload is `{ document, components, componentSets, styles, variables }`.
 `resolvedType` and `codeSyntax`. `geometry: true` adds vector paths
 (`fillGeometry`, `strokeGeometry`), as REST's `geometry=paths` does.
 
-The read limits still apply. Figma exports a layer whole when its subtree fits
-what is left of `maxNodes` and `depth`, up to 5,000 layers in one export. A
-larger layer, and every page, is marked `partial: true`: its own box, layout,
-paint and bound variables are read from the plugin API, and its children are
-exported one by one. Layers below `depth` become
-`{ id, name, type, truncated: true }`, and text is cut at 100,000 characters
-(`textTruncated: true`). REST JSON is larger than the plugin's own reading, so a
-read fills `maxBytes` (2 MB by default) sooner: read one screen frame, or pass
-`includeHidden: false`.
+The read limits still apply. `depth` defaults to 50, so every level of a design
+is read unless a smaller depth is asked for. Figma exports a layer whole when its
+subtree fits what is left of `maxNodes` and `depth`, up to 5,000 layers in one
+export. A larger layer, and every page, is marked `partial: true`: its own box,
+layout, paint and bound variables are read from the plugin API, and its children
+are exported one by one. Text is cut at 100,000 characters
+(`textTruncated: true`).
+
+A limit never drops a layer silently. Layers below `depth`, the layers left once
+`maxNodes` is spent and, when the payload is over `maxBytes`, its trailing
+layers become `{ id, name, type, truncated: true }`. The answer's note names
+them, and each one can be read with the same link and its id as `node-id`. REST
+JSON is larger than the plugin's own reading, so a read fills `maxBytes` (2 MB
+by default) sooner: read one screen frame, read the layers the note names, or
+pass `includeHidden: false`.
+
+The summary, tree, text, color, search and info tools return a small answer
+derived from the read, so their `depth`, `maxNodes` and `maxBytes` bound the
+plugin's read, not the answer. When their first read is cut, they read the node
+again with `maxNodes: 20000` and `maxBytes: 10000000`, unless the caller set a
+limit, and their note names whatever is still left out.
 
 If the first export of a read fails, this Figma may not export JSON at all: the
 plugin reads the node its own way and says why in `fallbackReason`. A later
@@ -1047,7 +1060,7 @@ Restart the MCP client after changing its environment configuration.
 
 | Tool | Description |
 |------|-------------|
-| `get_design_context` | Read a Figma file or exact node through the connected plugin (`source` required; live by default). A node comes back as Figma's REST JSON with every attribute. `depth`, `maxNodes` and `maxBytes` bound the result; `timeoutMs` (default 30000, up to 120000) bounds the wait; `fresh: true` reads again instead of reusing an unchanged read; `geometry: true` adds vector paths |
+| `get_design_context` | Read a Figma file or exact node through the connected plugin (`source` required; live by default). A node comes back as Figma's REST JSON with every attribute. `depth` (default 50, every level), `maxNodes` and `maxBytes` bound the result, and a cut layer stays as a placeholder the note names; `timeoutMs` (default 30000, up to 120000) bounds the wait; `fresh: true` reads again instead of reusing an unchanged read; `geometry: true` adds vector paths |
 | `get_bridge_status` | Show bridge readiness, live plugin sessions, how many plugins wait for pairing approval, cache statistics, and setup hints |
 | `approve_figma_pairing` | Approve the Figma plugin that shows this 6-digit pairing code (`code` required). Use only a code the user reads from the plugin |
 | `sync_figma_design` | Explicitly fetch a Figma URL/file key, normalize it, and cache it locally |

@@ -4,6 +4,41 @@ All notable changes to Figma Design Bridge. Versions follow
 [Semantic Versioning](https://semver.org/); the Claude Code plugin, the
 marketplace entry and both `package.json` files always carry the same number.
 
+## [Unreleased]
+
+A read covers the whole design: no layer is cut without its id.
+
+### Upgrading
+
+- Close Design Bridge in Figma and open it again to load the new plugin. A panel
+  opened before the upgrade still reads at most 30 levels and drops byte-cut
+  layers without naming them.
+
+### Fixed
+
+- Text, colors and layers nested deep inside component instances were left out.
+  `depth` defaulted to 12 and the plugin read at most 30 levels. `depth` now
+  defaults to 50, the most the bridge accepts, so every level is read unless a
+  smaller depth is asked for.
+- `get_design_summary`, `get_design_tree`, `get_design_texts`,
+  `get_design_colors`, `search_design` and `get_design_info` cut a large frame
+  at 2 MB, although their answer is far smaller than the read. When their first
+  read is cut, they read the node again with `maxNodes: 20000` and
+  `maxBytes: 10000000`, unless the caller set a limit.
+- A read over `maxBytes` dropped its trailing layers, and a read past
+  `maxNodes` stopped at the first layer that did not fit, without naming what
+  was left. Each cut layer now stays in its parent as
+  `{ id, name, type, truncated: true }`.
+
+### Changed
+
+- The truncation note names up to 15 cut layers as `"name" (id)` and says to
+  read each one with the same link and its id as `node-id`, or to raise
+  `maxBytes`.
+- The summary, tree, text, color and search tools ask Claude Code to show up to
+  500,000 characters inline, as `get_design_context` already did, so a long
+  text table is not cut by the client.
+
 ## [1.5.0] - 2026-10-22
 
 A live read returns every attribute Figma stores, and agents reading the same

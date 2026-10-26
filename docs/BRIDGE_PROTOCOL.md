@@ -318,7 +318,7 @@ The route an MCP adapter calls with the URL a user pasted.
   "source": "https://www.figma.com/design/FILE_KEY/Design?node-id=1-23",
   "mode": "live",
   "timeoutMs": 30000,
-  "options": { "representation": "figma-rest", "depth": 12, "maxNodes": 5000 }
+  "options": { "representation": "figma-rest", "depth": 50, "maxNodes": 5000 }
 }
 ```
 
@@ -333,7 +333,7 @@ The route an MCP adapter calls with the URL a user pasted.
 | Option | Range | Plugin default |
 |--------|-------|----------------|
 | `representation` | short identifier, `[A-Za-z0-9_.+-]{1,40}` | `node-subtree` or `document-index` |
-| `depth` | integer 0–50; the plugin serializes at most 30 levels | 12 |
+| `depth` | integer 0–50 | 50, every level (an older plugin reads 12 and at most 30) |
 | `maxNodes` | integer 1–20000 | 5000 |
 | `maxBytes` | integer 1024–10000000, in UTF-8 bytes of the serialized payload | 2000000 |
 | `includeHidden` | boolean; hidden layers come back with `visible: false` | `true` |
@@ -380,7 +380,19 @@ are part of the cache key — a `depth: 12` read can never be served from a
 default entry.
 
 When a limit cuts the payload, the plugin keeps the subtree in document order
-and drops what comes last. A node whose children were cut carries
+and cuts what comes last. Every layer it cuts stays in its parent as a
+placeholder `{ id, name, type, truncated: true }`, so the caller can read each
+one with its id as `node-id`:
+
+- layers below `depth`;
+- the layers left once `maxNodes` is spent;
+- over `maxBytes`, the trailing layers, deepest first, until the payload fits.
+  A parent whose children are all placeholders becomes a placeholder itself.
+  Only when the root holds nothing but placeholders does the plugin drop them,
+  last first.
+
+An older plugin stops at the first layer past `maxNodes` and drops byte-cut
+layers without a placeholder. A node whose children were cut carries
 `truncated: true`, and `completeness` describes what was returned: `nodeCount`
 counts the node objects in the payload (placeholders included), `byteSize` is
 its UTF-8 size, and `truncatedNodeIds` lists the ids of nodes whose content or

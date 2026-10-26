@@ -132,6 +132,9 @@ test("the bridge an MCP server starts accepts the plugin's /design sync, and the
   const { tools } = await client.listTools();
   const context = tools.find(tool => tool.name === "get_design_context");
   assert.equal(context._meta?.["anthropic/maxResultSizeChars"], 500000);
+  for (const name of ["get_design_summary", "get_design_tree", "get_design_texts", "get_design_colors", "search_design"]) {
+    assert.equal(tools.find(tool => tool.name === name)._meta?.["anthropic/maxResultSizeChars"], 500000, name);
+  }
 
   // Codex runs a tool marked read-only without asking; pairing and a REST sync
   // must still ask.
@@ -421,7 +424,7 @@ test("texts, colors and search refuse a file link, and a truncated read says so"
   assert.match(textOf(texts), /too old to export Figma's REST JSON.*reopen Design Bridge/);
   const context = JSON.parse(textOf(await client.callTool({ name: "get_design_context", arguments: { source: `${fileLink}?node-id=1-2` } })));
   assert.equal(context.pluginOutdated, true);
-  assert.equal(context.representation, "node-subtree");
+  assert.equal(context.representation, "node-subtree+d50");
   assert.match(context.notes.join(" "), /reopen Design Bridge/);
 });
 
@@ -467,13 +470,58 @@ test("a node is read as Figma's REST JSON, and the same read is reused until the
   assert.match(textOf(texts), /\| Card > Title \| Pay now \| Inter \| 16 \|/);
   const colors = await client.callTool({ name: "get_design_colors", arguments: { source } });
   assert.match(textOf(colors), /\| #FF0000 \| 1 \| Title \|/);
-  assert.deepEqual(reads, ["figma-rest"]);
+  assert.deepEqual(reads, ["figma-rest+d50"]);
 
   editSeq = 5;
   await client.callTool({ name: "get_design_texts", arguments: { source } });
   await client.callTool({ name: "get_design_context", arguments: { source, fresh: true } });
   await client.callTool({ name: "get_design_context", arguments: { source, geometry: true } });
-  assert.deepEqual(reads, ["figma-rest", "figma-rest", "figma-rest", "figma-rest+geometry"]);
+  assert.deepEqual(reads, ["figma-rest+d50", "figma-rest+d50", "figma-rest+d50", "figma-rest+geometry+d50"]);
+});
+
+test("a derived tool reads a cut node again whole, and every answer names what is still left out", async t => {
+  const dataDir = tempDataDir(t);
+  const port = await freePort();
+  const client = await connectMcp(t, { FIGMA_BRIDGE_DATA_DIR: dataDir, FIGMA_BRIDGE_PORT: String(port) });
+  await waitFor(() => bridgeHealthy(port));
+  const reads = [];
+  await fakePlugin(t, port, dataDir, "SearchFile1", request => {
+    if (request.op === "edit-seq") return { fileKey: "SearchFile1", editSeq: 1 };
+    reads.push(request.params.representation);
+    // Only a read up to the bridge's caps holds the whole frame.
+    const whole = request.params.options?.maxBytes === 10000000;
+    const events = { id: "1:3", name: "Events", type: "TEXT", characters: "Events" };
+    const channels = whole
+      ? { id: "1:9", name: "Channels", type: "FRAME", children: [{ id: "1:10", name: "Title", type: "TEXT", characters: "Chaînes" }] }
+      : { id: "1:9", name: "Channels", type: "FRAME", truncated: true };
+    return {
+      fileKey: "SearchFile1", fileName: "Search", nodeId: request.params.nodeId, pageId: "0:1", pageName: "Home",
+      format: "figma-rest", editSeq: 1,
+      completeness: { nodeCount: whole ? 4 : 3, byteSize: 400, limitHit: !whole, truncatedNodeIds: whole ? [] : ["1:9"] },
+      payload: {
+        document: { id: request.params.nodeId, name: "Search", type: "FRAME", children: [events, channels] },
+        components: {}, componentSets: {}, styles: {}, variables: {},
+      },
+    };
+  }, ["read-node", "read-document-index", "figma-rest", "edit-seq"]);
+  const source = "https://www.figma.com/design/SearchFile1/Search?node-id=1-2";
+
+  const texts = textOf(await client.callTool({ name: "get_design_texts", arguments: { source } }));
+  assert.match(texts, /\| Search > Channels > Title \| Chaînes \|/);
+  assert.doesNotMatch(texts, /truncated/);
+  assert.deepEqual(reads, ["figma-rest+d50", "figma-rest+d50+n20000+b10000000"]);
+
+  // get_design_context keeps its limits and names the layer it left out.
+  const context = JSON.parse(textOf(await client.callTool({ name: "get_design_context", arguments: { source } })));
+  assert.equal(context.reused, true);
+  assert.match(context.notes.join(" "), /1 layer\(s\) were left out, with everything inside them: "Channels" \(1:9\)\. Read each one with the same link and its id as node-id/);
+
+  // A limit the caller sets is kept, and the answer says what it left out.
+  const bounded = textOf(await client.callTool({ name: "get_design_texts", arguments: { source, maxBytes: 50000 } }));
+  assert.match(bounded, /Events/);
+  assert.doesNotMatch(bounded, /Chaînes/);
+  assert.match(bounded, /"Channels" \(1:9\)/);
+  assert.deepEqual(reads, ["figma-rest+d50", "figma-rest+d50+n20000+b10000000", "figma-rest+d50+b50000"]);
 });
 
 test("the MCP server that owns the bridge keeps working after the token is rotated", async t => {
