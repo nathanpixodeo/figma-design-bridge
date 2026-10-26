@@ -104,7 +104,7 @@ with the next one: restart Claude Code (`claude -c` resumes the conversation).
 ### Approvals
 
 Reading a design changes nothing, so by default (`auto`) Claude Code, Codex and
-agy run the eight read tools — `get_design_*`, `search_design` and
+agy run the ten read tools — `get_design_*`, `search_design` and
 `get_bridge_status` — without asking. `approve_figma_pairing` hands a Figma
 plugin the bridge token and `sync_figma_design` calls the Figma API, so those two
 always ask. Rules of your own that deny or ask for a tool still apply.
@@ -1061,6 +1061,8 @@ Restart the MCP client after changing its environment configuration.
 | Tool | Description |
 |------|-------------|
 | `get_design_context` | Read a Figma file or exact node through the connected plugin (`source` required; live by default). A node comes back as Figma's REST JSON with every attribute. `depth` (default 50, every level), `maxNodes` and `maxBytes` bound the result, and a cut layer stays as a placeholder the note names; `timeoutMs` (default 30000, up to 120000) bounds the wait; `fresh: true` reads again instead of reusing an unchanged read; `geometry: true` adds vector paths |
+| `get_design_assets` | Export every icon and image inside a node link (with `node-id`): each icon as Figma's own SVG (Copy as SVG), each image fill as its original file, saved under `<dataDir>/assets/<fileKey>/` and listed with the layers that use them. `maxBytes` (default 10000000) bounds the data; an asset past it is named, to read alone |
+| `get_design_image` | Render a node link (with `node-id`) as PNG (default), JPG or SVG and show it to the agent; `scale` 0.5–4 (default 1), at most 4096 px on the long side. A PNG too large to show is rendered again as JPG, then smaller. Saved under `<dataDir>/renders/<fileKey>/` |
 | `get_bridge_status` | Show bridge readiness, live plugin sessions, how many plugins wait for pairing approval, cache statistics, and setup hints |
 | `approve_figma_pairing` | Approve the Figma plugin that shows this 6-digit pairing code (`code` required). Use only a code the user reads from the plugin |
 | `sync_figma_design` | Explicitly fetch a Figma URL/file key, normalize it, and cache it locally |
@@ -1080,6 +1082,24 @@ For a live plugin read, no Figma REST token is needed:
 3. The agent calls `get_bridge_status`, then `get_design_context` with the
    exact URL as `source`; use the same `source` for searches and extracted
    text or colors.
+
+#### Icons and images
+
+Build icons and images from what the design holds, not from paths or look-alikes:
+
+- `get_design_assets` exports each icon as the SVG Figma's **Copy as SVG** gives,
+  with its own size, colors, strokes and clipping, and each image fill as the file
+  that was placed. An icon is a layer drawn only with vector shapes, such as an
+  icon component or a logo mark. A chip or button with a fill of its own is not
+  an icon: the glyph inside it is. The same icon used by several layers is
+  listed once.
+- `get_design_image` renders a frame, a section or one layer, so the agent can
+  see the design and compare it with the page it built. It also exports what
+  code cannot draw from attributes, such as an illustration or a photo as its
+  layer crops it.
+
+Both need the Design Bridge plugin from 1.6.0: after updating, close Design
+Bridge in Figma and open it again.
 
 For the explicit REST-import flow, export `FIGMA_ACCESS_TOKEN` before starting
 Claude Code and ask: *"Sync this Figma design: https://www.figma.com/design/..."*

@@ -28,6 +28,9 @@ const DEFAULT_POLL_WAIT_MS = 25_000
 const DEFAULT_READ_TIMEOUT_MS = 30_000
 // A node read through the plugin's native REST JSON export; see representationFor.
 const REST_REPRESENTATION = 'figma-rest'
+// Reads only a plugin that names them among its capabilities can answer: an
+// older plugin would read the node as JSON instead.
+const ASSET_REPRESENTATIONS = ['assets', 'render']
 // A live read may be answered with the plugin's earlier answer while the
 // plugin's edit count shows nothing changed since that read began. Figma
 // reports no edit to a variable's value, so the answer is reused for this long
@@ -101,8 +104,12 @@ function toIso(value) {
   return null
 }
 
+function representationBase(value) {
+  return typeof value === 'string' ? value.split('+')[0] : null
+}
+
 function isRestRepresentation(value) {
-  return typeof value === 'string' && value.split('+')[0] === REST_REPRESENTATION
+  return representationBase(value) === REST_REPRESENTATION
 }
 
 function withoutRepresentation(opts) {
@@ -615,6 +622,18 @@ function createRoutes(options = {}) {
           opts = withoutRepresentation(opts)
           pluginOutdated = true
         }
+      }
+    } else if (ASSET_REPRESENTATIONS.includes(representationBase(opts.representation))) {
+      const base = representationBase(opts.representation)
+      if (op !== 'read-node') {
+        return sendError(req, res, 400, 'BAD_REQUEST',
+          `Representation "${base}" reads a node: pass a link that includes node-id`, readEnvelope({ fileKey }))
+      }
+      const target = mode === 'cached' ? null : sessionFor(fileKey)
+      if (target && !target.capabilities.includes(base)) {
+        return sendError(req, res, 409, 'PLUGIN_OUTDATED',
+          `The Design Bridge plugin open in Figma for file ${fileKey} is too old to read "${base}". `
+          + 'Close Design Bridge in Figma and open it again to load the current plugin.', readEnvelope({ fileKey, nodeId }))
       }
     }
     const representation = representationFor(op, opts)

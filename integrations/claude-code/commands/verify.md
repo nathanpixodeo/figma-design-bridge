@@ -9,13 +9,13 @@ This command reports. It does not edit code. Stop after the report unless the us
 
 ## 1. Establish the design as the source of truth
 
-Prefer the official Figma MCP server when it is connected, because it is the only source here that returns a rendered image:
+When the official Figma MCP server is connected, it offers:
 
 - `get_screenshot` on the node — the rendered truth, needed for anything about layout or visual weight.
 - `get_design_context` on the node — structure, computed styles, and any Code Connect mapping.
 - `get_variable_defs` on the node — design tokens. A hard-coded value in the code that matches a token's *value* is still a finding: it will not follow the token when the token changes.
 
-Otherwise use this plugin's bridge tools: call `get_bridge_status` first for
+Otherwise, or as well, use this plugin's bridge tools: call `get_bridge_status` first for
 setup diagnostics. If the first argument is a Figma node link (it contains
 `node-id`), call `get_design_context` with it as `source`, then pass the same
 `source` to `search_design`, `get_design_texts`, and `get_design_colors`.
@@ -35,9 +35,16 @@ of memory. Pass `includeHidden: false` unless hidden layers matter. When a
 result carries a truncation note, raise `depth`, `maxNodes` or `maxBytes`, or
 read a child node, before reporting anything as missing. If a read fails with
 `SESSION_LOST`, ask the user to reopen Design Bridge, then read a smaller node. Only use unscoped `get_design_info` and omit `source` when
-checking the legacy imported snapshot. Say in the report that the bridge was used, and mark every layout and
-visual-weight check as **not verified** rather than passed — the bridge exposes
-no image, so those checks cannot be performed from it.
+checking the legacy imported snapshot.
+
+With a node link, also call `get_design_image` on it: the rendered truth for
+layout and visual weight. One screen is shown to you at about 1568 px on its long
+side, so render each section by its own link to compare small details. Call
+`get_design_assets` on it for every icon as Figma's own SVG and every image as
+its file, with the layers that use them. If either fails with
+`PLUGIN_OUTDATED`, ask the user to close and reopen Design Bridge in Figma. If
+no render is available, mark every layout and visual-weight check as **not
+verified** rather than passed.
 
 If neither source is reachable, stop and say which one failed and how to restore it. Do not review the code against assumptions about the design.
 
@@ -45,7 +52,7 @@ If neither source is reachable, stop and say which one failed and how to restore
 
 Read every path in the arguments in full. Follow imports far enough to resolve what actually renders: the stylesheet or style object, the theme or token file, shared primitives, and any variant or state logic. A value that comes from a theme file is only correct if that theme entry is correct.
 
-## 3. Compare on six axes
+## 3. Compare on seven axes
 
 For each axis, check the code against the design and record concrete values on both sides.
 
@@ -55,6 +62,7 @@ For each axis, check the code against the design and record concrete values on b
 4. **Spacing and size** — padding, gap, margin, width and height constraints, border radius, and border width.
 5. **State** — hover, focus, active, disabled, loading, error, and selected. Designs often carry these on separate frames; look for them before concluding a state is undesigned.
 6. **Responsive behaviour** — how the design's constraints or auto-layout map to the code's breakpoints, wrapping, and overflow.
+7. **Icons and images** — each icon against the SVG `get_design_assets` exported for it: viewBox, rendered size, fill and stroke colors, stroke width and shape. An icon drawn by hand, rebuilt from vector paths or taken from an icon library instead of the exported SVG is a **Major** finding, even when it looks close. Each image uses the exported file, at the layer's size, scale mode (FILL is `object-fit: cover`, FIT is `contain`) and corner radius.
 
 Also flag accessibility gaps that the design implies but the code drops: focus visibility, contrast against the actual background, alt text, and semantic element choice.
 

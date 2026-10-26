@@ -5,6 +5,8 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
+import crypto from "node:crypto";
+import fs from "node:fs";
 import path from "node:path";
 import { createRequire } from "node:module";
 import figmaApi from "./figma-api.js";
@@ -467,6 +469,231 @@ const SOURCE_PROPERTIES = {
   fresh: FRESH_PROPERTY,
 };
 
+// ── Icons, images and renders ──────────────────────────────
+
+// An asset read walks every visible layer of the node and sends each icon's
+// SVG and each image's file, up to the bridge's caps.
+const ASSET_READ = { maxNodes: 20000, maxBytes: 10000000 };
+const RENDER_MAX_BYTES = 10000000;
+// Claude takes an image of up to 5 MB: a render larger than this is taken
+// again as JPG, then at a smaller scale.
+const MAX_IMAGE_BASE64 = 3500000;
+// Longer SVG markup is left in its file rather than shown inline.
+const INLINE_ICON_CHARS = 8000;
+const INLINE_RENDER_CHARS = 50000;
+// Claude sees an image at up to about this many pixels on its long side.
+const VISION_SIDE = 1568;
+const ASSETS_LISTED = 15;
+
+const ASSETS_OUTDATED = "The bridge that answered is older than this MCP server and cannot export icons, images or renders. "
+  + "Close every agent session so the bridge restarts on the new version, then ask the user to close and reopen Design Bridge in Figma.";
+
+const ICON_GUIDE = "Each icon is Figma's own SVG export of its layer, the markup Copy as SVG gives: its size, colors, "
+  + "strokes and clipping are the design's. Use the file or the markup as it is. Do not redraw an icon, rebuild it "
+  + "from vector paths or take a look-alike from an icon library. To color an icon from CSS, change only its fill "
+  + "or stroke colors to currentColor.";
+
+const IMAGE_GUIDE = "Each image is the original file placed in the design. A layer shows it as its scale mode says: "
+  + "FILL is object-fit: cover and FIT is object-fit: contain, both centered. CROP, TILE, rotation and filters "
+  + "change what the layer shows.";
+
+// Saved files go under the data directory, one folder per Figma file.
+function assetDir(kind, fileKey) {
+  const key = String(fileKey ?? "").replace(/[^A-Za-z0-9_-]/g, "") || "unknown";
+  const dir = path.join(DATA_DIR, kind, key);
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+function fileSlug(name, fallback) {
+  const slug = String(name ?? "").normalize("NFKD").replace(/[̀-ͯ]/g, "").toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-").slice(0, 60).replace(/^-+|-+$/g, "");
+  return slug || fallback;
+}
+
+const sha1 = data => crypto.createHash("sha1").update(data).digest("hex");
+
+// Figma takes PNG, JPEG, GIF and WebP files as image fills.
+function imageExtension(bytes) {
+  const text = (start, end) => bytes.subarray(start, end).toString("latin1");
+  if (text(1, 4) === "PNG") return "png";
+  if (bytes[0] === 0xff && bytes[1] === 0xd8) return "jpg";
+  if (text(0, 3) === "GIF") return "gif";
+  if (text(0, 4) === "RIFF" && text(8, 12) === "WEBP") return "webp";
+  return "bin";
+}
+
+function formatBytes(bytes) {
+  if (!Number.isFinite(bytes)) return "unknown size";
+  return bytes >= 1048576 ? `${(bytes / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round(bytes / 1024))} KB`;
+}
+
+const sizeOf = item => (Number.isFinite(item?.width) && Number.isFinite(item?.height) ? `${item.width}x${item.height}` : "unknown size");
+const layerName = layer => `"${layer.name ?? ""}" (${layer.id})${layer.path ? ` in ${layer.path}` : ""}`;
+const svgMarkup = item => item.svg ?? (typeof item.svgBase64 === "string" ? Buffer.from(item.svgBase64, "base64").toString("utf8") : null);
+
+// Figma lists every filter of an image paint, most of them 0.
+function activeFilters(filters) {
+  if (!filters || typeof filters !== "object") return {};
+  return Object.fromEntries(Object.entries(filters).filter(([, value]) => value !== 0));
+}
+
+// FILL and FIT are object-fit: cover and contain; anything else changes what
+// the layer shows of the file.
+function reshapesImage(layer) {
+  return !["FILL", "FIT", null, undefined].includes(layer.scaleMode)
+    || Boolean(layer.rotation) || Object.keys(activeFilters(layer.filters)).length > 0;
+}
+
+function imageLayer(layer) {
+  const details = [sizeOf(layer), layer.scaleMode || "FILL"];
+  if (layer.cornerRadius) details.push(`corner radius ${layer.cornerRadius}`);
+  if (layer.opacity !== undefined) details.push(`opacity ${layer.opacity}`);
+  if (layer.rotation) details.push(`rotated ${layer.rotation} degrees`);
+  if (layer.scaleMode === "TILE" && layer.scalingFactor !== undefined) details.push(`tile scale ${layer.scalingFactor}`);
+  if (layer.scaleMode === "CROP" && layer.imageTransform) details.push(`imageTransform ${JSON.stringify(layer.imageTransform)}`);
+  const filters = activeFilters(layer.filters);
+  if (Object.keys(filters).length) details.push(`filters ${JSON.stringify(filters)}`);
+  const render = reshapesImage(layer) ? ". Render this layer with get_design_image to see what it shows" : "";
+  return `${layerName(layer)}: ${details.join(", ")}${render}`;
+}
+
+// Saves every icon and image an asset read sent, and lists them with where
+// the design uses them.
+function describeAssets(result) {
+  const icons = Array.isArray(result.payload?.icons) ? result.payload.icons : [];
+  const images = Array.isArray(result.payload?.images) ? result.payload.images : [];
+  const dir = icons.length || images.length ? assetDir("assets", result.fileKey) : null;
+  const out = [provenance({ fileName: result.fileName, bridge: result }), "", `# Icons and images: ${icons.length} icon(s), ${images.length} image(s)`];
+  if (dir) out.push("", `Saved in ${dir}`);
+  else out.push("", "No visible layer of this node is an icon or shows an image.");
+  const named = new Set();
+
+  if (icons.length) out.push("", "## Icons", "", ICON_GUIDE);
+  icons.forEach((icon, index) => {
+    const layers = Array.isArray(icon.layers) && icon.layers.length ? icon.layers : [icon];
+    out.push("", `### ${index + 1}. ${icon.component || icon.name} (${sizeOf(icon)})`, "");
+    if (layers.length > 1) {
+      const shown = layers.slice(0, ASSETS_LISTED).map(layerName).join("; ");
+      const more = layers.length > ASSETS_LISTED ? `; and ${layers.length - ASSETS_LISTED} more` : "";
+      out.push(`- Used by ${layers.length} layers: ${shown}${more}`);
+    } else {
+      out.push(`- Layer: ${layerName(layers[0])}`);
+    }
+    if (icon.component) out.push(`- Component: ${icon.component}`);
+    const markup = svgMarkup(icon);
+    if (icon.exportError) {
+      out.push(`- Figma could not export it as SVG (${icon.exportError}). Render it with get_design_image.`);
+    } else if (icon.truncated || markup === null) {
+      named.add(icon.id);
+      out.push(`- Not sent: the answer reached maxBytes. Read it alone: the same link with its id as node-id.`);
+    } else {
+      const file = path.join(dir, `${fileSlug(icon.component || icon.name, "icon")}-${sha1(markup).slice(0, 8)}.svg`);
+      fs.writeFileSync(file, markup);
+      out.push(`- File: ${file}`);
+      out.push(markup.length <= INLINE_ICON_CHARS
+        ? `\n\`\`\`svg\n${markup}\n\`\`\``
+        : `- The markup is ${formatBytes(Buffer.byteLength(markup))}: read it from the file.`);
+    }
+  });
+
+  if (images.length) out.push("", "## Images", "", IMAGE_GUIDE);
+  images.forEach((image, index) => {
+    const layers = Array.isArray(image.layers) ? image.layers : [];
+    if (image.kind === "VIDEO") {
+      out.push("", `### ${index + 1}. Video`, "", "- Its file is not exported. Render a layer that shows it with get_design_image for a still.");
+    } else if (typeof image.base64 === "string") {
+      const bytes = Buffer.from(image.base64, "base64");
+      const ext = imageExtension(bytes);
+      const name = /^[0-9a-f]{8,64}$/i.test(image.hash) ? image.hash.toLowerCase() : sha1(bytes);
+      const file = path.join(dir, `${name}.${ext}`);
+      fs.writeFileSync(file, bytes);
+      out.push("", `### ${index + 1}. Image ${sizeOf(image)} ${ext.toUpperCase()}, ${formatBytes(bytes.length)}`, "", `- File: ${file}`);
+    } else {
+      out.push("", `### ${index + 1}. Image ${sizeOf(image)}, ${formatBytes(image.byteLength)}`, "");
+      if (image.exportError) {
+        out.push(`- Figma could not read the file (${image.exportError}). Render a layer that shows it with get_design_image.`);
+      } else {
+        for (const layer of layers) named.add(layer.id);
+        out.push(Math.ceil(image.byteLength / 3) * 4 > ASSET_READ.maxBytes
+          ? "- Too large to send: render a layer that shows it with get_design_image."
+          : "- Not sent: the answer reached maxBytes. Read it alone: the same link with the id of a layer below as node-id.");
+      }
+    }
+    for (const layer of layers.slice(0, ASSETS_LISTED)) out.push(`- Shown by ${imageLayer(layer)}`);
+    if (layers.length > ASSETS_LISTED) out.push(`- And ${layers.length - ASSETS_LISTED} more layers`);
+  });
+
+  const notes = readNotes({ ...result, truncated: false });
+  const unread = (result.completeness?.truncatedNodeIds || []).filter(id => !named.has(id));
+  if (unread.length) {
+    const more = unread.length > ASSETS_LISTED ? `, and ${unread.length - ASSETS_LISTED} more` : "";
+    notes.unshift(`The read reached its layer limit: ${unread.length} layer(s) were not searched for icons and images: `
+      + `${unread.slice(0, ASSETS_LISTED).join(", ")}${more}. Read each one with the same link and its id as node-id.`);
+  }
+  return out.join("\n") + (notes.length ? "\n\n" + notes.map(note => `> **Note:** ${note}`).join("\n") : "");
+}
+
+function renderRepresentation(format, scale) {
+  const parts = ["render", `s${Number(scale.toFixed(3))}`];
+  if (format !== "png") parts.push(format);
+  return parts.join("+");
+}
+
+// The renders to try in turn: a PNG too large to show is taken again as JPG,
+// then at half and a quarter of the scale.
+function renderAttempts(format, scale) {
+  if (format === "svg") return [["svg", 1]];
+  const attempts = format === "png" ? [["png", scale]] : [];
+  for (const factor of [1, 0.5, 0.25]) {
+    if (scale * factor >= 0.25) attempts.push(["jpg", scale * factor]);
+  }
+  return attempts;
+}
+
+// Saves a render and answers with it as an image Claude sees.
+function describeRender(result, { asked, retried }) {
+  const render = result.payload || {};
+  const nodeId = String(result.nodeId);
+  const what = `"${render.name ?? ""}" (${nodeId}), ${sizeOf(render)} in the design`;
+  const out = [provenance({ fileName: result.fileName, bridge: result }), ""];
+  const notes = readNotes({ ...result, truncated: false });
+  const content = [];
+  const base = path.join(assetDir("renders", result.fileKey), nodeId.replace(/[^0-9A-Za-z]+/g, "-"));
+
+  if (render.format === "svg") {
+    const markup = svgMarkup(render);
+    if (markup === null) {
+      out.push(`The SVG of ${what} is larger than ${formatBytes(RENDER_MAX_BYTES)}: render it as PNG or JPG.`);
+    } else {
+      fs.writeFileSync(`${base}.svg`, markup);
+      out.push(`Rendered ${what} as SVG, with text drawn as paths.`, `File: ${base}.svg`);
+      out.push(markup.length <= INLINE_RENDER_CHARS
+        ? `\n\`\`\`svg\n${markup}\n\`\`\``
+        : `The markup is ${formatBytes(Buffer.byteLength(markup))}: read it from the file.`);
+    }
+  } else if (typeof render.base64 === "string") {
+    const ext = render.format === "jpg" ? "jpg" : "png";
+    const file = `${base}@${render.scale}x.${ext}`;
+    fs.writeFileSync(file, Buffer.from(render.base64, "base64"));
+    const long = Math.round(Math.max(render.width, render.height) * render.scale);
+    out.push(`Rendered ${what}, as ${ext.toUpperCase()} at scale ${render.scale}: `
+      + `${Math.round(render.width * render.scale)}x${Math.round(render.height * render.scale)} px, ${formatBytes(render.byteLength)}.`, `File: ${file}`);
+    if (render.base64.length <= MAX_IMAGE_BASE64) {
+      content.push({ type: "image", data: render.base64, mimeType: ext === "jpg" ? "image/jpeg" : "image/png" });
+    } else {
+      out.push("Too large to show here: open the file, or render a smaller node such as one section.");
+    }
+    if (Math.abs(render.scale - asked) > 0.001) notes.push(`Figma renders at most 4096 px on the long side, so the scale was lowered from ${asked} to ${render.scale}.`);
+    if (long > VISION_SIDE) notes.push(`The model sees an image at up to about ${VISION_SIDE} px on its long side, so small details blur: render one section by its own node-id to compare icons, text and spacing.`);
+  } else {
+    out.push(`The render of ${what} is larger than ${formatBytes(RENDER_MAX_BYTES)}: render a smaller node, such as one section.`);
+  }
+  if (retried.length) notes.push(`${retried.join(", then ")} was too large to show, so it was rendered again smaller.`);
+  const text = out.join("\n") + (notes.length ? "\n\n" + notes.map(note => `> **Note:** ${note}`).join("\n") : "");
+  return { content: [{ type: "text", text }, ...content] };
+}
+
 // ── MCP server ─────────────────────────────────────────────
 
 // Design payloads, and the tables and trees made from a whole design, are
@@ -497,7 +724,7 @@ async function startMCP() {
     tools: annotate([
       {
         name: "get_design_context",
-        description: "Read a Figma file or exact node through the connected Figma plugin. A node URL returns that node and its subtree as Figma's REST API JSON, exported by the plugin with no token: payload.document holds every attribute, such as per-corner radii (rectangleCornerRadii), per-character text styles (characterStyleOverrides, styleOverrideTable) and bound variables, and payload.components, componentSets, styles and variables describe what it uses. A file URL returns a lightweight document index. A read the plugin confirms unchanged since an earlier one is answered at once (reused: true). Live mode never falls back to the Figma REST API or to stale cache.",
+        description: "Read a Figma file or exact node through the connected Figma plugin. A node URL returns that node and its subtree as Figma's REST API JSON, exported by the plugin with no token: payload.document holds every attribute, such as per-corner radii (rectangleCornerRadii), per-character text styles (characterStyleOverrides, styleOverrideTable) and bound variables, and payload.components, componentSets, styles and variables describe what it uses. A file URL returns a lightweight document index. A read the plugin confirms unchanged since an earlier one is answered at once (reused: true). Live mode never falls back to the Figma REST API or to stale cache. For the icons and images a node holds, call get_design_assets; to see it, get_design_image.",
         _meta: INLINE_RESULT_META,
         inputSchema: {
           type: "object",
@@ -508,7 +735,39 @@ async function startMCP() {
             maxNodes: { type: "integer", minimum: 1, maximum: 20000, description: "Most nodes to read (default 5000)" },
             maxBytes: { type: "integer", minimum: 1024, maximum: 10000000, description: "Payload limit in UTF-8 bytes (default 2000000). Layers past it come back as placeholders { id, name, type, truncated: true }; read each by its id as node-id" },
             includeHidden: { type: "boolean", description: "Include hidden layers (default true). Pass false unless hidden layers matter; it keeps a large read smaller." },
-            geometry: { type: "boolean", description: "Add vector paths (fillGeometry, strokeGeometry) to vector layers, as the REST API's geometry=paths does (default false)." },
+            geometry: { type: "boolean", description: "Add vector paths (fillGeometry, strokeGeometry) to vector layers, as the REST API's geometry=paths does (default false). The paths leave out the transforms, strokes and clipping of the layers above them: for an icon, call get_design_assets instead of rebuilding it from paths." },
+            timeoutMs: TIMEOUT_PROPERTY,
+            fresh: FRESH_PROPERTY,
+          },
+          required: ["source"],
+        },
+      },
+      {
+        name: "get_design_assets",
+        description: "Export every icon and image inside a Figma node (a link with node-id) through the connected Figma plugin. An icon is a layer drawn only with vector shapes, such as an icon component, a logo mark or an arrow: it comes as Figma's own SVG export, the markup Copy as SVG gives, with its exact size, colors, strokes and clipping. The same icon used by several layers is listed once with each of them. An image fill comes as its original file, with how each layer shows it (size, scale mode, crop, corner radius). Every file is saved under the bridge's data directory and its path listed. Use these instead of redrawing icons from vector paths or picking look-alikes from an icon library.",
+        _meta: INLINE_RESULT_META,
+        inputSchema: {
+          type: "object",
+          properties: {
+            source: { type: "string", description: "Figma link that includes node-id: the frame, component or layer whose icons and images to export." },
+            mode: SOURCE_PROPERTIES.mode,
+            maxBytes: { type: "integer", minimum: 1024, maximum: 10000000, description: "Most bytes of SVG and image data to send (default 10000000). An icon or image past it is named with its layer id, to read alone." },
+            timeoutMs: TIMEOUT_PROPERTY,
+            fresh: FRESH_PROPERTY,
+          },
+          required: ["source"],
+        },
+      },
+      {
+        name: "get_design_image",
+        description: "Render a Figma node (a link with node-id) as Figma's Export does, through the connected Figma plugin, and show the image. Use it to see the design and compare it with the built page, or to export what code cannot draw from attributes: an illustration, a photo as a layer crops it, a logo that holds text. PNG by default, at most 4096 px on the long side. The file is saved under the bridge's data directory.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            source: { type: "string", description: "Figma link that includes node-id: the frame, section or layer to render. One section shows more detail than a whole screen." },
+            mode: SOURCE_PROPERTIES.mode,
+            scale: { type: "number", minimum: 0.5, maximum: 4, description: "Export scale (default 1; 2 for a retina asset)." },
+            format: { type: "string", enum: ["png", "jpg", "svg"], description: "png (default); jpg for a large frame; svg for vector markup, with text drawn as paths." },
             timeoutMs: TIMEOUT_PROPERTY,
             fresh: FRESH_PROPERTY,
           },
@@ -608,6 +867,56 @@ async function startMCP() {
           const notes = readNotes(result);
           // Compact: indentation alone made a 150 KB payload 3.7 times larger.
           return ok(JSON.stringify(notes.length ? { ...result, notes } : result));
+        } catch (error) {
+          return err(describeError(error, { read: true }));
+        }
+      }
+
+      case "get_design_assets": {
+        if (!args?.source) return err('Missing required parameter "source"');
+        try {
+          const result = await withBridge(client => client.read({
+            source: args.source,
+            mode: args.mode || "live",
+            timeoutMs: readTimeoutFromArgs(args),
+            options: { representation: "assets", ...ASSET_READ, ...(args.maxBytes !== undefined && { maxBytes: args.maxBytes }) },
+            fresh: args.fresh === true,
+          }));
+          if (!result?.nodeId) return err(indexOnly("Exporting icons and images"));
+          if (result.format !== "assets") return err(ASSETS_OUTDATED);
+          return ok(describeAssets(result));
+        } catch (error) {
+          return err(describeError(error, { read: true }));
+        }
+      }
+
+      case "get_design_image": {
+        if (!args?.source) return err('Missing required parameter "source"');
+        const format = args.format ?? "png";
+        const scale = args.scale ?? 1;
+        if (!["png", "jpg", "svg"].includes(format)) return err('"format" must be png, jpg or svg');
+        if (typeof scale !== "number" || !(scale >= 0.5 && scale <= 4)) return err('"scale" must be a number from 0.5 to 4');
+        try {
+          const attempts = renderAttempts(format, scale);
+          const retried = [];
+          for (let index = 0; ; index++) {
+            const [type, size] = attempts[index];
+            const result = await withBridge(client => client.read({
+              source: args.source,
+              mode: args.mode || "live",
+              timeoutMs: readTimeoutFromArgs(args),
+              options: { representation: renderRepresentation(type, size), maxBytes: RENDER_MAX_BYTES },
+              fresh: args.fresh === true,
+            }));
+            if (!result?.nodeId) return err(indexOnly("Rendering"));
+            if (result.format !== "render") return err(ASSETS_OUTDATED);
+            const base64 = result.payload?.base64;
+            const fits = typeof base64 === "string" && base64.length <= MAX_IMAGE_BASE64;
+            if (type === "svg" || fits || index === attempts.length - 1) {
+              return describeRender(result, { asked: size, retried });
+            }
+            retried.push(`${type.toUpperCase()} at scale ${Number(size.toFixed(3))} (${formatBytes(result.payload?.byteLength)})`);
+          }
         } catch (error) {
           return err(describeError(error, { read: true }));
         }

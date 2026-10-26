@@ -43,7 +43,7 @@ try {
   const listed = await bounded(client.listTools(), "tools/list");
   const tools = listed.tools || [];
   const byName = new Map(tools.map(tool => [tool.name, tool]));
-  const expected = ["get_design_context", "get_bridge_status", "approve_figma_pairing", "sync_figma_design", "get_design_summary", "get_design_tree", "get_design_texts", "get_design_colors", "search_design", "get_design_info"];
+  const expected = ["get_design_context", "get_design_assets", "get_design_image", "get_bridge_status", "approve_figma_pairing", "sync_figma_design", "get_design_summary", "get_design_tree", "get_design_texts", "get_design_colors", "search_design", "get_design_info"];
   assert.deepEqual([...byName.keys()].sort(), expected.sort());
   assert.deepEqual(byName.get("get_design_context").inputSchema.required, ["source"]);
   assert.deepEqual(byName.get("sync_figma_design").inputSchema.required, ["source"]);

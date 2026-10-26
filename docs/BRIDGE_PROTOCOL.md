@@ -124,7 +124,7 @@ Registers a plugin instance as the answering session for one Figma file.
   "fileKey": "abc123DEF456",
   "fileName": "Website",
   "pluginInstanceId": "plugin-7f3c",
-  "capabilities": ["read-node", "read-document-index", "figma-rest", "edit-seq"]
+  "capabilities": ["read-node", "read-document-index", "figma-rest", "edit-seq", "assets", "render"]
 }
 ```
 
@@ -140,9 +140,14 @@ Registers a plugin instance as the answering session for one Figma file.
 | `read-node`, `read-document-index` | Answers those ops |
 | `figma-rest` | Exports a node as Figma's REST JSON (representation `figma-rest`), since 1.5.0 |
 | `edit-seq` | Answers `edit-seq` at once with its edit count, which lets the bridge reuse its reads, since 1.5.0 |
+| `assets` | Exports a node's icons as SVG and its images as their files (representation `assets`), since 1.6.0 |
+| `render` | Renders a node as PNG, JPG or SVG (representation `render`), since 1.6.0 |
 
 A read asking for `figma-rest` from a session without that capability is
 served as `node-subtree` instead, and the response says `pluginOutdated: true`.
+A live read asking for `assets` or `render` from a session without that
+capability is refused with `409 PLUGIN_OUTDATED`: no other read can stand in
+for it.
 
 **Response `201 Created`:**
 
@@ -349,8 +354,42 @@ The route an MCP adapter calls with the URL a user pasted.
   `fillGeometry` and `strokeGeometry` to vector layers, as REST's
   `geometry=paths` does.
 - `node-subtree`: the plugin's own reading, property by property.
+- `assets`: the icons and images inside the node, with `format: "assets"` and
+  the payload `{ type: "ASSETS", icons, images }`. The plugin walks the
+  visible layers only.
+  - An icon is the top-most layer whose visible subtree holds no text and no
+    image or video fill, and which draws a path: a vector, boolean operation,
+    star or polygon, or a frame, group, instance or component holding two or
+    more shapes. A frame, instance or component with a visible fill, stroke or
+    effect of its own is a box code draws, so the icons inside it are taken
+    instead. Each icon is `exportAsync({ format: 'SVG_STRING' })`, the markup
+    Figma's Copy as SVG gives, as `svg`, or as `svgBase64` when Figma only
+    exports SVG bytes. It also has `{ id, name, type, width, height, path }`
+    and, for an instance, `component` ("Set / Variant"). Icons whose markup is
+    the same once SVG ids are numbered in order are sent once, with every layer
+    that uses them in `layers: [{ id, name, path }]`.
+  - An image is every visible `IMAGE` paint, once per `imageHash`, with its
+    original file as `base64`, its pixel `width` and `height`, its
+    `byteLength`, and in `layers` each layer that shows it, with its size,
+    `scaleMode`, `imageTransform`, `scalingFactor`, `rotation`,
+    `filters`, paint `opacity` and `cornerRadius`. A `VIDEO` paint is
+    listed with `kind: "VIDEO"` and no file.
+  - `maxBytes` bounds the SVG and image data. An icon or image past it keeps
+    its record with `truncated: true` and no data, and its layer ids are in
+    `truncatedNodeIds`; reading one of those ids alone exports it. `maxNodes`
+    bounds the walk, and the layers it never reached are in
+    `truncatedNodeIds` too.
+- `render+s<scale>[+jpg|+svg]`: the node exported as Figma's Export does, with
+  `format: "render"` and the payload `{ type: "RENDER", name, format, width,
+  height, scale, byteLength, base64 }`. The scale is clamped to 0.25–4. A PNG or
+  JPG longer than 4096 px on its long side is exported 4096 px long instead, and
+  `scale` says the scale used. `+svg` sends `svg` (or `svgBase64`) with
+  text drawn as paths. A render larger than `maxBytes` has no data and
+  `truncated: true`.
 
-A file link reads the document index whatever representation was asked for.
+A file link reads the document index whatever representation was asked for,
+except `assets` and `render`, which are refused with `400 BAD_REQUEST`:
+they need a node.
 
 For `figma-rest`, the plugin first counts a subtree by walking its `children`
 only, and exports it whole when it fits what is left of `maxNodes` (at most 5,000
@@ -639,6 +678,7 @@ Errors are distinguishable by design: an agent can tell "plugin offline" from
 | `PAIRING_NOT_FOUND` | 404 | No pairing is waiting with that code or id |
 | `SESSION_NOT_FOUND` | 404 | The session is no longer registered |
 | `NO_SESSION_FOR_FILE` | 409 | No plugin session is connected for that file |
+| `PLUGIN_OUTDATED` | 409 | The plugin session for that file lacks the capability the representation needs; reopening Design Bridge in Figma loads the current plugin |
 | `PAIRING_EXPIRED` | 410 | The pairing code expired before it was approved |
 | `PAYLOAD_TOO_LARGE` | 413 | Body exceeded the route's limit: 2,000,000 bytes, or 51,000,000 for a plugin reply |
 | `PAIRING_LIMIT` | 429 | Too many pairings waiting or requested |

@@ -488,3 +488,47 @@ test('a read that timed out is kept when the plugin finishes it, so the retry do
   assert.equal(retry.body.reused, true)
   assert.equal(reads, 1)
 })
+
+test('an asset or render read is refused by a plugin too old for it, and needs a node link', async t => {
+  const { api, plugin } = await startBridge(t)
+  const p = plugin({ capabilities: CURRENT_PLUGIN })
+  await p.start()
+  p.setHandler(async request => nodeResult(FILE_A, request.params.nodeId, { format: 'figma-rest' }))
+  p.run()
+
+  for (const representation of ['assets', 'render+s2']) {
+    const res = await api('POST', '/bridge/read', { body: { source: sourceFor(FILE_A, '5-5'), options: { representation } } })
+    assert.equal(res.status, 409)
+    assert.equal(res.body.code, 'PLUGIN_OUTDATED')
+    assert.match(res.body.error, /Close Design Bridge in Figma and open it again/)
+    assert.equal(res.body.nodeId, '5:5')
+  }
+  const fileLink = await api('POST', '/bridge/read', { body: { source: sourceFor(FILE_A), options: { representation: 'assets' } } })
+  assert.equal(fileLink.status, 400)
+  assert.match(fileLink.body.error, /node-id/)
+  assert.equal(p.seen.length, 0, 'the old plugin was never asked')
+})
+
+test('an asset read reaches a plugin that names it, and is cached under its own representation', async t => {
+  const { api, plugin } = await startBridge(t)
+  const p = plugin({ capabilities: [...CURRENT_PLUGIN, 'assets', 'render'] })
+  await p.start()
+  const payload = { type: 'ASSETS', icons: [{ id: '5:6', name: 'Icon', svg: '<svg/>', layers: [{ id: '5:6' }] }], images: [] }
+  p.setHandler(async request => {
+    if (request.op === 'edit-seq') return { fileKey: FILE_A, editSeq: 1 }
+    return nodeResult(FILE_A, request.params.nodeId, { format: 'assets', payload, editSeq: 1 })
+  })
+  p.run()
+
+  const body = { source: sourceFor(FILE_A, '5-5'), options: { representation: 'assets', maxBytes: 10000000 } }
+  const live = await api('POST', '/bridge/read', { body })
+  assert.equal(live.status, 200)
+  assert.equal(live.body.format, 'assets')
+  assert.equal(live.body.representation, 'assets+b10000000')
+  assert.deepEqual(live.body.payload, payload)
+  assert.equal(p.seen[0].params.representation, 'assets+b10000000')
+
+  const cached = await api('POST', '/bridge/read', { body: { ...body, mode: 'cached' } })
+  assert.equal(cached.status, 200)
+  assert.deepEqual(cached.body.payload, payload)
+})

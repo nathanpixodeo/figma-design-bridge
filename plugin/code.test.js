@@ -1226,7 +1226,7 @@ test('a heartbeat of a replaced session does not start a second heartbeat chain'
   assert.equal(heartbeats(), 1, 'the old heartbeat scheduled another one for the new session')
 })
 
-test('the panel tells the bridge it can export REST JSON and report its edit count', async () => {
+test('the panel tells the bridge it can export REST JSON and report its edit count, and that it exports assets and renders', async () => {
   const calls = []
   const panel = ui(async (url, options = {}) => {
     calls.push({ url, body: options.body ? JSON.parse(options.body) : null })
@@ -1236,7 +1236,7 @@ test('the panel tells the bridge it can export REST JSON and report its edit cou
   await panel.post({ type: 'bridge-start', config: savedConfig })
   await settleUi()
   const register = calls.find(call => call.url.endsWith('/bridge/session'))
-  assert.deepEqual(register.body.capabilities, ['read-node', 'read-document-index', 'figma-rest', 'edit-seq'])
+  assert.deepEqual(register.body.capabilities, ['read-node', 'read-document-index', 'figma-rest', 'edit-seq', 'assets', 'render'])
 })
 
 // What Figma's JSON_REST_V1 export gives for a fake layer: the REST API's
@@ -1519,4 +1519,226 @@ test('Bridge answers a read waiting right behind the same read with its answer, 
   await settle(p, Promise.all([p.message(readRequest('before', screen.id)), p.message(index), p.message(readRequest('behind', screen.id))]))
   assert.equal(reads, 5)
   assert.deepEqual(results().slice(-3).map(message => message.requestId), ['before', 'index', 'behind'])
+})
+
+// A layer tree for the asset tests: every layer gets a parent, a place in
+// nodes and Figma's exports. An SVG is drawn from the layer's visible shapes,
+// with an id carrying the layer's id, as Figma's ids do.
+const ASSET_CONTAINERS = ['FRAME', 'GROUP', 'INSTANCE', 'COMPONENT']
+
+function assetLayer(nodes, parent, spec) {
+  const { children, ...fields } = spec
+  const node = { width: 16, height: 16, ...fields, parent }
+  nodes.set(node.id, node)
+  if (children || ASSET_CONTAINERS.includes(node.type)) node.children = (children || []).map(child => assetLayer(nodes, node, child))
+  return node
+}
+
+function svgDrawing(node) {
+  const shapes = layer => {
+    if (layer.visible === false) return ''
+    return layer.children ? layer.children.map(shapes).join('') : `<${layer.type.toLowerCase()}/>`
+  }
+  const id = `clip0_${node.id.replace(/\W/g, '_')}`
+  return `<svg width="${node.width}" height="${node.height}"><g clip-path="url(#${id})">${shapes(node)}</g>`
+    + `<defs><clipPath id="${id}"><rect/></clipPath></defs></svg>`
+}
+
+function assetFigma(p, root, { svgString = true, images = {} } = {}) {
+  const nodes = new Map()
+  assetLayer(nodes, p.otherPage, root)
+  const exports = []
+  for (const node of nodes.values()) {
+    node.exportAsync = async settings => {
+      // The settings come from the plugin's realm: copy the values out.
+      exports.push({ id: node.id, format: settings.format, constraint: settings.constraint && { ...settings.constraint } })
+      if (settings.format === 'SVG_STRING') {
+        if (!svgString) throw new Error('Unsupported export format')
+        return svgDrawing(node)
+      }
+      if (settings.format === 'SVG') return new Uint8Array(Buffer.from(svgDrawing(node)))
+      if (settings.format === 'PNG' || settings.format === 'JPG') return new Uint8Array(node.renderBytes || 64)
+      throw new Error(`Unexpected export ${settings.format}`)
+    }
+  }
+  p.figma.getNodeByIdAsync = async id => nodes.get(id) || null
+  p.figma.base64Encode = bytes => Buffer.from(bytes).toString('base64')
+  p.figma.getImageByHash = hash => (images[hash] ? {
+    getBytesAsync: async () => new Uint8Array(images[hash].bytes),
+    getSizeAsync: async () => ({ width: images[hash].width, height: images[hash].height }),
+  } : null)
+  return { nodes, exports }
+}
+
+const SOLID = { type: 'SOLID', color: { r: 0, g: 0, b: 0 } }
+const HIDDEN_SOLID = { ...SOLID, visible: false }
+
+function ticket(id, { dot }) {
+  return {
+    id, name: 'bi:ticket-perforated', type: 'FRAME', width: 14, height: 14, fills: [HIDDEN_SOLID],
+    children: [{
+      id: `${id}g`, name: 'Group', type: 'GROUP', children: [
+        { id: `${id}a`, name: 'Vector', type: 'VECTOR' },
+        ...(dot ? [{ id: `${id}d`, name: 'Ellipse 161', type: 'ELLIPSE' }] : []),
+        { id: `${id}b`, name: 'Vector', type: 'VECTOR' },
+      ],
+    }],
+  }
+}
+
+// The search page's access filter: a heading with a chevron, chips that each
+// hold a glyph and a label, and two layers showing one image.
+function accessPanel() {
+  const chip = (id, icon, label) => ({
+    id, name: `Chip ${label}`, type: 'INSTANCE', fills: [SOLID], strokes: [SOLID],
+    children: [icon, { id: `${id}t`, name: label, type: 'TEXT', characters: label }],
+  })
+  return {
+    id: '9:1', name: 'Access', type: 'FRAME', width: 389, height: 146, fills: [SOLID], strokes: [SOLID],
+    children: [
+      {
+        id: '9:2', name: 'Header', type: 'FRAME', children: [
+          { id: '9:3', name: 'Heading', type: 'TEXT', characters: 'Access' },
+          {
+            id: '9:4', name: 'ICONS', type: 'INSTANCE', width: 18, height: 18, fills: [HIDDEN_SOLID],
+            mainComponent: { name: 'chevron-down', parent: { type: 'COMPONENT_SET', name: 'Icons' } },
+            children: [{ id: '9:5', name: 'Vector', type: 'VECTOR', strokes: [SOLID] }],
+          },
+        ],
+      },
+      {
+        id: '9:6', name: 'chips-row', type: 'FRAME', children: [
+          {
+            id: '9:7', name: 'Component 8', type: 'FRAME', fills: [SOLID], children: [
+              { id: '9:8', name: 'Vector', type: 'VECTOR', width: 10, height: 12 },
+              { id: '9:9', name: 'PACK', type: 'TEXT', characters: 'PACK' },
+            ],
+          },
+          chip('9:10', ticket('9:11', { dot: true }), 'Live Only'),
+          chip('9:12', ticket('9:13', { dot: false }), 'Video'),
+          chip('9:14', ticket('9:15', { dot: false }), 'Rental'),
+          { id: '9:16', name: 'Divider', type: 'RECTANGLE', fills: [SOLID] },
+          {
+            id: '9:17', name: 'Bars', type: 'FRAME', children: [
+              { id: '9:18', name: 'Bar', type: 'RECTANGLE', fills: [SOLID] },
+              { id: '9:19', name: 'Bar', type: 'RECTANGLE', fills: [SOLID] },
+            ],
+          },
+          { id: '9:20', name: 'Hidden glyph', type: 'VECTOR', visible: false },
+        ],
+      },
+      {
+        id: '9:21', name: 'Poster', type: 'FRAME', width: 320, height: 180, cornerRadius: 8,
+        fills: [{ type: 'IMAGE', imageHash: 'abc', scaleMode: 'FILL' }],
+      },
+      {
+        id: '9:22', name: 'Thumb', type: 'RECTANGLE', width: 40, height: 40,
+        fills: [{ type: 'IMAGE', imageHash: 'abc', scaleMode: 'CROP', imageTransform: [[0.5, 0, 0], [0, 0.5, 0.25]] }],
+      },
+    ],
+  }
+}
+
+test('Bridge reads the icons of a node as Figma SVG and its images as their files', async () => {
+  const p = await connectedBridgePlugin()
+  const { exports } = assetFigma(p, accessPanel(), { images: { abc: { bytes: [137, 80, 78, 71, 1, 2, 3], width: 1200, height: 800 } } })
+
+  const reply = await readRest(p, '9:1', { maxBytes: 10_000_000 }, 'assets')
+  assert.equal(reply.ok, true)
+  assert.equal(reply.result.format, 'assets')
+  assert.equal(reply.result.truncated, false)
+  const { icons, images } = reply.result.payload
+  assert.deepEqual(icons.map(icon => icon.id), ['9:4', '9:8', '9:11', '9:13', '9:17'],
+    'the glyph of each chip, not the chip; the lone rectangle and the hidden layer are left out')
+  assert.ok(exports.every(entry => entry.format === 'SVG_STRING'))
+
+  const chevron = icons[0]
+  assert.equal(chevron.component, 'Icons / chevron-down')
+  assert.deepEqual([chevron.width, chevron.height], [18, 18])
+  assert.equal(chevron.path, 'Access / Header')
+  assert.equal(chevron.svg, svgDrawing({ id: '9:4', width: 18, height: 18, children: [{ type: 'VECTOR' }] }))
+
+  const [withDot, plain] = [icons[2], icons[3]]
+  assert.match(withDot.svg, /<ellipse\/>/)
+  assert.doesNotMatch(plain.svg, /<ellipse\/>/)
+  assert.deepEqual(plain.layers.map(layer => layer.id), ['9:13', '9:15'], 'the same icon twice is one SVG with both layers')
+  assert.equal(plain.layers[1].path, 'Access / chips-row / Chip Rental')
+
+  assert.equal(images.length, 1)
+  const [image] = images
+  assert.equal(image.hash, 'abc')
+  assert.equal(image.base64, Buffer.from([137, 80, 78, 71, 1, 2, 3]).toString('base64'))
+  assert.deepEqual([image.width, image.height, image.byteLength], [1200, 800, 7])
+  assert.deepEqual(image.layers.map(layer => [layer.id, layer.scaleMode]), [['9:21', 'FILL'], ['9:22', 'CROP']])
+  assert.equal(image.layers[0].cornerRadius, 8)
+  assert.deepEqual(image.layers[1].imageTransform, [[0.5, 0, 0], [0, 0.5, 0.25]])
+})
+
+test('Bridge exports a node that is an icon itself whole', async () => {
+  const p = await connectedBridgePlugin()
+  assetFigma(p, ticket('8:1', { dot: true }))
+  const reply = await readRest(p, '8:1', {}, 'assets')
+  assert.deepEqual(reply.result.payload.icons.map(icon => icon.id), ['8:1'])
+  assert.equal(reply.result.payload.icons[0].path, '')
+  assert.deepEqual(reply.result.payload.images, [])
+})
+
+test('Bridge names the assets past maxBytes instead of dropping them', async () => {
+  const p = await connectedBridgePlugin()
+  assetFigma(p, accessPanel(), { images: { abc: { bytes: new Array(4000).fill(1), width: 10, height: 10 } } })
+  const reply = await readRest(p, '9:1', { maxBytes: 1024 }, 'assets')
+  const { icons, images } = reply.result.payload
+  assert.equal(reply.result.truncated, true)
+  assert.ok(icons[0].svg, 'the first icon fits')
+  const cut = icons.filter(icon => icon.truncated)
+  assert.equal(cut.length, icons.length - 1)
+  for (const icon of cut) {
+    assert.equal(icon.svg, undefined)
+    assert.ok(reply.result.completeness.truncatedNodeIds.includes(icon.id))
+  }
+  assert.equal(images[0].truncated, true)
+  assert.equal(images[0].base64, undefined)
+  assert.equal(images[0].byteLength, 4000)
+  assert.ok(reply.result.completeness.truncatedNodeIds.includes('9:21'))
+  assert.ok(reply.result.completeness.truncatedNodeIds.includes('9:22'))
+})
+
+test('Bridge sends an SVG as base64 when Figma cannot export it as a string', async () => {
+  const p = await connectedBridgePlugin()
+  const { nodes, exports } = assetFigma(p, ticket('8:1', { dot: false }), { svgString: false })
+  const reply = await readRest(p, '8:1', {}, 'assets')
+  const [icon] = reply.result.payload.icons
+  assert.equal(icon.svg, undefined)
+  assert.equal(Buffer.from(icon.svgBase64, 'base64').toString(), svgDrawing(nodes.get('8:1')))
+  assert.deepEqual(exports.map(entry => entry.format), ['SVG_STRING', 'SVG'])
+})
+
+test('Bridge renders a node, scaled down to 4096 px, and says when it is too large to send', async () => {
+  const p = await connectedBridgePlugin()
+  const { nodes, exports } = assetFigma(p, {
+    id: '7:1', name: 'Search', type: 'FRAME', width: 3000, height: 1000, fills: [SOLID],
+    children: [{ id: '7:2', name: 'Title', type: 'TEXT', characters: 'Search' }],
+  })
+
+  let reply = await readRest(p, '7:1', {}, 'render+s2')
+  assert.equal(reply.result.format, 'render')
+  assert.deepEqual(exports.at(-1), { id: '7:1', format: 'PNG', constraint: { type: 'WIDTH', value: 4096 } })
+  const render = reply.result.payload
+  assert.deepEqual([render.type, render.format, render.width, render.height, render.scale], ['RENDER', 'png', 3000, 1000, 1.365])
+  assert.equal(render.base64, Buffer.from(new Uint8Array(64)).toString('base64'))
+  assert.equal(reply.result.truncated, false)
+
+  nodes.get('7:1').width = 400
+  reply = await readRest(p, '7:1', {}, 'render+s2+jpg')
+  assert.deepEqual(exports.at(-1), { id: '7:1', format: 'JPG', constraint: { type: 'SCALE', value: 2 } })
+  assert.equal(reply.result.payload.format, 'jpg')
+
+  reply = await readRest(p, '7:1', {}, 'render+svg')
+  assert.equal(reply.result.payload.svg, svgDrawing(nodes.get('7:1')))
+
+  nodes.get('7:1').renderBytes = 4000
+  reply = await readRest(p, '7:1', { maxBytes: 1024 }, 'render+s1')
+  assert.equal(reply.result.truncated, true)
+  assert.equal(reply.result.payload.base64, undefined)
+  assert.equal(reply.result.payload.byteLength, 4000)
 })

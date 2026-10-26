@@ -4,6 +4,42 @@ All notable changes to Figma Design Bridge. Versions follow
 [Semantic Versioning](https://semver.org/); the Claude Code plugin, the
 marketplace entry and both `package.json` files always carry the same number.
 
+## [Unreleased]
+
+Icons, images and a rendered view come from the design itself.
+
+### Upgrading
+
+- Close Design Bridge in Figma and open it again to load the new plugin. Until
+  then, `get_design_assets` and `get_design_image` answer `PLUGIN_OUTDATED`.
+- Close every agent session once, so the bridge restarts on the new version. An
+  older bridge cannot export assets, and the tools say so.
+
+### Added
+
+- `get_design_assets` exports every icon inside a node as Figma's own SVG, the
+  markup Copy as SVG gives, with its exact size, colors, strokes and clipping.
+  An icon is a layer drawn only with vector shapes; a chip or button with a fill
+  of its own gives the glyph inside it. The same icon used by several layers is
+  listed once with each of them. Every image fill comes as its original file,
+  with the size, scale mode, crop and corner radius of each layer that shows it.
+  Files are saved under `<dataDir>/assets/<fileKey>/`.
+- `get_design_image` renders a node as PNG, JPG or SVG and shows it to the
+  agent, so it can compare the page it built with the design. A PNG too large
+  to show is rendered again as JPG, then smaller. Files are saved under
+  `<dataDir>/renders/<fileKey>/`.
+- Bridge representations `assets` and `render`, and plugin capabilities of the
+  same names. A live read of either from an older plugin is refused with
+  `409 PLUGIN_OUTDATED`, and a file link with `400 BAD_REQUEST`.
+- `/figma-bridge:verify` and the Codex prompt compare icons and images against
+  the exported assets, and layout against the render.
+
+### Changed
+
+- `get_design_context`'s `geometry` option says to export icons with
+  `get_design_assets` instead of rebuilding them from paths, which leave out
+  the transforms, strokes and clipping of the layers above them.
+
 ## [1.5.1] - 2026-10-26
 
 A read covers the whole design: no layer is cut without its id.

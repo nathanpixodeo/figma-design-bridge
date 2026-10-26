@@ -7,6 +7,8 @@
 
 const READ_TOOLS = Object.freeze([
   'get_design_context',
+  'get_design_assets',
+  'get_design_image',
   'get_design_summary',
   'get_design_tree',
   'get_design_texts',

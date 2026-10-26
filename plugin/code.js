@@ -289,7 +289,7 @@ async function connectBridge(){
   if(!waitingForBridge) setStatus('connecting','Connecting...')
   let data
   try{
-    data=await bridgeFetch('/bridge/session',{method:'POST',body:{fileKey:bridgeConfig.fileKey,fileName:bridgeConfig.fileName,pluginInstanceId:bridgeConfig.pluginInstanceId,capabilities:['read-node','read-document-index','figma-rest','edit-seq']}},false)
+    data=await bridgeFetch('/bridge/session',{method:'POST',body:{fileKey:bridgeConfig.fileKey,fileName:bridgeConfig.fileName,pluginInstanceId:bridgeConfig.pluginInstanceId,capabilities:['read-node','read-document-index','figma-rest','edit-seq','assets','render']}},false)
   }catch(err){
     // Registering checks the token alone, so a 401 here means the token is wrong.
     if(err.status===401) err.tokenRejected=true
@@ -1354,6 +1354,320 @@ async function readBridgeNodeRest(request) {
   }
 }
 
+// The 'assets' representation: what code takes from a design as files. An icon
+// is drawn in Figma as a frame of vector layers, and code needs it as one SVG,
+// not as the paths a node read describes. Figma exports it itself, as Copy as
+// SVG does, and an image fill's bytes are the file the designer placed.
+const PATH_TYPES = ['VECTOR', 'BOOLEAN_OPERATION', 'STAR', 'REGULAR_POLYGON', 'POLYGON']
+const SHAPE_TYPES = [...PATH_TYPES, 'ELLIPSE', 'RECTANGLE', 'LINE']
+const ICON_CONTAINERS = ['FRAME', 'GROUP', 'INSTANCE', 'COMPONENT']
+// Longest side of a rendered node, in pixels: larger renders are scaled down.
+const MAX_RENDER_SIDE = 4096
+
+function representationBase(request) {
+  return representationParts(request)[0]
+}
+
+function readValue(node, key) {
+  try { return node[key] } catch { return undefined }
+}
+
+function shownPaints(paints) {
+  return Array.isArray(paints) ? paints.filter(paint => paint && paint.visible !== false && paint.opacity !== 0) : []
+}
+
+// A frame or instance with a fill, stroke or shadow of its own is a box code
+// draws, such as a chip or a button, rather than part of an icon.
+function hasOwnPaint(node) {
+  return shownPaints(readValue(node, 'fills')).length > 0
+    || shownPaints(readValue(node, 'strokes')).length > 0
+    || shownPaints(readValue(node, 'effects')).length > 0
+}
+
+function roundSize(value) {
+  return typeof value === 'number' ? Math.round(value * 100) / 100 : null
+}
+
+// What one layer in the walk is: a vector it can export as one SVG, with how
+// many paths and shapes draw it, or the icons found inside it.
+async function walkAssets(node, trail, read) {
+  const { limits } = read
+  await read.pace()
+  if (node.removed || readValue(node, 'visible') === false || readValue(node, 'opacity') === 0) return null
+  if (bridgeBudgetSpent(limits)) {
+    markBridgeTruncated(limits, node.id)
+    return { vector: false, paths: 0, shapes: 0, icons: [] }
+  }
+  limits.state.nodeCount++
+
+  let drawsImage = false
+  for (const field of ['fills', 'strokes']) {
+    for (const paint of shownPaints(readValue(node, field))) {
+      if (paint.type === 'IMAGE' && paint.imageHash) {
+        drawsImage = true
+        addImageUse(read, paint.imageHash, 'IMAGE', node, paint, trail)
+      } else if (paint.type === 'VIDEO') {
+        drawsImage = true
+        addImageUse(read, paint.videoHash || node.id, 'VIDEO', node, paint, trail)
+      }
+    }
+  }
+
+  const type = node.type
+  if (SHAPE_TYPES.includes(type)) {
+    if (drawsImage) return { vector: false, paths: 0, shapes: 0, icons: [] }
+    const paths = PATH_TYPES.includes(type) ? 1 : 0
+    // A path alone is an icon; a rectangle or circle alone is a box code draws.
+    return { vector: true, paths, shapes: 1, isIcon: paths > 0, node: { node, trail }, icons: [] }
+  }
+
+  let children = []
+  try { if ('children' in node) children = node.children } catch {}
+  const below = trail.concat(node.name)
+  const parts = []
+  for (const child of children) {
+    const part = await walkAssets(child, below, read)
+    if (part) parts.push(part)
+  }
+  const icons = parts.flatMap(part => (part.vector ? (part.isIcon ? [part.node] : []) : part.icons))
+  const vector = ICON_CONTAINERS.includes(type) && !drawsImage && parts.length > 0 && parts.every(part => part.vector)
+    && (type === 'GROUP' || !hasOwnPaint(node))
+  if (!vector) return { vector: false, paths: 0, shapes: 0, icons }
+  const paths = parts.reduce((sum, part) => sum + part.paths, 0)
+  const shapes = parts.reduce((sum, part) => sum + part.shapes, 0)
+  // A path, or two shapes or more, is an icon; one rectangle or circle alone
+  // is a box code draws itself.
+  const isIcon = paths > 0 || shapes >= 2
+  return { vector: true, paths, shapes, isIcon, node: { node, trail }, icons: [] }
+}
+
+function addImageUse(read, hash, kind, node, paint, trail) {
+  let image = read.images.get(hash)
+  if (!image) {
+    image = { hash, kind, layers: [] }
+    read.images.set(hash, image)
+  }
+  const layer = {
+    id: node.id, name: node.name, type: node.type,
+    width: roundSize(readValue(node, 'width')), height: roundSize(readValue(node, 'height')),
+    path: trail.join(' / '), scaleMode: paint.scaleMode || null,
+  }
+  for (const field of ['imageTransform', 'scalingFactor', 'rotation', 'filters']) {
+    if (paint[field] !== undefined) layer[field] = sanitizeForMessage(paint[field])
+  }
+  if (typeof paint.opacity === 'number' && paint.opacity !== 1) layer.opacity = paint.opacity
+  const radius = readValue(node, 'cornerRadius')
+  if (typeof radius === 'number' && radius) layer.cornerRadius = radius
+  image.layers.push(layer)
+}
+
+// SVG ids carry the node id, as in clip0_12_34: two copies of one icon differ
+// only there, so ids are numbered by order before markup is compared.
+function svgShape(svg) {
+  const ids = new Map()
+  const numbered = id => {
+    if (!ids.has(id)) ids.set(id, `i${ids.size}`)
+    return ids.get(id)
+  }
+  return svg
+    .replace(/\bid="([^"]+)"/g, (_, id) => `id="${numbered(id)}"`)
+    .replace(/url\(#([^)]+)\)/g, (whole, id) => (ids.has(id) ? `url(#${ids.get(id)})` : whole))
+    .replace(/href="#([^"]+)"/g, (whole, id) => (ids.has(id) ? `href="#${ids.get(id)}"` : whole))
+}
+
+// Figma's own SVG export. A Figma without the string form gives bytes, which
+// go to the bridge as base64.
+async function exportSvg(node, read) {
+  const started = Date.now()
+  try {
+    try {
+      return { svg: await node.exportAsync({ format: 'SVG_STRING' }) }
+    } catch {
+      return { svgBase64: figma.base64Encode(await node.exportAsync({ format: 'SVG' })) }
+    }
+  } finally {
+    read.timing.exportMs += Date.now() - started
+  }
+}
+
+async function componentName(node) {
+  if (node.type !== 'INSTANCE') return null
+  let main = null
+  try {
+    main = typeof node.getMainComponentAsync === 'function' ? await node.getMainComponentAsync() : node.mainComponent
+  } catch {}
+  if (!main) return null
+  const set = main.parent && main.parent.type === 'COMPONENT_SET' ? main.parent : null
+  return set ? `${set.name} / ${main.name}` : main.name
+}
+
+// Counts an asset toward maxBytes. One that does not fit is named instead, so
+// it can be read on its own by its layer's id.
+function fitsBudget(read, bytes) {
+  if (read.bytes + bytes > read.limits.maxBytes) return false
+  read.bytes += bytes
+  return true
+}
+
+async function exportIcons(found, read) {
+  const icons = []
+  const byShape = new Map()
+  for (const { node, trail } of found) {
+    await read.pace()
+    const layer = { id: node.id, name: node.name, path: trail.join(' / ') }
+    let exported
+    try {
+      exported = await exportSvg(node, read)
+    } catch (error) {
+      icons.push({ ...layer, type: node.type, exportError: (error && error.message) || String(error), layers: [layer] })
+      continue
+    }
+    const key = exported.svg !== undefined ? svgShape(exported.svg) : exported.svgBase64
+    const same = byShape.get(key)
+    if (same) {
+      same.layers.push(layer)
+      continue
+    }
+    const icon = {
+      id: node.id, name: node.name, type: node.type,
+      width: roundSize(readValue(node, 'width')), height: roundSize(readValue(node, 'height')),
+      path: layer.path, layers: [layer],
+    }
+    const component = await componentName(node)
+    if (component) icon.component = component
+    const markup = exported.svg !== undefined ? exported.svg : exported.svgBase64
+    if (fitsBudget(read, utf8Length(markup) + 512)) Object.assign(icon, exported)
+    else {
+      icon.truncated = true
+      markBridgeTruncated(read.limits, node.id)
+    }
+    byShape.set(key, icon)
+    icons.push(icon)
+  }
+  return icons
+}
+
+async function exportImages(read) {
+  const images = []
+  for (const image of read.images.values()) {
+    await read.pace()
+    if (image.kind !== 'IMAGE') {
+      images.push(image)
+      continue
+    }
+    const source = typeof figma.getImageByHash === 'function' ? figma.getImageByHash(image.hash) : null
+    if (!source) {
+      images.push({ ...image, exportError: 'Figma has no image with this hash' })
+      continue
+    }
+    const started = Date.now()
+    try {
+      const size = typeof source.getSizeAsync === 'function' ? await source.getSizeAsync() : null
+      if (size) Object.assign(image, { width: size.width, height: size.height })
+      const bytes = await source.getBytesAsync()
+      image.byteLength = bytes.length
+      if (fitsBudget(read, Math.ceil(bytes.length / 3) * 4 + 512)) image.base64 = figma.base64Encode(bytes)
+      else {
+        image.truncated = true
+        for (const layer of image.layers) markBridgeTruncated(read.limits, layer.id)
+      }
+    } catch (error) {
+      image.exportError = (error && error.message) || String(error)
+    } finally {
+      read.timing.exportMs += Date.now() - started
+    }
+    images.push(image)
+  }
+  return images
+}
+
+async function readBridgeAssets(request) {
+  const started = Date.now()
+  const params = request.params || {}
+  const limits = bridgeLimits({ ...(params.options || {}), includeHidden: false })
+  const node = await figma.getNodeByIdAsync(params.nodeId)
+  if (!node) return missingBridgeNode(params.nodeId)
+
+  const read = {
+    limits, pace: createPacer(), images: new Map(), bytes: 0,
+    timing: { countMs: 0, exportMs: 0, totalMs: 0 },
+  }
+  const walked = await walkAssets(node, [], read)
+  read.timing.countMs = Date.now() - started
+  // The node asked for is exported whole when it is an icon itself.
+  const found = walked && walked.vector && walked.isIcon ? [walked.node] : (walked ? walked.icons : [])
+  const payload = { type: 'ASSETS', icons: await exportIcons(found, read), images: await exportImages(read) }
+  const byteSize = jsonBytes(payload)
+  const page = findPageForNode(node)
+  read.timing.totalMs = Date.now() - started
+  const completeness = {
+    nodeCount: limits.state.nodeCount, byteSize,
+    limitHit: limits.state.limitHit, truncatedNodeIds: limits.state.truncatedNodeIds,
+  }
+  return {
+    fileKey: state.bridgeFileKey, fileName: state.bridgeFileName, nodeId: node.id,
+    pageId: page ? page.id : null, pageName: page ? page.name : null, found: true,
+    truncated: completeness.limitHit, completeness, format: 'assets', timing: read.timing, payload,
+  }
+}
+
+// The 'render' representation: the node as Figma draws it, to compare a
+// built page against. 'render+s2+jpg' asks for twice the size, as JPG.
+async function readBridgeRender(request) {
+  const started = Date.now()
+  const params = request.params || {}
+  const limits = bridgeLimits(params.options || {})
+  const parts = representationParts(request)
+  const node = await figma.getNodeByIdAsync(params.nodeId)
+  if (!node) return missingBridgeNode(params.nodeId)
+  if (typeof node.exportAsync !== 'function') throw new Error(`Figma cannot render layer ${node.id} (${node.type})`)
+
+  const scalePart = parts.find(part => /^s\d+(\.\d+)?$/.test(part))
+  const asked = scalePart ? Number(scalePart.slice(1)) : 1
+  let scale = Math.min(4, Math.max(0.25, Number.isFinite(asked) ? asked : 1))
+  const format = parts.includes('svg') ? 'svg' : parts.includes('jpg') ? 'jpg' : 'png'
+  const width = roundSize(readValue(node, 'width'))
+  const height = roundSize(readValue(node, 'height'))
+  const payload = { type: 'RENDER', name: node.name, format, width, height }
+  if (format === 'svg') {
+    const exported = await exportSvg(node, { timing: { exportMs: 0 } })
+    const markup = exported.svg !== undefined ? exported.svg : exported.svgBase64
+    if (utf8Length(markup) + 512 > limits.maxBytes) markBridgeTruncated(limits, node.id)
+    else Object.assign(payload, exported)
+  } else {
+    let constraint = { type: 'SCALE', value: scale }
+    const longest = Math.max(width || 0, height || 0)
+    if (longest * scale > MAX_RENDER_SIDE) {
+      scale = MAX_RENDER_SIDE / longest
+      constraint = width >= height ? { type: 'WIDTH', value: MAX_RENDER_SIDE } : { type: 'HEIGHT', value: MAX_RENDER_SIDE }
+    }
+    const bytes = await node.exportAsync({ format: format === 'jpg' ? 'JPG' : 'PNG', constraint })
+    payload.scale = Math.round(scale * 1000) / 1000
+    payload.byteLength = bytes.length
+    // Too large to send: the answer says so, and the caller asks again smaller.
+    if (Math.ceil(bytes.length / 3) * 4 + 512 > limits.maxBytes) markBridgeTruncated(limits, node.id)
+    else payload.base64 = figma.base64Encode(bytes)
+  }
+  const byteSize = jsonBytes(payload)
+  const page = findPageForNode(node)
+  const completeness = {
+    nodeCount: 1, byteSize, limitHit: limits.state.limitHit, truncatedNodeIds: limits.state.truncatedNodeIds,
+  }
+  return {
+    fileKey: state.bridgeFileKey, fileName: state.bridgeFileName, nodeId: node.id,
+    pageId: page ? page.id : null, pageName: page ? page.name : null, found: true,
+    truncated: completeness.limitHit, completeness, format: 'render',
+    timing: { countMs: 0, exportMs: Date.now() - started, totalMs: Date.now() - started }, payload,
+  }
+}
+
+function readBridgeNodeAs(request) {
+  const base = representationBase(request)
+  if (base === 'assets') return readBridgeAssets(request)
+  if (base === 'render') return readBridgeRender(request)
+  return wantsRestFormat(request) ? readBridgeNodeRest(request) : readBridgeNode(request)
+}
+
 function readBridgeDocumentIndex(request) {
   const limits = bridgeLimits(request.params?.options || {})
   const pages = []
@@ -1418,7 +1732,7 @@ async function handleBridgeRequest(sessionId, request) {
   const editSeq = state.editSeq
   try {
     let result
-    if (request.op === 'read-node') result = wantsRestFormat(request) ? await readBridgeNodeRest(request) : await readBridgeNode(request)
+    if (request.op === 'read-node') result = await readBridgeNodeAs(request)
     else if (request.op === 'read-document-index') result = readBridgeDocumentIndex(request)
     else throw new Error(`Unsupported bridge operation: ${request.op}`)
     result.editSeq = editSeq

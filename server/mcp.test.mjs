@@ -132,7 +132,7 @@ test("the bridge an MCP server starts accepts the plugin's /design sync, and the
   const { tools } = await client.listTools();
   const context = tools.find(tool => tool.name === "get_design_context");
   assert.equal(context._meta?.["anthropic/maxResultSizeChars"], 500000);
-  for (const name of ["get_design_summary", "get_design_tree", "get_design_texts", "get_design_colors", "search_design"]) {
+  for (const name of ["get_design_assets", "get_design_summary", "get_design_tree", "get_design_texts", "get_design_colors", "search_design"]) {
     assert.equal(tools.find(tool => tool.name === name)._meta?.["anthropic/maxResultSizeChars"], 500000, name);
   }
 
@@ -522,6 +522,162 @@ test("a derived tool reads a cut node again whole, and every answer names what i
   assert.doesNotMatch(bounded, /Chaînes/);
   assert.match(bounded, /"Channels" \(1:9\)/);
   assert.deepEqual(reads, ["figma-rest+d50", "figma-rest+d50+n20000+b10000000", "figma-rest+d50+b50000"]);
+});
+
+const ASSET_CAPABILITIES = ["read-node", "read-document-index", "figma-rest", "edit-seq", "assets", "render"];
+const svgOf = (width, height, d) => `<svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}"><path d="${d}" fill="#E30613"/></svg>`;
+const PNG_BYTES = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]);
+const fence = markup => "```svg\n" + markup + "\n```";
+
+test("get_design_assets saves each icon's Figma SVG and each image's file, and lists where the design uses them", async t => {
+  const dataDir = tempDataDir(t);
+  const port = await freePort();
+  const client = await connectMcp(t, { FIGMA_BRIDGE_DATA_DIR: dataDir, FIGMA_BRIDGE_PORT: String(port) });
+  await waitFor(() => bridgeHealthy(port));
+  const reads = [];
+  await fakePlugin(t, port, dataDir, "AssetFile1", request => {
+    if (request.op === "edit-seq") return { fileKey: "AssetFile1", editSeq: 1 };
+    reads.push(request.params.representation);
+    return {
+      fileKey: "AssetFile1", fileName: "Search", nodeId: request.params.nodeId, pageId: "0:1", pageName: "Home",
+      format: "assets", editSeq: 1, truncated: true,
+      completeness: { nodeCount: 30, byteSize: 900, limitHit: true, truncatedNodeIds: ["9:17", "9:30"] },
+      payload: {
+        type: "ASSETS",
+        icons: [
+          {
+            id: "9:4", name: "ICONS", type: "INSTANCE", width: 18, height: 18, path: "Access / Header", component: "Icons / chevron-down",
+            layers: [{ id: "9:4", name: "ICONS", path: "Access / Header" }], svg: svgOf(18, 18, "M4 7l5 5 5-5"),
+          },
+          {
+            id: "9:13", name: "bi:ticket-perforated", type: "FRAME", width: 14, height: 14, path: "Access / Chip Video",
+            layers: [
+              { id: "9:13", name: "bi:ticket-perforated", path: "Access / Chip Video" },
+              { id: "9:15", name: "bi:ticket-perforated", path: "Access / Chip Rental" },
+            ],
+            svgBase64: Buffer.from(svgOf(14, 14, "M0 4.5V3h14")).toString("base64"),
+          },
+          { id: "9:17", name: "Bars", type: "FRAME", width: 16, height: 16, path: "Access", layers: [{ id: "9:17", name: "Bars", path: "Access" }], truncated: true },
+        ],
+        images: [{
+          hash: "ab12cd34ef56", kind: "IMAGE", width: 1200, height: 800, byteLength: PNG_BYTES.length, base64: PNG_BYTES.toString("base64"),
+          layers: [
+            { id: "9:21", name: "Poster", type: "FRAME", width: 320, height: 180, path: "Access", scaleMode: "FILL", cornerRadius: 8, filters: { exposure: 0, contrast: 0 } },
+            { id: "9:22", name: "Thumb", type: "RECTANGLE", width: 40, height: 40, path: "Access", scaleMode: "CROP", imageTransform: [[0.5, 0, 0], [0, 0.5, 0.25]] },
+          ],
+        }],
+      },
+    };
+  }, ASSET_CAPABILITIES);
+
+  const result = await client.callTool({ name: "get_design_assets", arguments: { source: "https://www.figma.com/design/AssetFile1/Search?node-id=9-1" } });
+  assert.equal(result.isError, undefined, textOf(result));
+  const answer = textOf(result);
+  assert.deepEqual(reads, ["assets+n20000+b10000000"]);
+  assert.match(answer, /^> Source: Search, node 9:1, live read at /);
+  assert.match(answer, /# Icons and images: 3 icon\(s\), 1 image\(s\)/);
+  assert.match(answer, /Do not redraw an icon/);
+
+  const dir = path.join(dataDir, "assets", "AssetFile1");
+  const files = fs.readdirSync(dir).sort();
+  assert.equal(files.length, 3, files.join(", "));
+  const chevron = files.find(name => /^icons-chevron-down-[0-9a-f]{8}\.svg$/.test(name));
+  const ticket = files.find(name => /^bi-ticket-perforated-[0-9a-f]{8}\.svg$/.test(name));
+  assert.ok(chevron && ticket, files.join(", "));
+  assert.equal(fs.readFileSync(path.join(dir, chevron), "utf8"), svgOf(18, 18, "M4 7l5 5 5-5"));
+  assert.equal(fs.readFileSync(path.join(dir, ticket), "utf8"), svgOf(14, 14, "M0 4.5V3h14"), "base64 markup is saved decoded");
+  assert.deepEqual(fs.readFileSync(path.join(dir, "ab12cd34ef56.png")), PNG_BYTES);
+
+  assert.match(answer, /### 1\. Icons \/ chevron-down \(18x18\)\n\n- Layer: "ICONS" \(9:4\) in Access \/ Header\n/);
+  assert.ok(answer.includes(`- File: ${path.join(dir, chevron)}\n\n${fence(svgOf(18, 18, "M4 7l5 5 5-5"))}`));
+  assert.match(answer, /- Used by 2 layers: "bi:ticket-perforated" \(9:13\) in Access \/ Chip Video; "bi:ticket-perforated" \(9:15\) in Access \/ Chip Rental/);
+  assert.match(answer, /### 3\. Bars \(16x16\)\n\n- Layer: "Bars" \(9:17\) in Access\n- Not sent: the answer reached maxBytes\./);
+  assert.match(answer, /### 1\. Image 1200x800 PNG, 1 KB\n\n- File: /);
+  assert.match(answer, /- Shown by "Poster" \(9:21\) in Access: 320x180, FILL, corner radius 8\n/);
+  assert.match(answer, /- Shown by "Thumb" \(9:22\) in Access: 40x40, CROP, imageTransform \[\[0\.5,0,0\],\[0,0\.5,0\.25\]\]\. Render this layer with get_design_image/);
+  // 9:17 is named with its icon: only the layer the walk never reached is a note.
+  assert.match(answer, /> \*\*Note:\*\* The read reached its layer limit: 1 layer\(s\) were not searched for icons and images: 9:30\./);
+
+  const fileLink = await client.callTool({ name: "get_design_assets", arguments: { source: "https://www.figma.com/design/AssetFile1/Search" } });
+  assert.equal(fileLink.isError, true);
+  assert.match(textOf(fileLink), /node-id/);
+});
+
+test("get_design_assets and get_design_image say what to restart when the plugin or the bridge is too old", async t => {
+  const dataDir = tempDataDir(t);
+  const port = await freePort();
+  const client = await connectMcp(t, { FIGMA_BRIDGE_DATA_DIR: dataDir, FIGMA_BRIDGE_PORT: String(port) });
+  await waitFor(() => bridgeHealthy(port));
+  // A plugin older than this version: the bridge refuses without asking it.
+  const asked = [];
+  await fakePlugin(t, port, dataDir, "OldPlugin1", request => { asked.push(request.op); return {}; },
+    ["read-node", "read-document-index", "figma-rest", "edit-seq"]);
+  // A bridge older than this version passes the representation on, and the
+  // plugin reads the node its usual way.
+  await fakePlugin(t, port, dataDir, "OldBridge1", request => (request.op === "edit-seq" ? { fileKey: "OldBridge1", editSeq: 1 } : {
+    fileKey: "OldBridge1", fileName: "Old", nodeId: request.params.nodeId, format: "plugin",
+    completeness: { nodeCount: 1, byteSize: 50, limitHit: false, truncatedNodeIds: [] }, payload: { id: "1:2", name: "Card", type: "FRAME" },
+  }), ASSET_CAPABILITIES);
+
+  for (const name of ["get_design_assets", "get_design_image"]) {
+    const plugin = await client.callTool({ name, arguments: { source: "https://www.figma.com/design/OldPlugin1/Old?node-id=1-2" } });
+    assert.equal(plugin.isError, true, name);
+    assert.match(textOf(plugin), /PLUGIN_OUTDATED: .*Close Design Bridge in Figma and open it again/);
+    const bridge = await client.callTool({ name, arguments: { source: "https://www.figma.com/design/OldBridge1/Old?node-id=1-2" } });
+    assert.equal(bridge.isError, true, name);
+    assert.match(textOf(bridge), /older than this MCP server.*Close every agent session.*reopen Design Bridge/);
+  }
+  assert.deepEqual(asked.filter(op => op === "read-node"), []);
+});
+
+test("get_design_image shows the render, and takes a render too large to show again as JPG", async t => {
+  const dataDir = tempDataDir(t);
+  const port = await freePort();
+  const client = await connectMcp(t, { FIGMA_BRIDGE_DATA_DIR: dataDir, FIGMA_BRIDGE_PORT: String(port) });
+  await waitFor(() => bridgeHealthy(port));
+  const reads = [];
+  const large = Buffer.alloc(2_700_000, 7);
+  const jpg = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3]);
+  const svg = svgOf(3000, 1000, "M0 0h10");
+  await fakePlugin(t, port, dataDir, "RenderFile1", request => {
+    if (request.op === "edit-seq") return { fileKey: "RenderFile1", editSeq: 1 };
+    const representation = request.params.representation;
+    reads.push(representation);
+    const render = { type: "RENDER", name: "Search", width: 3000, height: 1000 };
+    if (representation.includes("+svg")) Object.assign(render, { format: "svg", svg });
+    else if (representation.includes("+jpg")) Object.assign(render, { format: "jpg", scale: 1.365, byteLength: jpg.length, base64: jpg.toString("base64") });
+    else Object.assign(render, { format: "png", scale: 1.365, byteLength: large.length, base64: large.toString("base64") });
+    return {
+      fileKey: "RenderFile1", fileName: "Search", nodeId: request.params.nodeId, pageId: "0:1", pageName: "Home",
+      format: "render", editSeq: 1, completeness: { nodeCount: 1, byteSize: 100, limitHit: false, truncatedNodeIds: [] }, payload: render,
+    };
+  }, ASSET_CAPABILITIES);
+  const source = "https://www.figma.com/design/RenderFile1/Search?node-id=7-1";
+
+  const result = await client.callTool({ name: "get_design_image", arguments: { source, scale: 2 } });
+  assert.equal(result.isError, undefined, textOf(result));
+  assert.deepEqual(reads, ["render+s2+b10000000", "render+s2+jpg+b10000000"]);
+  const [text, image] = result.content;
+  assert.equal(text.type, "text");
+  assert.deepEqual(image, { type: "image", data: jpg.toString("base64"), mimeType: "image/jpeg" });
+  const file = path.join(dataDir, "renders", "RenderFile1", "7-1@1.365x.jpg");
+  assert.deepEqual(fs.readFileSync(file), jpg);
+  assert.match(text.text, /Rendered "Search" \(7:1\), 3000x1000 in the design, as JPG at scale 1\.365: 4095x1365 px, 1 KB\./);
+  assert.ok(text.text.includes(`File: ${file}`));
+  assert.match(text.text, /PNG at scale 2 \(2\.6 MB\) was too large to show, so it was rendered again smaller\./);
+  assert.match(text.text, /scale was lowered from 2 to 1\.365/);
+  assert.match(text.text, /render one section by its own node-id/);
+
+  const vector = await client.callTool({ name: "get_design_image", arguments: { source, format: "svg" } });
+  assert.equal(vector.isError, undefined, textOf(vector));
+  assert.equal(vector.content.length, 1);
+  assert.equal(reads.at(-1), "render+s1+svg+b10000000");
+  assert.equal(fs.readFileSync(path.join(dataDir, "renders", "RenderFile1", "7-1.svg"), "utf8"), svg);
+  assert.ok(textOf(vector).includes(fence(svg)));
+
+  const refused = await client.callTool({ name: "get_design_image", arguments: { source, scale: 8 } });
+  assert.equal(refused.isError, true);
+  assert.match(textOf(refused), /scale/);
 });
 
 test("the MCP server that owns the bridge keeps working after the token is rotated", async t => {
