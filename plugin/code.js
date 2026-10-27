@@ -1467,6 +1467,10 @@ function addImageUse(read, hash, kind, node, paint, trail, fills) {
     layer.x = roundSize(box.x - read.origin.x)
     layer.y = roundSize(box.y - read.origin.y)
   }
+  // A frame placed on the page or in a section is a screen: its image is
+  // that screen's background.
+  const parent = readValue(node, 'parent')
+  if (parent && (parent.type === 'PAGE' || parent.type === 'SECTION')) layer.screen = true
   for (const field of ['imageTransform', 'scalingFactor', 'rotation', 'filters']) {
     if (paint[field] !== undefined) layer[field] = sanitizeForMessage(paint[field])
   }

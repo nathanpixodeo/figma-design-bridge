@@ -542,15 +542,16 @@ const svgMarkup = item => item.svg ?? (typeof item.svgBase64 === "string" ? Buff
 // background: a layer as large as the node read is laid out with the page,
 // not at its image's size.
 function layerPlace(layer, root) {
-  if (!Number.isFinite(layer.x) || !Number.isFinite(layer.y)) return { at: "", span: "" };
-  const at = ` at ${layer.x},${layer.y}`;
+  const placed = Number.isFinite(layer.x) && Number.isFinite(layer.y);
+  const at = placed ? ` at ${layer.x},${layer.y}` : "";
+  const sized = " Size it with its section, such as the full width of the viewport, not with its file.";
+  if (layer.screen) return { at, span: ` It is the background of a whole screen (${sizeOf(layer)}): a full-bleed background.${sized}` };
   const near = (value, target) => Math.abs(value - target) <= 1;
-  if (!Number.isFinite(root?.width) || !Number.isFinite(root?.height) || !near(layer.x, 0) || !near(layer.width, root.width)) {
+  if (!placed || !Number.isFinite(root?.width) || !Number.isFinite(root?.height) || !near(layer.x, 0) || !near(layer.width, root.width)) {
     return { at, span: "" };
   }
   if (near(layer.y, 0) && near(layer.height, root.height)) {
-    return { at, span: ` It covers the whole node read (${sizeOf(root)}): a full-bleed background. Size it with its `
-      + "section, such as the full width of the viewport, not with its file." };
+    return { at, span: ` It covers the whole node read (${sizeOf(root)}): a full-bleed background.${sized}` };
   }
   return { at, span: " It spans the full width of the node read: a full-bleed band." };
 }
@@ -559,7 +560,7 @@ function layerPlace(layer, root) {
 // each image's saved file by its hash.
 function imageLayer(layer, { image, root, files }) {
   const details = [`${sizeOf(layer)}${layerPlace(layer, root).at}`, layer.scaleMode || "FILL"];
-  if (layer.cornerRadius) details.push(`corner radius ${layer.cornerRadius}`);
+  if (layer.cornerRadius) details.push(`corner radius ${Number(layer.cornerRadius.toFixed(2))}`);
   const lines = [`- Shown by ${layerName(layer)}: ${details.join(", ")}.${layerPlace(layer, root).span}`];
   const box = { width: layer.width, height: layer.height };
   if (image.kind === "VIDEO" || !(box.width > 0 && box.height > 0)) return lines.join("\n");

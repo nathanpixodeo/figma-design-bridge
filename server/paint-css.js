@@ -168,10 +168,10 @@ function imagePlacement(paint, url, box, image) {
   const filters = Object.entries(paint.filters || {}).filter(([, value]) => value)
   if (filters.length) {
     exact = false
-    notes.push(`filters ${filters.map(([name, value]) => `${name} ${value}`).join(', ')} change its colors, and CSS filters only come close`)
+    notes.push(`filters ${filters.map(([name, value]) => `${name} ${round(value)}`).join(', ')} change its colors, and CSS filters only come close`)
   }
   if (paintOpacity(paint) !== 1) {
-    notes.push(`the image is at opacity ${paint.opacity}, which a CSS background cannot set: draw it in its own layer, such as ::before, with that opacity`)
+    notes.push(`the image is at opacity ${round(paint.opacity)}, which a CSS background cannot set: draw it in its own layer, such as ::before, with that opacity`)
   }
   return { css, img, exact, notes }
 }

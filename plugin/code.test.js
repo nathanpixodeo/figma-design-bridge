@@ -1702,6 +1702,26 @@ test('Bridge reads the icons of a node as Figma SVG and its images as their file
   assert.deepEqual(poster.fills[2].gradientTransform, [[0, 1, 0], [-1, 0, 1]])
   assert.equal(poster.fills[2].opacity, 0.8)
   assert.equal(thumb.fills, undefined, 'a lone image fill needs no stack')
+  assert.deepEqual(image.layers.map(layer => layer.screen), [undefined, undefined], 'layers inside a frame are not screens')
+})
+
+test('Bridge names a frame on the page or in a section as a screen, whose image is its background', async () => {
+  const p = await connectedBridgePlugin()
+  const slide = {
+    id: '7:2', name: 'Slide 16:9 - 1', type: 'FRAME', width: 1920, height: 1080,
+    absoluteBoundingBox: { x: 582, y: 2700, width: 1920, height: 1080 },
+    fills: [{ type: 'IMAGE', imageHash: 'bg', scaleMode: 'CROP', imageTransform: [[1.24, 0, 0], [0, 0.875, 0.125]] }],
+  }
+  assetFigma(p, {
+    id: '7:1', name: 'Sign in', type: 'SECTION', width: 4000, height: 4000,
+    absoluteBoundingBox: { x: 0, y: 0, width: 4000, height: 4000 }, children: [slide],
+  }, { images: { bg: { bytes: [137, 80, 78, 71], width: 1024, height: 819 } } })
+
+  const fromSection = await readRest(p, '7:1', {}, 'assets')
+  const [layer] = fromSection.result.payload.images[0].layers
+  assert.deepEqual([layer.id, layer.x, layer.y, layer.screen], ['7:2', 582, 2700, true])
+  const alone = await readRest(p, '7:2', {}, 'assets')
+  assert.deepEqual(alone.result.payload.images[0].layers.map(item => [item.x, item.y, item.screen]), [[0, 0, true]])
 })
 
 test('Bridge exports a node that is an icon itself whole', async () => {

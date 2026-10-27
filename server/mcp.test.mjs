@@ -576,6 +576,7 @@ test("get_design_assets saves each icon's Figma SVG and each image's file, and l
           layers: [
             { id: "9:21", name: "Poster", type: "FRAME", width: 320, height: 180, path: "Access", scaleMode: "FILL", cornerRadius: 8, filters: { exposure: 0, contrast: 0 } },
             { id: "9:22", name: "Thumb", type: "RECTANGLE", width: 40, height: 40, path: "Access", scaleMode: "CROP", imageTransform: [[0.5, 0, 0], [0, 0.5, 0.25]] },
+            { id: "9:50", name: "Slide", type: "FRAME", width: 1920, height: 1080, x: 2000, y: 0, path: "Flows", scaleMode: "FILL", screen: true, opacity: 0.8600000143051147 },
             {
               id: "9:1", name: "Access", type: "FRAME", width: 1440, height: 900, x: 0, y: 0, path: "", scaleMode: "FILL", fillIndex: 1,
               fills: [
@@ -633,6 +634,9 @@ test("get_design_assets saves each icon's Figma SVG and each image's file, and l
     + `  - CSS: \`background: url("ab12cd34ef56.png") 0% 50% / 200% 200% no-repeat;\`\n`
     + `  - As an <img>, in a box with position: relative and overflow: hidden: \`position: absolute; left: 0%; top: -50%; width: 200%; height: 200%;\`\n`));
   assert.doesNotMatch(answer, /imageTransform|Render this layer/);
+  // A frame on a page or in a section is a screen, whatever node was read.
+  assert.ok(answer.includes(`- Shown by "Slide" (9:50) in Flows: 1920x1080 at 2000,0, FILL. It is the background of a whole screen (1920x1080): a full-bleed background.`));
+  assert.match(answer, /- Note: the image is at opacity 0\.86, which a CSS background cannot set/);
   // The node read's own background: its three fills in one declaration, top first.
   assert.ok(answer.includes(`- Shown by "Access" (9:1): 1440x900 at 0,0, FILL. It covers the whole node read (1440x900): a full-bleed background.`));
   assert.ok(answer.includes(`  - CSS for its 3 fills, top first: \`background: linear-gradient(180deg, rgba(0, 0, 0, 0) 0%, rgba(0, 0, 0, 0.8) 100%), url("ab12cd34ef56.png") center / cover no-repeat, #101014;\``));

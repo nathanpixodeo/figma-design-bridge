@@ -377,7 +377,8 @@ The route an MCP adapter calls with the URL a user pasted.
     `filters`, paint `opacity` and `cornerRadius`. A layer with more than
     one visible fill also has `fills`, every one of them bottom first in the
     REST API's paint shape without `boundVariables`, and `fillIndex`, the
-    image's place among them. A `VIDEO` paint is listed with
+    image's place among them. A frame placed on a page or in a section, a
+    screen, also has `screen: true`. A `VIDEO` paint is listed with
     `kind: "VIDEO"` and no file.
   - `maxBytes` bounds the SVG and image data. An icon or image past it keeps
     its record with `truncated: true` and no data, and its layer ids are in

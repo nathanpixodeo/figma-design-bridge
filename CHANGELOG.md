@@ -22,9 +22,11 @@ Full-screen and full-bleed backgrounds are built as the design draws them.
   declaration for all of them, top first, with blend modes; linear, radial and
   angular gradients are converted, and what CSS cannot draw, such as a diamond
   gradient, image filters or a turned image, is named with a render to compare.
-- Each image layer has its place from the top left of the node read. A layer
-  as large as the node is named as its full-bleed background, and one as wide
-  as the node as a full-bleed band.
+- Each image layer has its place from the top left of the node read. A screen
+  (a frame on a page or in a section) and a layer as large as the node read are
+  named as a full-bleed background, and a layer as wide as the node as a
+  full-bleed band, so a section of several screens still names each screen's
+  background.
 - Icons and images left out at `maxBytes` are read again, up to 10 of them,
   each by its own layer, so a large page sends every file it can.
 
