@@ -4,7 +4,7 @@ All notable changes to Figma Design Bridge. Versions follow
 [Semantic Versioning](https://semver.org/); the Claude Code plugin, the
 marketplace entry and both `package.json` files always carry the same number.
 
-## [Unreleased]
+## [1.7.0] - 2026-10-27
 
 Full-screen and full-bleed backgrounds are built as the design draws them.
 
@@ -429,7 +429,8 @@ audit. Nothing to migrate.
   with page and selection sync and Watch mode, and the MCP server for Claude
   Code.
 
-[1.6.0]: https://github.com/nathanpixodeo/figma-design-bridge/compare/df30224...main
+[1.7.0]: https://github.com/nathanpixodeo/figma-design-bridge/compare/d0e2682...main
+[1.6.0]: https://github.com/nathanpixodeo/figma-design-bridge/compare/df30224...d0e2682
 [1.5.1]: https://github.com/nathanpixodeo/figma-design-bridge/compare/334a489...df30224
 [1.5.0]: https://github.com/nathanpixodeo/figma-design-bridge/compare/fab0416...334a489
 [1.4.1]: https://github.com/nathanpixodeo/figma-design-bridge/compare/1559101...fab0416
