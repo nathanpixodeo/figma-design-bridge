@@ -1061,7 +1061,7 @@ Restart the MCP client after changing its environment configuration.
 | Tool | Description |
 |------|-------------|
 | `get_design_context` | Read a Figma file or exact node through the connected plugin (`source` required; live by default). A node comes back as Figma's REST JSON with every attribute. `depth` (default 50, every level), `maxNodes` and `maxBytes` bound the result, and a cut layer stays as a placeholder the note names; `timeoutMs` (default 30000, up to 120000) bounds the wait; `fresh: true` reads again instead of reusing an unchanged read; `geometry: true` adds vector paths |
-| `get_design_assets` | Export every icon and image inside a node link (with `node-id`): each icon as Figma's own SVG (Copy as SVG), each image fill as its original file, saved under `<dataDir>/assets/<fileKey>/` and listed with the layers that use them. `maxBytes` (default 10000000) bounds the data; an asset past it is named, to read alone |
+| `get_design_assets` | Export every icon and image inside a node link (with `node-id`): each icon as Figma's own SVG (Copy as SVG), each image fill as its original file, saved under `<dataDir>/assets/<fileKey>/` and listed with the layers that use them, each with its place and the CSS background that draws it. `maxBytes` (default 10000000) bounds the data; up to 10 assets past it are read again alone, and any more are named, to read alone |
 | `get_design_image` | Render a node link (with `node-id`) as PNG (default), JPG or SVG and show it to the agent; `scale` 0.5–4 (default 1), at most 4096 px on the long side. A PNG too large to show is rendered again as JPG, then smaller. Saved under `<dataDir>/renders/<fileKey>/` |
 | `get_bridge_status` | Show bridge readiness, live plugin sessions, how many plugins wait for pairing approval, cache statistics, and setup hints |
 | `approve_figma_pairing` | Approve the Figma plugin that shows this 6-digit pairing code (`code` required). Use only a code the user reads from the plugin |
@@ -1093,6 +1093,12 @@ Build icons and images from what the design holds, not from paths or look-alikes
   icon component or a logo mark. A chip or button with a fill of its own is not
   an icon: the glyph inside it is. The same icon used by several layers is
   listed once.
+- Each layer that shows an image comes with its place in the node and the CSS
+  background that draws it as Figma does: cover, contain, the designer's crop
+  or a tile, stacked with the solids and gradients of the same layer, top
+  first. A layer as large as the node read is named as its full-bleed
+  background, so a full-screen hero or page background is laid out with the
+  page, not at the size of its file.
 - `get_design_image` renders a frame, a section or one layer, so the agent can
   see the design and compare it with the page it built. It also exports what
   code cannot draw from attributes, such as an illustration or a photo as its

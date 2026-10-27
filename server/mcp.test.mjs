@@ -535,15 +535,27 @@ test("get_design_assets saves each icon's Figma SVG and each image's file, and l
   const client = await connectMcp(t, { FIGMA_BRIDGE_DATA_DIR: dataDir, FIGMA_BRIDGE_PORT: String(port) });
   await waitFor(() => bridgeHealthy(port));
   const reads = [];
+  const alone = {
+    // An icon and an image left out at maxBytes, read again alone by one of their layers.
+    "9:17": { icons: [{ id: "9:17", name: "Bars", type: "FRAME", width: 16, height: 16, layers: [{ id: "9:17", name: "Bars" }], svg: svgOf(16, 16, "M0 3h16") }], images: [] },
+    "9:41": { icons: [], images: [{ hash: "ff00ff00ff00", kind: "IMAGE", width: 640, height: 480, byteLength: PNG_BYTES.length, base64: PNG_BYTES.toString("base64"), layers: [] }] },
+  };
   await fakePlugin(t, port, dataDir, "AssetFile1", request => {
     if (request.op === "edit-seq") return { fileKey: "AssetFile1", editSeq: 1 };
-    reads.push(request.params.representation);
+    reads.push(`${request.params.nodeId} ${request.params.representation}`);
+    if (alone[request.params.nodeId]) {
+      return {
+        fileKey: "AssetFile1", fileName: "Search", nodeId: request.params.nodeId, format: "assets", editSeq: 1, truncated: false,
+        completeness: { nodeCount: 1, byteSize: 100, limitHit: false, truncatedNodeIds: [] },
+        payload: { type: "ASSETS", ...alone[request.params.nodeId] },
+      };
+    }
     return {
       fileKey: "AssetFile1", fileName: "Search", nodeId: request.params.nodeId, pageId: "0:1", pageName: "Home",
       format: "assets", editSeq: 1, truncated: true,
-      completeness: { nodeCount: 30, byteSize: 900, limitHit: true, truncatedNodeIds: ["9:17", "9:30"] },
+      completeness: { nodeCount: 30, byteSize: 900, limitHit: true, truncatedNodeIds: ["9:17", "9:30", "9:40", "9:41"] },
       payload: {
-        type: "ASSETS",
+        type: "ASSETS", name: "Access", width: 1440, height: 900,
         icons: [
           {
             id: "9:4", name: "ICONS", type: "INSTANCE", width: 18, height: 18, path: "Access / Header", component: "Icons / chevron-down",
@@ -564,6 +576,23 @@ test("get_design_assets saves each icon's Figma SVG and each image's file, and l
           layers: [
             { id: "9:21", name: "Poster", type: "FRAME", width: 320, height: 180, path: "Access", scaleMode: "FILL", cornerRadius: 8, filters: { exposure: 0, contrast: 0 } },
             { id: "9:22", name: "Thumb", type: "RECTANGLE", width: 40, height: 40, path: "Access", scaleMode: "CROP", imageTransform: [[0.5, 0, 0], [0, 0.5, 0.25]] },
+            {
+              id: "9:1", name: "Access", type: "FRAME", width: 1440, height: 900, x: 0, y: 0, path: "", scaleMode: "FILL", fillIndex: 1,
+              fills: [
+                { type: "SOLID", blendMode: "NORMAL", color: { r: 16 / 255, g: 16 / 255, b: 20 / 255, a: 1 } },
+                { type: "IMAGE", blendMode: "NORMAL", imageRef: "ab12cd34ef56", scaleMode: "FILL" },
+                {
+                  type: "GRADIENT_LINEAR", blendMode: "NORMAL", opacity: 0.8, gradientTransform: [[0, 1, 0], [-1, 0, 1]],
+                  gradientStops: [{ position: 0, color: { r: 0, g: 0, b: 0, a: 0 } }, { position: 1, color: { r: 0, g: 0, b: 0, a: 1 } }],
+                },
+              ],
+            },
+          ],
+        }, {
+          hash: "ff00ff00ff00", kind: "IMAGE", width: 640, height: 480, byteLength: PNG_BYTES.length, truncated: true,
+          layers: [
+            { id: "9:40", name: "Banner", type: "FRAME", width: 1440, height: 320, x: 0, y: 580, path: "Access", scaleMode: "FILL" },
+            { id: "9:41", name: "Photo", type: "RECTANGLE", width: 64, height: 48, x: 24, y: 600, path: "Access / Banner", scaleMode: "FIT" },
           ],
         }],
       },
@@ -573,29 +602,44 @@ test("get_design_assets saves each icon's Figma SVG and each image's file, and l
   const result = await client.callTool({ name: "get_design_assets", arguments: { source: "https://www.figma.com/design/AssetFile1/Search?node-id=9-1" } });
   assert.equal(result.isError, undefined, textOf(result));
   const answer = textOf(result);
-  assert.deepEqual(reads, ["assets+n20000+b10000000"]);
+  // The image is read again by the shape that shows it, not by the frame.
+  assert.deepEqual(reads, ["9:1 assets+n20000+b10000000", "9:17 assets+n20000+b10000000", "9:41 assets+n20000+b10000000"]);
   assert.match(answer, /^> Source: Search, node 9:1, live read at /);
-  assert.match(answer, /# Icons and images: 3 icon\(s\), 1 image\(s\)/);
+  assert.match(answer, /# Icons and images: 3 icon\(s\), 2 image\(s\)/);
   assert.match(answer, /Do not redraw an icon/);
+  assert.match(answer, /do not drop the solids and gradients drawn over it/);
 
   const dir = path.join(dataDir, "assets", "AssetFile1");
   const files = fs.readdirSync(dir).sort();
-  assert.equal(files.length, 3, files.join(", "));
+  assert.equal(files.length, 5, files.join(", "));
   const chevron = files.find(name => /^icons-chevron-down-[0-9a-f]{8}\.svg$/.test(name));
   const ticket = files.find(name => /^bi-ticket-perforated-[0-9a-f]{8}\.svg$/.test(name));
-  assert.ok(chevron && ticket, files.join(", "));
+  const bars = files.find(name => /^bars-[0-9a-f]{8}\.svg$/.test(name));
+  assert.ok(chevron && ticket && bars, files.join(", "));
   assert.equal(fs.readFileSync(path.join(dir, chevron), "utf8"), svgOf(18, 18, "M4 7l5 5 5-5"));
   assert.equal(fs.readFileSync(path.join(dir, ticket), "utf8"), svgOf(14, 14, "M0 4.5V3h14"), "base64 markup is saved decoded");
   assert.deepEqual(fs.readFileSync(path.join(dir, "ab12cd34ef56.png")), PNG_BYTES);
+  assert.deepEqual(fs.readFileSync(path.join(dir, "ff00ff00ff00.png")), PNG_BYTES);
 
   assert.match(answer, /### 1\. Icons \/ chevron-down \(18x18\)\n\n- Layer: "ICONS" \(9:4\) in Access \/ Header\n/);
   assert.ok(answer.includes(`- File: ${path.join(dir, chevron)}\n\n${fence(svgOf(18, 18, "M4 7l5 5 5-5"))}`));
   assert.match(answer, /- Used by 2 layers: "bi:ticket-perforated" \(9:13\) in Access \/ Chip Video; "bi:ticket-perforated" \(9:15\) in Access \/ Chip Rental/);
-  assert.match(answer, /### 3\. Bars \(16x16\)\n\n- Layer: "Bars" \(9:17\) in Access\n- Not sent: the answer reached maxBytes\./);
+  assert.ok(answer.includes(`### 3. Bars (16x16)\n\n- Layer: "Bars" (9:17) in Access\n- File: ${path.join(dir, bars)}`));
+  assert.doesNotMatch(answer, /Not sent/);
   assert.match(answer, /### 1\. Image 1200x800 PNG, 1 KB\n\n- File: /);
-  assert.match(answer, /- Shown by "Poster" \(9:21\) in Access: 320x180, FILL, corner radius 8\n/);
-  assert.match(answer, /- Shown by "Thumb" \(9:22\) in Access: 40x40, CROP, imageTransform \[\[0\.5,0,0\],\[0,0\.5,0\.25\]\]\. Render this layer with get_design_image/);
-  // 9:17 is named with its icon: only the layer the walk never reached is a note.
+  assert.ok(answer.includes(`- Shown by "Poster" (9:21) in Access: 320x180, FILL, corner radius 8.\n  - CSS: \`background: url("ab12cd34ef56.png") center / cover no-repeat;\`\n`));
+  // CROP: the 40x40 layer shows the file at 80x80, moved up by 20 px.
+  assert.ok(answer.includes(`- Shown by "Thumb" (9:22) in Access: 40x40, CROP.\n`
+    + `  - CSS: \`background: url("ab12cd34ef56.png") 0% 50% / 200% 200% no-repeat;\`\n`
+    + `  - As an <img>, in a box with position: relative and overflow: hidden: \`position: absolute; left: 0%; top: -50%; width: 200%; height: 200%;\`\n`));
+  assert.doesNotMatch(answer, /imageTransform|Render this layer/);
+  // The node read's own background: its three fills in one declaration, top first.
+  assert.ok(answer.includes(`- Shown by "Access" (9:1): 1440x900 at 0,0, FILL. It covers the whole node read (1440x900): a full-bleed background.`));
+  assert.ok(answer.includes(`  - CSS for its 3 fills, top first: \`background: linear-gradient(180deg, rgba(0, 0, 0, 0) 0%, rgba(0, 0, 0, 0.8) 100%), url("ab12cd34ef56.png") center / cover no-repeat, #101014;\``));
+  assert.match(answer, /### 2\. Image 640x480 PNG, 1 KB\n\n- File: /);
+  assert.match(answer, /- Shown by "Banner" \(9:40\) in Access: 1440x320 at 0,580, FILL\. It spans the full width of the node read: a full-bleed band\.\n  - CSS: `background: url\("ff00ff00ff00\.png"\) center \/ cover no-repeat;`/);
+  assert.match(answer, /- Shown by "Photo" \(9:41\) in Access \/ Banner: 64x48 at 24,600, FIT\.\n  - CSS: `background: url\("ff00ff00ff00\.png"\) center \/ contain no-repeat;`/);
+  // Only the layer the walk never reached is a note.
   assert.match(answer, /> \*\*Note:\*\* The read reached its layer limit: 1 layer\(s\) were not searched for icons and images: 9:30\./);
 
   const fileLink = await client.callTool({ name: "get_design_assets", arguments: { source: "https://www.figma.com/design/AssetFile1/Search" } });

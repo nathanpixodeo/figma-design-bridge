@@ -1132,6 +1132,11 @@ function restPaint(paint) {
   if (paint.gradientTransform) rest.gradientTransform = sanitizeForMessage(paint.gradientTransform)
   if (paint.imageHash) rest.imageRef = paint.imageHash
   if (paint.scaleMode) rest.scaleMode = paint.scaleMode
+  // Without these a cropped, tiled or rotated image reads as one that fills
+  // its layer.
+  for (const field of ['imageTransform', 'scalingFactor', 'rotation', 'filters']) {
+    if (paint[field] !== undefined) rest[field] = sanitizeForMessage(paint[field])
+  }
   if (paint.boundVariables && Object.keys(paint.boundVariables).length) {
     rest.boundVariables = sanitizeForMessage(paint.boundVariables)
   }
@@ -1402,13 +1407,15 @@ async function walkAssets(node, trail, read) {
 
   let drawsImage = false
   for (const field of ['fills', 'strokes']) {
-    for (const paint of shownPaints(readValue(node, field))) {
+    const paints = shownPaints(readValue(node, field))
+    const stack = field === 'fills' ? paints : null
+    for (const paint of paints) {
       if (paint.type === 'IMAGE' && paint.imageHash) {
         drawsImage = true
-        addImageUse(read, paint.imageHash, 'IMAGE', node, paint, trail)
+        addImageUse(read, paint.imageHash, 'IMAGE', node, paint, trail, stack)
       } else if (paint.type === 'VIDEO') {
         drawsImage = true
-        addImageUse(read, paint.videoHash || node.id, 'VIDEO', node, paint, trail)
+        addImageUse(read, paint.videoHash || node.id, 'VIDEO', node, paint, trail, stack)
       }
     }
   }
@@ -1441,7 +1448,10 @@ async function walkAssets(node, trail, read) {
   return { vector: true, paths, shapes, isIcon, node: { node, trail }, icons: [] }
 }
 
-function addImageUse(read, hash, kind, node, paint, trail) {
+// One layer showing an image: its box, placed from the top left of the node
+// read, and the fills under and over the image, bottom first, so the agent can
+// write the layer's whole background.
+function addImageUse(read, hash, kind, node, paint, trail, fills) {
   let image = read.images.get(hash)
   if (!image) {
     image = { hash, kind, layers: [] }
@@ -1452,12 +1462,24 @@ function addImageUse(read, hash, kind, node, paint, trail) {
     width: roundSize(readValue(node, 'width')), height: roundSize(readValue(node, 'height')),
     path: trail.join(' / '), scaleMode: paint.scaleMode || null,
   }
+  const box = readValue(node, 'absoluteBoundingBox')
+  if (box && read.origin) {
+    layer.x = roundSize(box.x - read.origin.x)
+    layer.y = roundSize(box.y - read.origin.y)
+  }
   for (const field of ['imageTransform', 'scalingFactor', 'rotation', 'filters']) {
     if (paint[field] !== undefined) layer[field] = sanitizeForMessage(paint[field])
   }
   if (typeof paint.opacity === 'number' && paint.opacity !== 1) layer.opacity = paint.opacity
   const radius = readValue(node, 'cornerRadius')
   if (typeof radius === 'number' && radius) layer.cornerRadius = radius
+  if (fills && fills.length > 1) {
+    layer.fills = fills.map(fill => {
+      const { boundVariables, ...rest } = restPaint(fill)
+      return rest
+    })
+    layer.fillIndex = fills.indexOf(paint)
+  }
   image.layers.push(layer)
 }
 
@@ -1590,13 +1612,18 @@ async function readBridgeAssets(request) {
 
   const read = {
     limits, pace: createPacer(), images: new Map(), bytes: 0,
+    origin: readValue(node, 'absoluteBoundingBox'),
     timing: { countMs: 0, exportMs: 0, totalMs: 0 },
   }
   const walked = await walkAssets(node, [], read)
   read.timing.countMs = Date.now() - started
   // The node asked for is exported whole when it is an icon itself.
   const found = walked && walked.vector && walked.isIcon ? [walked.node] : (walked ? walked.icons : [])
-  const payload = { type: 'ASSETS', icons: await exportIcons(found, read), images: await exportImages(read) }
+  const payload = {
+    type: 'ASSETS', name: node.name,
+    width: roundSize(readValue(node, 'width')), height: roundSize(readValue(node, 'height')),
+    icons: await exportIcons(found, read), images: await exportImages(read),
+  }
   const byteSize = jsonBytes(payload)
   const page = findPageForNode(node)
   read.timing.totalMs = Date.now() - started

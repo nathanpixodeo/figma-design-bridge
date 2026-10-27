@@ -355,7 +355,8 @@ The route an MCP adapter calls with the URL a user pasted.
   `geometry=paths` does.
 - `node-subtree`: the plugin's own reading, property by property.
 - `assets`: the icons and images inside the node, with `format: "assets"` and
-  the payload `{ type: "ASSETS", icons, images }`. The plugin walks the
+  the payload `{ type: "ASSETS", name, width, height, icons, images }`, where
+  `name`, `width` and `height` are the node read's. The plugin walks the
   visible layers only.
   - An icon is the top-most layer whose visible subtree holds no text and no
     image or video fill, and which draws a path: a vector, boolean operation,
@@ -371,9 +372,13 @@ The route an MCP adapter calls with the URL a user pasted.
   - An image is every visible `IMAGE` paint, once per `imageHash`, with its
     original file as `base64`, its pixel `width` and `height`, its
     `byteLength`, and in `layers` each layer that shows it, with its size,
+    its place `x` and `y` from the top left of the node read,
     `scaleMode`, `imageTransform`, `scalingFactor`, `rotation`,
-    `filters`, paint `opacity` and `cornerRadius`. A `VIDEO` paint is
-    listed with `kind: "VIDEO"` and no file.
+    `filters`, paint `opacity` and `cornerRadius`. A layer with more than
+    one visible fill also has `fills`, every one of them bottom first in the
+    REST API's paint shape without `boundVariables`, and `fillIndex`, the
+    image's place among them. A `VIDEO` paint is listed with
+    `kind: "VIDEO"` and no file.
   - `maxBytes` bounds the SVG and image data. An icon or image past it keeps
     its record with `truncated: true` and no data, and its layer ids are in
     `truncatedNodeIds`; reading one of those ids alone exports it. `maxNodes`

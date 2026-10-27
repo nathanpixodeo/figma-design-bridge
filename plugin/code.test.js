@@ -1351,10 +1351,16 @@ test('Bridge outlines layers within the depth asked for and exports nothing deep
   const { screen, nodes } = nestedScreen(p.otherPage)
   p.figma.getNodeByIdAsync = async id => nodes.get(id) || null
   const exports = exportable(screen)
+  // A full-page background: the crop is what places the image in the screen.
+  const crop = [[1.25, 0, 0], [0, 0.875, 0.125]]
+  screen.fills = [{ type: 'IMAGE', imageHash: 'bg', scaleMode: 'CROP', imageTransform: crop, rotation: 0, filters: { exposure: 0.2 } }]
 
   const reply = await readRest(p, screen.id, { depth: 1 })
   const { document } = reply.result.payload
   assert.equal(document.partial, true)
+  assert.deepEqual(document.fills, [{
+    blendMode: 'NORMAL', type: 'IMAGE', imageRef: 'bg', scaleMode: 'CROP', imageTransform: crop, rotation: 0, filters: { exposure: 0.2 },
+  }])
   assert.equal(document.children.length, 60)
   assert.equal(document.children[0].partial, true)
   assert.deepEqual(document.children[0].children, [{ id: '3:3', name: 'Body', type: 'FRAME', truncated: true }])
@@ -1595,6 +1601,7 @@ function accessPanel() {
   })
   return {
     id: '9:1', name: 'Access', type: 'FRAME', width: 389, height: 146, fills: [SOLID], strokes: [SOLID],
+    absoluteBoundingBox: { x: 100, y: 200, width: 389, height: 146 },
     children: [
       {
         id: '9:2', name: 'Header', type: 'FRAME', children: [
@@ -1629,10 +1636,21 @@ function accessPanel() {
       },
       {
         id: '9:21', name: 'Poster', type: 'FRAME', width: 320, height: 180, cornerRadius: 8,
-        fills: [{ type: 'IMAGE', imageHash: 'abc', scaleMode: 'FILL' }],
+        absoluteBoundingBox: { x: 100, y: 366, width: 320, height: 180 },
+        // A dark base, the image, and a gradient that fades it out.
+        fills: [
+          { ...SOLID, boundVariables: { color: { type: 'VARIABLE_ALIAS', id: 'VariableID:1:1' } } },
+          { type: 'IMAGE', imageHash: 'abc', scaleMode: 'FILL' },
+          HIDDEN_SOLID,
+          {
+            type: 'GRADIENT_LINEAR', opacity: 0.8, gradientTransform: [[0, 1, 0], [-1, 0, 1]],
+            gradientStops: [{ position: 0, color: { r: 0, g: 0, b: 0, a: 0 } }, { position: 1, color: { r: 0, g: 0, b: 0, a: 1 } }],
+          },
+        ],
       },
       {
         id: '9:22', name: 'Thumb', type: 'RECTANGLE', width: 40, height: 40,
+        absoluteBoundingBox: { x: 120, y: 260, width: 40, height: 40 },
         fills: [{ type: 'IMAGE', imageHash: 'abc', scaleMode: 'CROP', imageTransform: [[0.5, 0, 0], [0, 0.5, 0.25]] }],
       },
     ],
@@ -1672,6 +1690,18 @@ test('Bridge reads the icons of a node as Figma SVG and its images as their file
   assert.deepEqual(image.layers.map(layer => [layer.id, layer.scaleMode]), [['9:21', 'FILL'], ['9:22', 'CROP']])
   assert.equal(image.layers[0].cornerRadius, 8)
   assert.deepEqual(image.layers[1].imageTransform, [[0.5, 0, 0], [0, 0.5, 0.25]])
+  assert.equal(reply.result.payload.name, 'Access')
+  assert.deepEqual([reply.result.payload.width, reply.result.payload.height], [389, 146])
+  // Places are from the top left of the node read.
+  assert.deepEqual(image.layers.map(layer => [layer.x, layer.y]), [[0, 166], [20, 60]])
+  // The fills shown, bottom first, so the agent can stack them as Figma does.
+  const [poster, thumb] = image.layers
+  assert.equal(poster.fillIndex, 1)
+  assert.deepEqual(poster.fills.map(fill => fill.type), ['SOLID', 'IMAGE', 'GRADIENT_LINEAR'], 'the hidden solid is left out')
+  assert.equal(poster.fills[0].boundVariables, undefined)
+  assert.deepEqual(poster.fills[2].gradientTransform, [[0, 1, 0], [-1, 0, 1]])
+  assert.equal(poster.fills[2].opacity, 0.8)
+  assert.equal(thumb.fills, undefined, 'a lone image fill needs no stack')
 })
 
 test('Bridge exports a node that is an icon itself whole', async () => {

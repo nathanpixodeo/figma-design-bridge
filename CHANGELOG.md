@@ -4,6 +4,37 @@ All notable changes to Figma Design Bridge. Versions follow
 [Semantic Versioning](https://semver.org/); the Claude Code plugin, the
 marketplace entry and both `package.json` files always carry the same number.
 
+## [Unreleased]
+
+Full-screen and full-bleed backgrounds are built as the design draws them.
+
+### Upgrading
+
+- Close Design Bridge in Figma and open it again to load the new plugin. An
+  older plugin still answers, without the places and fill stacks below.
+
+### Added
+
+- `get_design_assets` gives each layer that shows an image the CSS background
+  that draws it there, at any size of the layer: FILL as cover, FIT as contain,
+  CROP as the size and position of the part the designer framed, TILE at its
+  scale. A layer whose fills stack a solid, the image and a gradient gets one
+  declaration for all of them, top first, with blend modes; linear, radial and
+  angular gradients are converted, and what CSS cannot draw, such as a diamond
+  gradient, image filters or a turned image, is named with a render to compare.
+- Each image layer has its place from the top left of the node read. A layer
+  as large as the node is named as its full-bleed background, and one as wide
+  as the node as a full-bleed band.
+- Icons and images left out at `maxBytes` are read again, up to 10 of them,
+  each by its own layer, so a large page sends every file it can.
+
+### Fixed
+
+- `get_design_context` kept the crop, tile scale, rotation and filters of an
+  image fill only on layers small enough to export whole. A full-screen frame,
+  read layer by layer, lost them, and its background image read as one that
+  fills the frame.
+
 ## [1.6.0] - 2026-10-26
 
 Icons, images and a rendered view come from the design itself.

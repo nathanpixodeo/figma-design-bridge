@@ -19,6 +19,7 @@ const createSnapshotStore = require("./snapshot-store.js");
 const createLegacyRoutes = require("./legacy-routes.js");
 const { prepareDataDir, readConfig } = require("./data-dir.js");
 const { READ_TOOLS } = require("./tool-policy.js");
+const { fillsBackground, imagePlacement } = require("./paint-css.js");
 const { version: PACKAGE_VERSION } = require("./package.json");
 
 const fileConfig = readConfig({ log: message => log(message) });
@@ -484,6 +485,8 @@ const INLINE_RENDER_CHARS = 50000;
 // Claude sees an image at up to about this many pixels on its long side.
 const VISION_SIDE = 1568;
 const ASSETS_LISTED = 15;
+// Assets left out by maxBytes are read again one by one, up to this many.
+const LEFT_OUT_READS = 10;
 
 const ASSETS_OUTDATED = "The bridge that answered is older than this MCP server and cannot export icons, images or renders. "
   + "Close every agent session so the bridge restarts on the new version, then ask the user to close and reopen Design Bridge in Figma.";
@@ -493,9 +496,12 @@ const ICON_GUIDE = "Each icon is Figma's own SVG export of its layer, the markup
   + "from vector paths or take a look-alike from an icon library. To color an icon from CSS, change only its fill "
   + "or stroke colors to currentColor.";
 
-const IMAGE_GUIDE = "Each image is the original file placed in the design. A layer shows it as its scale mode says: "
-  + "FILL is object-fit: cover and FIT is object-fit: contain, both centered. CROP, TILE, rotation and filters "
-  + "change what the layer shows.";
+const IMAGE_GUIDE = "Each image is the original file placed in the design. Each layer that shows it comes with "
+  + "its CSS, which places the image as Figma does at any size of the layer: FILL is cover and FIT is contain, both "
+  + "centered, CROP keeps the part of the file the designer framed and TILE repeats it. A layer with several fills "
+  + "gets one background for all of them, top first, as Figma stacks them. Copy the file into the project, change "
+  + "only the url, and give the element the layer's size and place: positions are from the top left of the node "
+  + "read. Do not show the file at its own size with an <img>, and do not drop the solids and gradients drawn over it.";
 
 // Saved files go under the data directory, one folder per Figma file.
 function assetDir(kind, fileKey) {
@@ -532,30 +538,97 @@ const sizeOf = item => (Number.isFinite(item?.width) && Number.isFinite(item?.he
 const layerName = layer => `"${layer.name ?? ""}" (${layer.id})${layer.path ? ` in ${layer.path}` : ""}`;
 const svgMarkup = item => item.svg ?? (typeof item.svgBase64 === "string" ? Buffer.from(item.svgBase64, "base64").toString("utf8") : null);
 
-// Figma lists every filter of an image paint, most of them 0.
-function activeFilters(filters) {
-  if (!filters || typeof filters !== "object") return {};
-  return Object.fromEntries(Object.entries(filters).filter(([, value]) => value !== 0));
+// Where a layer sits in the node read, and whether it is that node's
+// background: a layer as large as the node read is laid out with the page,
+// not at its image's size.
+function layerPlace(layer, root) {
+  if (!Number.isFinite(layer.x) || !Number.isFinite(layer.y)) return { at: "", span: "" };
+  const at = ` at ${layer.x},${layer.y}`;
+  const near = (value, target) => Math.abs(value - target) <= 1;
+  if (!Number.isFinite(root?.width) || !Number.isFinite(root?.height) || !near(layer.x, 0) || !near(layer.width, root.width)) {
+    return { at, span: "" };
+  }
+  if (near(layer.y, 0) && near(layer.height, root.height)) {
+    return { at, span: ` It covers the whole node read (${sizeOf(root)}): a full-bleed background. Size it with its `
+      + "section, such as the full width of the viewport, not with its file." };
+  }
+  return { at, span: " It spans the full width of the node read: a full-bleed band." };
 }
 
-// FILL and FIT are object-fit: cover and contain; anything else changes what
-// the layer shows of the file.
-function reshapesImage(layer) {
-  return !["FILL", "FIT", null, undefined].includes(layer.scaleMode)
-    || Boolean(layer.rotation) || Object.keys(activeFilters(layer.filters)).length > 0;
-}
-
-function imageLayer(layer) {
-  const details = [sizeOf(layer), layer.scaleMode || "FILL"];
+// One layer showing an image, with the CSS that draws it there. `files` names
+// each image's saved file by its hash.
+function imageLayer(layer, { image, root, files }) {
+  const details = [`${sizeOf(layer)}${layerPlace(layer, root).at}`, layer.scaleMode || "FILL"];
   if (layer.cornerRadius) details.push(`corner radius ${layer.cornerRadius}`);
-  if (layer.opacity !== undefined) details.push(`opacity ${layer.opacity}`);
-  if (layer.rotation) details.push(`rotated ${layer.rotation} degrees`);
-  if (layer.scaleMode === "TILE" && layer.scalingFactor !== undefined) details.push(`tile scale ${layer.scalingFactor}`);
-  if (layer.scaleMode === "CROP" && layer.imageTransform) details.push(`imageTransform ${JSON.stringify(layer.imageTransform)}`);
-  const filters = activeFilters(layer.filters);
-  if (Object.keys(filters).length) details.push(`filters ${JSON.stringify(filters)}`);
-  const render = reshapesImage(layer) ? ". Render this layer with get_design_image to see what it shows" : "";
-  return `${layerName(layer)}: ${details.join(", ")}${render}`;
+  const lines = [`- Shown by ${layerName(layer)}: ${details.join(", ")}.${layerPlace(layer, root).span}`];
+  const box = { width: layer.width, height: layer.height };
+  if (image.kind === "VIDEO" || !(box.width > 0 && box.height > 0)) return lines.join("\n");
+
+  const urlFor = hash => `url("${files.get(hash) ?? hash}")`;
+  const own = imagePlacement(layer, urlFor(image.hash), box, image);
+  const stack = Array.isArray(layer.fills) && layer.fills.length > 1
+    ? fillsBackground(layer.fills, box, { urlFor, imageFor: hash => (hash === image.hash ? image : null) })
+    : null;
+  lines.push(stack
+    ? `  - CSS for its ${layer.fills.length} fills, top first: \`${stack.css}\``
+    : `  - CSS: \`background: ${own.css};\``);
+  if (own.img) lines.push(`  - As an <img>, in a box with position: relative and overflow: hidden: \`position: absolute; ${own.img};\``);
+  const notes = [...new Set([...own.notes, ...(stack?.notes ?? [])])];
+  if (notes.length) lines.push(`  - Note: ${notes.join("; ")}.`);
+  if (!own.exact || (stack && !stack.exact)) lines.push("  - Render this layer with get_design_image to see what it shows.");
+  return lines.join("\n");
+}
+
+// The layer to read an image alone by: a shape drawing it rather than a frame
+// that also holds other images, which could fill maxBytes again.
+function leftOutLayer(layers) {
+  const container = layer => ["FRAME", "GROUP", "SECTION", "COMPONENT", "COMPONENT_SET", "INSTANCE"].includes(layer.type);
+  const area = layer => (layer.width || 0) * (layer.height || 0);
+  return [...layers].sort((left, right) => container(left) - container(right) || area(left) - area(right))[0];
+}
+
+// Reads the icons and images an asset read left out at maxBytes again, each by
+// one of its layers, and puts what comes back into the first read.
+async function readLeftOut(result, readNode) {
+  const icons = (result.payload?.icons || []).filter(icon => icon.truncated && !icon.exportError);
+  const images = (result.payload?.images || []).filter(image => image.truncated && image.kind !== "VIDEO"
+    && Array.isArray(image.layers) && image.layers.length
+    && !(Math.ceil(image.byteLength / 3) * 4 > ASSET_READ.maxBytes));
+  const wanted = [
+    ...icons.map(icon => ({
+      item: icon, id: icon.id, ids: [icon.id], fields: ["svg", "svgBase64"],
+      find: alone => (alone.icons || []).find(found => found.id === icon.id && svgMarkup(found) !== null),
+    })),
+    ...images.map(image => ({
+      item: image, id: leftOutLayer(image.layers).id, ids: image.layers.map(layer => layer.id), fields: ["base64"],
+      find: alone => (alone.images || []).find(found => found.hash === image.hash && typeof found.base64 === "string"),
+    })),
+  ].slice(0, LEFT_OUT_READS);
+  const got = new Set();
+  for (const { item, id, ids, fields, find } of wanted) {
+    let match = null;
+    try {
+      const alone = await readNode(id);
+      if (alone?.format === "assets") match = find(alone.payload || {});
+    } catch {
+      // It stays listed as not sent, to read alone.
+    }
+    if (!match) continue;
+    for (const field of fields) if (match[field] !== undefined) item[field] = match[field];
+    delete item.truncated;
+    ids.forEach(layerId => got.add(layerId));
+  }
+  const completeness = result.completeness;
+  if (got.size && Array.isArray(completeness?.truncatedNodeIds)) {
+    completeness.truncatedNodeIds = completeness.truncatedNodeIds.filter(id => !got.has(id));
+  }
+}
+
+// The same link pointing at another layer.
+function nodeSource(source, nodeId) {
+  const url = new URL(source);
+  url.searchParams.set("node-id", /^\d+:\d+$/.test(nodeId) ? nodeId.replace(":", "-") : nodeId);
+  return url.toString();
 }
 
 // Saves every icon and image an asset read sent, and lists them with where
@@ -597,18 +670,29 @@ function describeAssets(result) {
     }
   });
 
+  // Every file is saved first, so a layer's CSS can name the other images
+  // stacked in its fills.
+  const files = new Map();
+  for (const image of images) {
+    if (image.kind === "VIDEO" || typeof image.base64 !== "string") continue;
+    const bytes = Buffer.from(image.base64, "base64");
+    const name = /^[0-9a-f]{8,64}$/i.test(image.hash) ? image.hash.toLowerCase() : sha1(bytes);
+    const file = `${name}.${imageExtension(bytes)}`;
+    fs.writeFileSync(path.join(dir, file), bytes);
+    files.set(image.hash, file);
+  }
+  const root = { width: result.payload?.width, height: result.payload?.height };
+
   if (images.length) out.push("", "## Images", "", IMAGE_GUIDE);
   images.forEach((image, index) => {
     const layers = Array.isArray(image.layers) ? image.layers : [];
     if (image.kind === "VIDEO") {
       out.push("", `### ${index + 1}. Video`, "", "- Its file is not exported. Render a layer that shows it with get_design_image for a still.");
-    } else if (typeof image.base64 === "string") {
-      const bytes = Buffer.from(image.base64, "base64");
-      const ext = imageExtension(bytes);
-      const name = /^[0-9a-f]{8,64}$/i.test(image.hash) ? image.hash.toLowerCase() : sha1(bytes);
-      const file = path.join(dir, `${name}.${ext}`);
-      fs.writeFileSync(file, bytes);
-      out.push("", `### ${index + 1}. Image ${sizeOf(image)} ${ext.toUpperCase()}, ${formatBytes(bytes.length)}`, "", `- File: ${file}`);
+    } else if (files.has(image.hash)) {
+      const file = files.get(image.hash);
+      const bytes = Buffer.byteLength(image.base64, "base64");
+      out.push("", `### ${index + 1}. Image ${sizeOf(image)} ${path.extname(file).slice(1).toUpperCase()}, ${formatBytes(bytes)}`,
+        "", `- File: ${path.join(dir, file)}`);
     } else {
       out.push("", `### ${index + 1}. Image ${sizeOf(image)}, ${formatBytes(image.byteLength)}`, "");
       if (image.exportError) {
@@ -620,7 +704,7 @@ function describeAssets(result) {
           : "- Not sent: the answer reached maxBytes. Read it alone: the same link with the id of a layer below as node-id.");
       }
     }
-    for (const layer of layers.slice(0, ASSETS_LISTED)) out.push(`- Shown by ${imageLayer(layer)}`);
+    for (const layer of layers.slice(0, ASSETS_LISTED)) out.push(imageLayer(layer, { image, root, files }));
     if (layers.length > ASSETS_LISTED) out.push(`- And ${layers.length - ASSETS_LISTED} more layers`);
   });
 
@@ -744,14 +828,14 @@ async function startMCP() {
       },
       {
         name: "get_design_assets",
-        description: "Export every icon and image inside a Figma node (a link with node-id) through the connected Figma plugin. An icon is a layer drawn only with vector shapes, such as an icon component, a logo mark or an arrow: it comes as Figma's own SVG export, the markup Copy as SVG gives, with its exact size, colors, strokes and clipping. The same icon used by several layers is listed once with each of them. An image fill comes as its original file, with how each layer shows it (size, scale mode, crop, corner radius). Every file is saved under the bridge's data directory and its path listed. Use these instead of redrawing icons from vector paths or picking look-alikes from an icon library.",
+        description: "Export every icon and image inside a Figma node (a link with node-id) through the connected Figma plugin. An icon is a layer drawn only with vector shapes, such as an icon component, a logo mark or an arrow: it comes as Figma's own SVG export, the markup Copy as SVG gives, with its exact size, colors, strokes and clipping. The same icon used by several layers is listed once with each of them. An image fill comes as its original file, with each layer that shows it: its size and place in the node, and the exact CSS background that draws it there, as cover, contain, crop or tile, stacked with the solids and gradients of the same layer. A layer as large as the node is named as its full-bleed background. Every file is saved under the bridge's data directory and its path listed. Use these instead of redrawing icons from vector paths, picking look-alikes from an icon library or placing images by eye.",
         _meta: INLINE_RESULT_META,
         inputSchema: {
           type: "object",
           properties: {
             source: { type: "string", description: "Figma link that includes node-id: the frame, component or layer whose icons and images to export." },
             mode: SOURCE_PROPERTIES.mode,
-            maxBytes: { type: "integer", minimum: 1024, maximum: 10000000, description: "Most bytes of SVG and image data to send (default 10000000). An icon or image past it is named with its layer id, to read alone." },
+            maxBytes: { type: "integer", minimum: 1024, maximum: 10000000, description: "Most bytes of SVG and image data to send (default 10000000). Up to 10 icons or images past it are read again alone; any more are named with a layer id, to read alone." },
             timeoutMs: TIMEOUT_PROPERTY,
             fresh: FRESH_PROPERTY,
           },
@@ -875,15 +959,17 @@ async function startMCP() {
       case "get_design_assets": {
         if (!args?.source) return err('Missing required parameter "source"');
         try {
-          const result = await withBridge(client => client.read({
-            source: args.source,
+          const read = (source, maxBytes) => withBridge(client => client.read({
+            source,
             mode: args.mode || "live",
             timeoutMs: readTimeoutFromArgs(args),
-            options: { representation: "assets", ...ASSET_READ, ...(args.maxBytes !== undefined && { maxBytes: args.maxBytes }) },
+            options: { representation: "assets", ...ASSET_READ, ...(maxBytes !== undefined && { maxBytes }) },
             fresh: args.fresh === true,
           }));
+          const result = await read(args.source, args.maxBytes);
           if (!result?.nodeId) return err(indexOnly("Exporting icons and images"));
           if (result.format !== "assets") return err(ASSETS_OUTDATED);
+          await readLeftOut(result, nodeId => read(nodeSource(args.source, nodeId)));
           return ok(describeAssets(result));
         } catch (error) {
           return err(describeError(error, { read: true }));

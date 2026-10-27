@@ -57,7 +57,7 @@ Read every path in the arguments in full. Follow imports far enough to resolve w
 4. **Spacing and size** — padding, gap, margin, width and height constraints, border radius, and border width.
 5. **State** — hover, focus, active, disabled, loading, error, and selected.
 6. **Responsive behaviour** — how the design's constraints map to the code's breakpoints, wrapping, and overflow.
-7. **Icons and images** — each icon against the SVG `get_design_assets` exported for it: viewBox, rendered size, fill and stroke colors, stroke width and shape. An icon drawn by hand, rebuilt from vector paths or taken from an icon library instead of the exported SVG is a **Major** finding, even when it looks close. Each image uses the exported file, at the layer's size, scale mode (FILL is `object-fit: cover`, FIT is `contain`) and corner radius.
+7. **Icons and images** — each icon against the SVG `get_design_assets` exported for it: viewBox, rendered size, fill and stroke colors, stroke width and shape. An icon drawn by hand, rebuilt from vector paths or taken from an icon library instead of the exported SVG is a **Major** finding, even when it looks close. Each image uses the exported file, drawn as the CSS `get_design_assets` gives for its layer: the crop, position and size of the image, and the solids and gradients stacked with it. A layer named as a full-bleed background or band spans its section, such as the full viewport width; one built at the size of its file or of the content column is a **Major** finding.
 
 Also flag accessibility gaps the design implies but the code drops: focus visibility, contrast against the actual background, alt text, and semantic element choice.
 
