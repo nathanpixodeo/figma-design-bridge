@@ -18,6 +18,9 @@ const READ_TOOLS = Object.freeze([
   'get_bridge_status',
 ])
 
+// The two tools that always ask.
+const ASK_TOOLS = Object.freeze(['approve_figma_pairing', 'sync_figma_design'])
+
 const APPROVAL_MODES = Object.freeze(['auto', 'manual'])
 
 // Anything but "manual" is auto: a typo must not start prompting on every read,
@@ -27,4 +30,4 @@ function approvalsMode(config = {}) {
   return String(config.approvals ?? '').trim().toLowerCase() === 'manual' ? 'manual' : 'auto'
 }
 
-module.exports = { READ_TOOLS, APPROVAL_MODES, approvalsMode }
+module.exports = { READ_TOOLS, ASK_TOOLS, APPROVAL_MODES, approvalsMode }

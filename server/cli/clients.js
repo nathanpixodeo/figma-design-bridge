@@ -1,21 +1,24 @@
 // Sets up the AI clients that use the bridge: Claude Code and Codex install it
-// as a plugin from this package's own marketplace, agy registers its MCP server.
-// Each step is safe to repeat, so setup also serves as the update: it keeps
-// what the user changed since, such as a plugin turned off or a server's env.
+// as a plugin from this package's own marketplace, agy and Gemini CLI register
+// its MCP server. Each step is safe to repeat, so setup also serves as the
+// update: it keeps what the user changed since, such as a plugin turned off or
+// a server's env.
 
 const fs = require('fs')
 const os = require('os')
 const path = require('path')
 const { run, failure, parseJson } = require('./run')
-const { READ_TOOLS } = require('../tool-policy')
+const { READ_TOOLS, ASK_TOOLS } = require('../tool-policy')
 const { samePath } = require('../data-dir')
 
 const PLUGIN = 'figma-bridge'
 const MARKETPLACE = 'figma-design-bridge'
 const PLUGIN_ID = `${PLUGIN}@${MARKETPLACE}`
-// The server name the plugin manifest declares, and the one agy registers.
+// The server name the plugin manifest declares, and the one agy and Gemini CLI
+// register.
 const PLUGIN_SERVER = 'bridge'
 const AGY_SERVER = 'figma-bridge'
+const GEMINI_SERVER = 'figma-bridge'
 const SDK_MARKER = path.join('node_modules', '@modelcontextprotocol', 'sdk', 'package.json')
 // The first version whose plugin carries the approvals hook.
 const HOOK_VERSION = '1.4.0'
@@ -41,6 +44,24 @@ function agySettingsPath(ctx) {
 
 function agyServersPath(ctx) {
   return path.join(homeOf(ctx), '.gemini', 'config', 'mcp_config.json')
+}
+
+// The Claude Code profile in use: CLAUDE_CONFIG_DIR, or ~/.claude.
+function claudeSettingsPath(ctx) {
+  return path.join(ctx.env.CLAUDE_CONFIG_DIR || path.join(homeOf(ctx), '.claude'), 'settings.json')
+}
+
+// GEMINI_CLI_HOME stands in for the home folder that holds .gemini.
+function geminiDir(ctx) {
+  return path.join(ctx.env.GEMINI_CLI_HOME || homeOf(ctx), '.gemini')
+}
+
+function geminiSettingsPath(ctx) {
+  return path.join(geminiDir(ctx), 'settings.json')
+}
+
+function geminiPolicyPath(ctx) {
+  return path.join(geminiDir(ctx), 'policies', `${GEMINI_SERVER}.toml`)
 }
 
 function versionBelow(version, floor) {
@@ -107,6 +128,20 @@ function formatJson(value, before) {
   return JSON.stringify(value, null, 2).replace(/\n/g, newline) + newline
 }
 
+// Adds rules to the permissions.allow list of a client's JSON settings, or
+// takes them out again, leaving the user's own rules where they are. Returns
+// whether the file changed.
+function setAllowRules(file, rules, on) {
+  const text = readText(file)
+  const settings = parseJsonFile(file, text)
+  const permissions = settings.permissions && typeof settings.permissions === 'object' ? settings.permissions : {}
+  const before = Array.isArray(permissions.allow) ? permissions.allow : []
+  const allow = on ? before.concat(rules.filter(rule => !before.includes(rule))) : before.filter(rule => !rules.includes(rule))
+  if (allow.length === before.length) return false
+  writeText(file, formatJson({ ...settings, permissions: { ...permissions, allow } }, text))
+  return true
+}
+
 // A marketplace kept in a folder that no longer exists, such as a deleted
 // clone or a Node.js version that was removed, cannot be refreshed.
 function goneLocalSource(folder) {
@@ -114,6 +149,9 @@ function goneLocalSource(folder) {
 }
 
 // ── Claude Code ───────────────────────────────────────────
+
+// Claude Code names a plugin's MCP tools mcp__plugin_<plugin>_<server>__<tool>.
+const CLAUDE_ALLOW = READ_TOOLS.map(tool => `mcp__plugin_${PLUGIN}_${PLUGIN_SERVER}__${tool}`)
 
 const claude = {
   key: 'claude',
@@ -175,13 +213,14 @@ const claude = {
       : null
   },
 
-  // Reads go through the plugin's PreToolUse hook, which follows config.json at
-  // every call, so there is nothing to write. setup reports an old plugin itself.
+  // The plugin's PreToolUse hook lets reads through while config.json says
+  // auto, but only where Claude Code runs it, so the profile's settings allow
+  // them too. Ask is the default for any other tool, so manual takes the rules
+  // out and adds nothing.
   applyApprovals(mode, ctx) {
-    const plugin = this.installed(ctx)
-    if (!plugin) return ['plugin not set up: run `figma-bridge setup --only claude`']
-    const old = this.hookWarning(plugin)
-    return old ? [old] : []
+    const file = claudeSettingsPath(ctx)
+    if (!setAllowRules(file, CLAUDE_ALLOW, mode === 'auto')) return []
+    return [mode === 'manual' ? `${file}: design reads ask again` : `${file}: design reads run without asking`]
   },
 }
 
@@ -444,7 +483,7 @@ const codex = {
 const AGY_ALLOW = READ_TOOLS.map(tool => `mcp(${AGY_SERVER}/${tool})`)
 // Ask outranks allow in agy, so a broad allow rule such as mcp(*) cannot let
 // pairing or a REST sync through.
-const AGY_ASK = ['approve_figma_pairing', 'sync_figma_design'].map(tool => `mcp(${AGY_SERVER}/${tool})`)
+const AGY_ASK = ASK_TOOLS.map(tool => `mcp(${AGY_SERVER}/${tool})`)
 
 const agy = {
   key: 'agy',
@@ -499,7 +538,80 @@ const agy = {
   },
 }
 
-const CLIENTS = [claude, codex, agy]
+// ── Gemini CLI ────────────────────────────────────────────
+
+// Gemini CLI's policy engine reads every .toml file in ~/.gemini/policies, and
+// this one belongs to the bridge, so approvals rewrites it whole. Its rules sit
+// in the user tier, above Gemini CLI's built-in ones, so pairing and a REST
+// sync ask even where a broader rule allows every tool.
+function geminiPolicy(mode) {
+  const rule = (tools, decision, priority) => [
+    '[[rule]]',
+    `mcpName = "${GEMINI_SERVER}"`,
+    `toolName = [${tools.map(tool => `"${tool}"`).join(', ')}]`,
+    `decision = "${decision}"`,
+    `priority = ${priority}`,
+    '',
+  ]
+  return [
+    '# Written by `figma-bridge approvals`, which replaces this file: change the',
+    '# mode with that command rather than here.',
+    '',
+    ...(mode === 'auto' ? rule(READ_TOOLS, 'allow', 100) : []),
+    ...rule(ASK_TOOLS, 'ask_user', 900),
+  ].join('\n')
+}
+
+const gemini = {
+  key: 'gemini',
+  label: 'Gemini CLI',
+  command: 'gemini',
+
+  installed(ctx) {
+    const file = geminiSettingsPath(ctx)
+    const servers = parseJsonFile(file, readText(file)).mcpServers
+    return Boolean(servers && typeof servers === 'object' && servers[GEMINI_SERVER])
+  },
+
+  // The server goes in the user settings, which `gemini mcp add` only writes
+  // with --scope user. Written here directly, an entry that exists keeps its
+  // env and other settings and only gets its path changed.
+  setup(ctx) {
+    const entry = path.join(ctx.pkgDir, 'server', 'mcp.mjs')
+    const file = geminiSettingsPath(ctx)
+    const text = readText(file)
+    const settings = parseJsonFile(file, text)
+    const servers = settings.mcpServers && typeof settings.mcpServers === 'object' ? settings.mcpServers : {}
+    const current = servers[GEMINI_SERVER]
+    const args = current && Array.isArray(current.args) ? current.args : []
+    if (current && current.command === 'node' && args.length === 1 && samePath(args[0], entry)) {
+      return [`the ${GEMINI_SERVER} MCP server already runs node ${entry}`]
+    }
+    const next = { ...settings, mcpServers: { ...servers, [GEMINI_SERVER]: { ...current, command: 'node', args: [entry] } } }
+    writeText(file, formatJson(next, text))
+    return [
+      current
+        ? `pointed the ${GEMINI_SERVER} MCP server at node ${entry}, keeping its other settings`
+        : `registered the ${GEMINI_SERVER} MCP server (node ${entry})`,
+      'restart running Gemini CLI sessions to load it',
+    ]
+  },
+
+  status(ctx) {
+    return this.installed(ctx) ? 'MCP server registered' : 'not set up'
+  },
+
+  applyApprovals(mode, ctx) {
+    const file = geminiPolicyPath(ctx)
+    const text = geminiPolicy(mode)
+    if (readText(file) === text) return []
+    fs.mkdirSync(path.dirname(file), { recursive: true })
+    fs.writeFileSync(file, text)
+    return [mode === 'manual' ? `${file}: design reads ask again` : `${file}: design reads run without asking`]
+  },
+}
+
+const CLIENTS = [claude, codex, agy, gemini]
 
 module.exports = {
   CLIENTS,
@@ -512,4 +624,6 @@ module.exports = {
   MARKETPLACE,
   AGY_ALLOW,
   AGY_ASK,
+  CLAUDE_ALLOW,
+  geminiPolicy,
 }

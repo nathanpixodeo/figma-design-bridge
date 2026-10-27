@@ -1,8 +1,8 @@
 # Codex CLI
 
 Codex installs Figma Design Bridge as a plugin, from the same marketplace as
-Claude Code. One command sets it up, along with Claude Code and agy if they are
-installed:
+Claude Code. One command sets it up, along with Claude Code, agy and Gemini CLI
+if they are installed:
 
 ```bash
 npx -y @pixodeo/figma-bridge@latest setup
@@ -26,7 +26,7 @@ and approve the code it shows with the `approve_figma_pairing` tool or
 `figma-bridge pair <code>`. Only `sync_figma_design`, which pulls a Figma URL
 through the REST API, needs `FIGMA_ACCESS_TOKEN` in the server's environment.
 
-No data directory needs configuring. Codex, Claude Code, agy and
+No data directory needs configuring. Codex, Claude Code, agy, Gemini CLI and
 `figma-bridge start` all keep the token and the cache in the same per-user
 directory (see [Where data lives](../../README.md#where-data-lives)), so the
 Figma plugin stays paired whichever of them runs the bridge.
@@ -41,7 +41,8 @@ tool ask:
 figma-bridge approvals manual
 ```
 
-It writes this table into `$CODEX_HOME/config.toml`;
+The command sets the other clients on the machine at the same time; see
+[Approvals](../../README.md#approvals). For Codex, it writes this table into `$CODEX_HOME/config.toml`;
 `figma-bridge approvals auto` removes it again. The first time setup changes
 the file, it keeps the file as it was in `config.toml.figma-bridge.bak`.
 

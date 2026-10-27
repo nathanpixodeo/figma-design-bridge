@@ -100,9 +100,10 @@ Design content can contain text written to steer an agent. Approvals do not
 change what such text can reach: a read returns it to the agent either way, and
 pairing still needs a code the user reads from the Figma panel.
 
-`figma-bridge setup` changes the following. `figma-bridge approvals` changes only
-`approvals` in `config.json`, `default_tools_approval_mode` in Codex and the agy
-permission rules.
+`figma-bridge setup` changes the following. `figma-bridge approvals`, and
+`/figma-bridge:approvals` in Claude Code, which runs it, change only `approvals`
+in `config.json`, the bridge's rules in the Claude Code and agy settings,
+`default_tools_approval_mode` in Codex and the Gemini CLI policy file.
 
 - The [data directory](#what-this-software-exposes): `approvals` in
   `config.json`, and `bridge-token.json` when there is no token yet.
@@ -113,6 +114,10 @@ permission rules.
 - agy: the `figma-bridge` server in `~/.gemini/config/mcp_config.json`, through
   `agy mcp add` the first time. Later runs change only its command and
   arguments, and keep its environment and whether it is turned off.
+- Claude Code: the `mcp__plugin_figma-bridge_bridge__<tool>` rules for the ten
+  read tools in `permissions.allow` of `settings.json` in the profile in use
+  (`CLAUDE_CONFIG_DIR`, or `~/.claude`). Rules of your own stay where they
+  are, and `manual` removes only these.
 - `$CODEX_HOME/config.toml`: `default_tools_approval_mode` for this bridge's
   server, and `enabled = false` put back on the plugin when it was off before
   `codex plugin add`. The edit is line by line, so comments and layout stay;
@@ -124,6 +129,12 @@ permission rules.
   in `permissions.allow` and `permissions.ask`. The file is parsed and written
   back as JSON, so its own formatting is not kept; a file that does not parse is
   left alone and reported.
+- Gemini CLI: the `figma-bridge` server in `~/.gemini/settings.json`, written
+  directly the first time; later runs change only its command and arguments
+  and keep its environment. `~/.gemini/policies/figma-bridge.toml` belongs to
+  the bridge and is rewritten whole. Its rules name the `figma-bridge` server
+  only: `auto` allows the read tools, and pairing and sync always ask.
+  `GEMINI_CLI_HOME` moves both files.
 
 The first time setup changes one of these files, it keeps the file as it was
 next to it, with `.figma-bridge.bak` added to the name. Later changes leave that

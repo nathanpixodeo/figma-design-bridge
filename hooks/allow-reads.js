@@ -2,6 +2,8 @@
 // Claude Code PreToolUse hook: allows a bridge read without a permission prompt
 // while approvals is auto. A plugin cannot ship permission rules, but its hook
 // can answer for the tools it owns. The user's own deny and ask rules still win.
+// `figma-bridge approvals` also writes the same reads into the profile's
+// settings.json, for a session where the hook does not run.
 //
 // It prints nothing, so Claude Code asks as usual, for manual, for any tool
 // that is not a read, and on any error.

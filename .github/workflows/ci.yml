@@ -110,7 +110,8 @@ jobs:
               'bin/figma-bridge.js', 'server/cli/index.js', 'server/mcp.mjs', 'server/index.js',
               'plugin/manifest.json', 'plugin/code.js', '.claude-plugin/plugin.json',
               '.claude-plugin/marketplace.json', 'hooks/hooks.json', 'hooks/allow-reads.js',
-              'integrations/claude-code/commands/pair.md', 'README.md', 'LICENSE',
+              'integrations/claude-code/commands/pair.md', 'integrations/claude-code/commands/approvals.md',
+              'README.md', 'LICENSE',
             ]
             const missing = required.filter(file => !files.includes(file))
             if (missing.length) throw new Error('missing from the package: ' + missing.join(', '))

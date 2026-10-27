@@ -44,10 +44,12 @@ It installs the `figma-bridge` command globally, creates the pairing token, and
 sets up every AI client it finds on `PATH`:
 
 - **Claude Code**: installs the `figma-bridge` plugin, which carries the MCP
-  server, the [slash commands](#install-as-a-claude-code-plugin-recommended) and
-  the hook that lets design reads run without a prompt.
+  server, the [slash commands](#in-claude-code) and the hook that lets design
+  reads run without a prompt, and allows those reads in the profile's settings.
 - **Codex**: installs the same plugin.
 - **agy**: registers the `figma-bridge` MCP server and its approval rules.
+- **Gemini CLI**: registers the `figma-bridge` MCP server in
+  `~/.gemini/settings.json` and writes its approval policy.
 
 A client that is not installed is skipped; run `figma-bridge setup` again after
 installing it. Running setup again is always safe: it updates what is already
@@ -79,7 +81,7 @@ link of that file into your AI client. Figma tells the plugin which file it is
 in, so no link has to be pasted into the panel; if your Figma account does not,
 the panel asks for the file's link once per document.
 
-The bridge runs while Claude Code, Codex or agy does; nothing has to be started
+The bridge runs while Claude Code, Codex, agy or Gemini CLI does; nothing has to be started
 by hand. Opened before them, the panel shows **Waiting for the bridge...** and
 connects as soon as a session starts. A plugin installed during a session starts
 with the next one: restart Claude Code (`claude -c` resumes the conversation).
@@ -87,44 +89,82 @@ with the next one: restart Claude Code (`claude -c` resumes the conversation).
 
 ### Commands
 
+#### In a terminal
+
 `figma-bridge` works from any directory.
 
 | Command | Does |
 | --- | --- |
-| `figma-bridge setup [--only claude,codex,agy] [--approvals auto\|manual]` | Sets up the AI clients and the pairing token. Safe to repeat |
+| `figma-bridge setup [--only claude,codex,agy,gemini] [--approvals auto\|manual]` | Sets up the AI clients and the pairing token. Safe to repeat |
 | `figma-bridge status` | Shows the version, the data directory, whether the bridge runs and which Figma files are connected, and each client |
-| `figma-bridge approvals [auto\|manual]` | Shows or sets whether design reads ask before they run. See [Approvals](#approvals) |
+| `figma-bridge approvals [auto\|manual]` | Shows or sets whether design reads ask before they run, in every client on this machine. See [Approvals](#approvals) |
 | `figma-bridge update` | Installs the latest version and runs setup again |
 | `figma-bridge start` | Runs the bridge in this terminal |
 | `figma-bridge mcp` | Runs the MCP server on stdio, for an MCP client configured by hand |
 | `figma-bridge pair <code>` | Approves the Figma plugin that shows this code |
 | `figma-bridge token [--rotate]` | Prints the bridge token for scripts, or replaces it and unpairs every plugin |
 | `figma-bridge import <figma-url>` | Pulls a design through the Figma REST API (needs `FIGMA_ACCESS_TOKEN`) |
+| `figma-bridge --help` | Lists these commands |
+
+#### In Claude Code
+
+The plugin adds these slash commands. Type them in the prompt of any project.
+
+| Command | Does |
+| --- | --- |
+| `/figma-bridge:pair <code>` | Approves the Figma plugin that shows this 6-digit pairing code |
+| `/figma-bridge:approvals [auto\|manual]` | Shows or sets whether design reads ask before they run, like `figma-bridge approvals` |
+| `/figma-bridge:verify <node-url> <paths...>` | Compares front-end code against the design and reports every mismatch |
+| `/figma-bridge:page [summary\|tree\|texts\|colors]` | Shows what is currently in the cache, and how stale it is |
+| `/figma-bridge:sync <figma-url>` | Pulls a file or node through the REST API (needs a Figma token) |
+
+To read a design, paste a Figma node link and ask; the agent calls the
+[MCP tools](#available-mcp-tools) itself. Codex, agy and Gemini CLI have no
+slash commands for the bridge: use the terminal commands above.
 
 ### Approvals
 
-Reading a design changes nothing, so by default (`auto`) Claude Code, Codex and
-agy run the ten read tools — `get_design_*`, `search_design` and
+Reading a design changes nothing, so by default (`auto`) Claude Code, Codex, agy
+and Gemini CLI run the ten read tools — `get_design_*`, `search_design` and
 `get_bridge_status` — without asking. `approve_figma_pairing` hands a Figma
 plugin the bridge token and `sync_figma_design` calls the Figma API, so those two
 always ask. Rules of your own that deny or ask for a tool still apply.
 
-```bash
-figma-bridge approvals manual   # every bridge tool asks again
-figma-bridge approvals auto     # back to the default
+In Claude Code:
+
+```text
+/figma-bridge:approvals          # shows the current mode
+/figma-bridge:approvals manual   # every bridge tool asks again
+/figma-bridge:approvals auto     # back to the default
 ```
+
+In a terminal:
+
+```bash
+figma-bridge approvals           # shows the current mode
+figma-bridge approvals manual
+figma-bridge approvals auto
+```
+
+Both set every client that is on `PATH`, in one step. Run either one on each
+machine; the setting does not travel between machines.
 
 | Client | `auto` | `manual` |
 | --- | --- | --- |
-| Claude Code | The plugin's `PreToolUse` hook allows the read tools | The hook stays silent and Claude Code asks as usual |
+| Claude Code | `mcp__plugin_figma-bridge_bridge__<tool>` rules in `permissions.allow` of the profile's `settings.json` (`~/.claude`, or `CLAUDE_CONFIG_DIR`), and the plugin's `PreToolUse` hook allows the same tools | Those rules are removed, the hook stays silent, and Claude Code asks as usual |
 | Codex | The tools are marked `readOnlyHint`, which Codex runs without asking | `default_tools_approval_mode = "prompt"` for the plugin's server in `config.toml` |
 | agy | `mcp(figma-bridge/<tool>)` rules in `permissions.allow` of `~/.gemini/antigravity-cli/settings.json` | Those rules are removed |
+| Gemini CLI | `~/.gemini/policies/figma-bridge.toml` allows the read tools | The policy file keeps only the rule that asks for pairing and sync |
 
 The mode is stored as `approvals` in `config.json` in the
-[data directory](#where-data-lives). Claude Code reads it at every tool call;
-for Codex and agy the command rewrites their config file. The first time setup
-changes one of those files, it keeps the file as it was next to it, with
-`.figma-bridge.bak` added to the name.
+[data directory](#where-data-lives). The Claude Code hook reads it at every tool
+call; for everything else the command rewrites the file in the table. Each
+Claude Code profile has its own `settings.json`, so with several profiles run
+`/figma-bridge:approvals auto` once in each, or `figma-bridge approvals auto`
+with each `CLAUDE_CONFIG_DIR`. `GEMINI_CLI_HOME` moves Gemini CLI's files the
+same way. Restart sessions that were already running if they keep asking. The
+first time the bridge changes a settings file, it keeps the file as it was next
+to it, with `.figma-bridge.bak` added to the name.
 
 ### Update and uninstall
 
@@ -132,23 +172,24 @@ changes one of those files, it keeps the file as it was next to it, with
 figma-bridge update
 ```
 
-Then restart running Claude Code, Codex and agy sessions, and close and reopen
+Then restart running Claude Code, Codex, agy and Gemini CLI sessions, and close and reopen
 the Design Bridge panel in Figma. The manifest path stays the same, so Figma
 needs no new import. [CHANGELOG.md](CHANGELOG.md) lists what changed.
 
 On Windows, npm cannot replace files that a running program holds open. If the
-update fails with `EPERM` or `EBUSY`, close Claude Code, Codex and agy, stop a
+update fails with `EPERM` or `EBUSY`, close Claude Code, Codex, agy and Gemini CLI, stop a
 `figma-bridge start` that is running, and run `figma-bridge update` again.
 
 Running setup again is also how an install repairs itself. It keeps what you
-changed since: a plugin you turned off stays off, and agy keeps the environment
-you gave its server, such as `FIGMA_ACCESS_TOKEN`. A marketplace whose folder
+changed since: a plugin you turned off stays off, and agy and Gemini CLI keep
+the environment you gave their server, such as `FIGMA_ACCESS_TOKEN`. A marketplace whose folder
 no longer exists, such as a deleted clone, is replaced with this install.
 
 To uninstall, remove the plugin in Figma (**Plugins → Development → Manage
 plugins in development**), then:
 
 ```bash
+figma-bridge approvals manual   # takes the read rules out of the clients' settings
 claude plugin uninstall figma-bridge@figma-design-bridge
 claude plugin marketplace remove figma-design-bridge
 codex plugin remove figma-bridge@figma-design-bridge
@@ -157,6 +198,8 @@ agy mcp remove figma-bridge
 npm uninstall -g @pixodeo/figma-bridge
 ```
 
+For Gemini CLI, delete the `figma-bridge` entry under `mcpServers` in
+`~/.gemini/settings.json`, and the file `~/.gemini/policies/figma-bridge.toml`.
 The [data directory](#where-data-lives) keeps the token and the cache; delete it
 too to remove everything.
 
@@ -297,8 +340,8 @@ On Linux the path comes from the home directory alone, not from
 `XDG_DATA_HOME`: MCP hosts such as Codex pass a server only a few environment
 variables, and every launcher has to arrive at the same directory.
 
-Every launcher uses it: the Claude Code plugin in any profile, Codex, agy and
-every `figma-bridge` command. They share one token, so the Figma plugin pairs
+Every launcher uses it: the Claude Code plugin in any profile, Codex, agy,
+Gemini CLI and every `figma-bridge` command. They share one token, so the Figma plugin pairs
 once per machine, whichever of them holds the port. Set `FIGMA_BRIDGE_DATA_DIR`
 (or, in a clone, `dataDir` in `server/config.json`) only to keep a setup apart
 on purpose; every process that should share it then needs the same value.
@@ -969,23 +1012,19 @@ Figma Design Bridge includes a built-in MCP server (`server/mcp.mjs`) that adds 
 
 `figma-bridge setup` installs the plugin (see [Install](#install)). The package
 is also a Claude Code plugin marketplace, so the plugin registers the MCP server,
-four slash commands and the [approvals](#approvals) hook in one step, for every
-project on the machine. With access to the GitHub repository, Claude Code can
-also install it from there:
+the [slash commands](#in-claude-code) and the [approvals](#approvals) hook in
+one step, for every project on the machine. With access to the GitHub
+repository, Claude Code can also install it from there:
 
 ```bash
 claude plugin marketplace add nathanpixodeo/figma-design-bridge
 claude plugin install figma-bridge@figma-design-bridge
 ```
 
-| Command | Does |
-| --- | --- |
-| `/figma-bridge:verify <node-url> <paths...>` | Compares front-end code against the design and reports every mismatch |
-| `/figma-bridge:page [summary\|tree\|texts\|colors]` | Shows what is currently in the cache, and how stale it is |
-| `/figma-bridge:sync <figma-url>` | Pulls a file or node through the REST API (needs a Figma token) |
-| `/figma-bridge:pair <code>` | Approves the Figma plugin that shows this 6-digit pairing code, so it receives the bridge token without anyone copying it |
+Installed this way, run `/figma-bridge:approvals auto` once so the profile's
+settings allow the read tools too.
 
-The plugin resolves its own paths through `${CLAUDE_PLUGIN_ROOT}`, so nothing breaks when the clone moves. Its MCP server keeps the token and the cached designs in the [shared data directory](#where-data-lives), the same one Codex, agy and `figma-bridge start` use, and on its first start copies over what earlier versions kept in `${CLAUDE_PLUGIN_DATA}`.
+The plugin resolves its own paths through `${CLAUDE_PLUGIN_ROOT}`, so nothing breaks when the clone moves. Its MCP server keeps the token and the cached designs in the [shared data directory](#where-data-lives), the same one Codex, agy, Gemini CLI and `figma-bridge start` use, and on its first start copies over what earlier versions kept in `${CLAUDE_PLUGIN_DATA}`.
 
 The MCP server tries to listen on port 3456, and when it succeeds it is itself the endpoint the Figma plugin talks to — it serves both the Sync commands' `/design` and the `/bridge/*` routes — so install, open the panel in Figma, pair, done. It hosts the bridge while Claude Code runs; in between, the panel waits and reconnects by itself. When `figma-bridge start` or another session already holds the port, the MCP server reuses that bridge: they share the token, so it makes no difference to the Figma plugin which of them runs.
 
@@ -1145,7 +1184,8 @@ claude -p "Based on these text nodes, write better copy for the landing page: $T
 | Problem | Solution |
 |---------|----------|
 | HTTP `401` from `/design` or `/snapshots` | Send the bridge token: `figma-bridge token`, then `-H "Authorization: Bearer <token>"`. In the Figma plugin, press **Pair with bridge**, or paste the token under **Advanced**. |
-| The plugin says "No bridge is running at http://localhost:3456" | Open Claude Code, Codex or agy with the bridge set up, or run `figma-bridge start`, then press **Pair with bridge** again. |
+| An AI client asks before every design read | Run `/figma-bridge:approvals auto` in Claude Code, or `figma-bridge approvals auto` in a terminal, then restart the client's running sessions. `figma-bridge approvals` alone shows the mode; `manual` makes every read ask. |
+| The plugin says "No bridge is running at http://localhost:3456" | Open Claude Code, Codex, agy or Gemini CLI with the bridge set up, or run `figma-bridge start`, then press **Pair with bridge** again. |
 | The panel stays on **Waiting for the bridge...** | Nothing runs at the bridge URL. Open Claude Code with the figma-bridge plugin — restart it if the plugin was installed during the session, and check that `/mcp` lists it — or run `figma-bridge start`. `figma-bridge status` shows what holds the port. The panel connects by itself. |
 | The panel says **Pairing needed** | The bridge refused the saved token: it was rotated, or the bridge keeps its own data directory (older than 1.3.0, or started with `FIGMA_BRIDGE_DATA_DIR`). Press **Pair with bridge**. |
 | **Pair with bridge** says the bridge is too old to pair | The bridge holding the port is older than 1.2.0, while the Figma plugin is newer. An older bridge answered pairing with `Missing or invalid bridge token`. Update whatever runs it: `claude plugin update figma-bridge@figma-design-bridge`, `codex plugin add figma-bridge@figma-design-bridge`, or `git pull` in the clone. Then restart it. `figma-bridge status` shows what holds the port. |
@@ -1163,7 +1203,7 @@ claude -p "Based on these text nodes, write better copy for the landing page: $T
 | `figma-bridge start` says a bridge "uses another data directory" | A launcher that keeps its own data directory, or a version older than 1.3.0, holds port 3456 and would keep the Figma plugin on a different token. Stop or update it, then run `figma-bridge start` again. When the running bridge shares the data directory, `figma-bridge start` just says it is not needed. |
 | `get_design_context` returns `TIMEOUT` | Reads of one file take turns in the plugin, and the error says how many were ahead. Figma also loads a large page slowly the first time it is read. Retry: a read the plugin was already working on answers the retry when it finishes. Otherwise pass a larger `timeoutMs` (up to 120000) or a smaller `depth` or `maxNodes`, and keep the panel open. |
 | A read says `pluginOutdated: true`, or that Design Bridge is too old to export REST JSON | The panel open in Figma runs a plugin older than 1.5.0, which reads its own way and can miss attributes such as per-corner radii. Close Design Bridge and open it again: Figma loads the plugin's code anew. With a clone, `git pull` first. |
-| A read says the bridge is older than the MCP server | Every agent session shares the bridge the first one started, and that one runs an older version. Close every Claude Code, Codex and agy session so the next one starts the new bridge, then reopen Design Bridge in Figma. |
+| A read says the bridge is older than the MCP server | Every agent session shares the bridge the first one started, and that one runs an older version. Close every Claude Code, Codex, agy and Gemini CLI session so the next one starts the new bridge, then reopen Design Bridge in Figma. |
 | Figma's console shows `Plugin runtime aborted` and the panel closes; the read fails with `SESSION_LOST` | The read was too large for the plugin's memory. Reopen Design Bridge, then read one screen frame rather than a section of many screens, or pass a smaller `depth` or `maxNodes`, or `includeHidden: false`. A panel left open for hours is closer to the limit; reopening it starts fresh. |
 | MCP tools return "No design data" | Call `sync_figma_design` with a Figma URL first. |
 

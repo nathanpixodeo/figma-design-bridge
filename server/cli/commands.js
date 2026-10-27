@@ -105,7 +105,7 @@ function installAndSetup(spec, args, ctx) {
   if (installed.status !== 0) {
     // Windows will not replace a file a running process holds open, and a
     // client session keeps the bridge's files open while it runs.
-    const hint = process.platform === 'win32' ? '; if npm reported EPERM or EBUSY, close Claude Code, Codex and agy, then try again' : ''
+    const hint = process.platform === 'win32' ? '; if npm reported EPERM or EBUSY, close Claude Code, Codex, agy and Gemini CLI, then try again' : ''
     throw new SetupError(`npm install --global ${spec} failed: ${failure(installed)}${hint}`)
   }
   const pkgDir = globalPackageDir(ctx)
@@ -124,7 +124,7 @@ function figmaSteps(ctx) {
     '  2. In the file you want to read, run Design Bridge and press Pair with bridge.',
     '  3. Approve the code it shows: figma-bridge pair <code>',
     '     (or /figma-bridge:pair <code> in Claude Code).',
-    'The bridge runs while Claude Code, Codex or agy is open, or with figma-bridge start.',
+    'The bridge runs while Claude Code, Codex, agy or Gemini CLI is open, or with figma-bridge start.',
     'Check everything with: figma-bridge status',
   ]
 }
@@ -151,9 +151,7 @@ async function setup(args, options) {
       continue
     }
     try {
-      // Claude Code's hook reads config.json itself, and setup has just
-      // checked the plugin it runs from.
-      const done = [...client.setup(ctx), ...(client.key === 'claude' ? [] : client.applyApprovals(mode, ctx))]
+      const done = [...client.setup(ctx), ...client.applyApprovals(mode, ctx)]
       ctx.out(`  ${client.label}:`)
       for (const line of done) ctx.out(`    - ${line}`)
     } catch (error) {
@@ -178,7 +176,7 @@ async function describeBridge(port, dataDir, token) {
   const url = `http://127.0.0.1:${port}`
   const probed = await probe(url, { timeoutMs: 2000 })
   if (!probed.ours) {
-    if (probed.reason === 'no-listener') return ['not running (it starts with Claude Code, Codex or agy, or figma-bridge start)']
+    if (probed.reason === 'no-listener') return ['not running (it starts with Claude Code, Codex, agy or Gemini CLI, or figma-bridge start)']
     if (probed.reason === 'timeout') return [`port ${port} accepted the connection but did not answer in time (busy with a large read?)`]
     return [`port ${port} is held by another program (${probed.reason})`]
   }
@@ -233,16 +231,19 @@ async function status(args, options) {
   return 0
 }
 
-async function approvals(args, options) {
+// The Claude Code command /figma-bridge:approvals passes its argument quoted,
+// so no argument arrives as one empty string.
+async function approvals(rawArgs, options) {
   const ctx = context(options)
   const dataDir = describeDataDir({ env: ctx.env }).dataDir
+  const args = rawArgs.map(arg => arg.trim()).filter(Boolean)
   if (!args.length) {
     const mode = approvalsMode(readConfig({ env: ctx.env, dataDir }))
     ctx.out(`Approvals: ${mode}, ${MODE_TEXT[mode]}`)
     ctx.out(`Change it with: figma-bridge approvals ${mode === 'auto' ? 'manual' : 'auto'}`)
     return 0
   }
-  const mode = args[0]
+  const mode = args[0].toLowerCase()
   if (args.length > 1 || !APPROVAL_MODES.includes(mode)) throw new UsageError('Usage: figma-bridge approvals [auto|manual]')
   saveConfig({ approvals: mode }, dataDir)
   ctx.out(`Approvals: ${mode}, ${MODE_TEXT[mode]}`)
@@ -250,9 +251,8 @@ async function approvals(args, options) {
   for (const client of CLIENTS) {
     if (!which(client.command, ctx.env)) continue
     try {
-      const done = client.applyApprovals(mode, ctx)
-      if (!done.length && client.key === 'claude') done.push('the plugin\'s hook follows this from the next tool call')
-      for (const line of done) ctx.out(`  ${client.label}: ${line}`)
+      for (const line of client.applyApprovals(mode, ctx)) ctx.out(`  ${client.label}: ${line}`)
+      if (!client.installed(ctx)) ctx.out(`  ${client.label}: the bridge is not set up here: run \`figma-bridge setup --only ${client.key}\``)
     } catch (error) {
       failed += 1
       ctx.out(`  ${client.label}: FAILED, ${error.message}`)

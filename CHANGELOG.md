@@ -4,6 +4,39 @@ All notable changes to Figma Design Bridge. Versions follow
 [Semantic Versioning](https://semver.org/); the Claude Code plugin, the
 marketplace entry and both `package.json` files always carry the same number.
 
+## [Unreleased]
+
+One command sets approvals in every AI client on the machine, and Gemini CLI
+joins the clients setup knows.
+
+### Upgrading
+
+- Run `figma-bridge update`, then `figma-bridge approvals auto` once on each
+  machine, or `/figma-bridge:approvals auto` in each Claude Code profile. Design
+  reads then run without a prompt even where the plugin's hook does not.
+
+### Added
+
+- `/figma-bridge:approvals [auto|manual]` in Claude Code shows or sets the
+  approvals mode, like `figma-bridge approvals`. Only you can run it: Claude
+  cannot call it to grant itself permissions.
+- `figma-bridge approvals auto` adds rules for the ten read tools to
+  `permissions.allow` in the Claude Code profile's `settings.json`
+  (`CLAUDE_CONFIG_DIR`, or `~/.claude`), and `manual` takes them out again.
+  Rules of your own and the file's line endings stay as they were. Setup does
+  the same.
+- Gemini CLI: `figma-bridge setup` registers the `figma-bridge` MCP server in
+  `~/.gemini/settings.json`, keeping the environment of a server that is
+  already there, and writes `~/.gemini/policies/figma-bridge.toml`. In `auto`
+  the policy allows the read tools; pairing and REST sync always ask. `--only
+  gemini` sets up Gemini CLI alone, and `GEMINI_CLI_HOME` is respected.
+
+### Changed
+
+- `figma-bridge approvals` accepts the mode in any case (`Auto`), and for a
+  client the bridge is not set up in, still sets the mode and names the
+  `figma-bridge setup --only <client>` to run.
+
 ## [1.7.0] - 2026-10-27
 
 Full-screen and full-bleed backgrounds are built as the design draws them.

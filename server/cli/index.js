@@ -29,12 +29,14 @@ const HELP = `Figma Design Bridge ${commands.VERSION}
 Usage: figma-bridge <command> [options]
 
 Setup
-  setup [--only claude,codex,agy] [--approvals auto|manual]
+  setup [--only claude,codex,agy,gemini] [--approvals auto|manual]
                        Install the plugin into Claude Code and Codex, register
-                       the MCP server with agy, and create the pairing token
+                       the MCP server with agy and Gemini CLI, and create the
+                       pairing token
   status               Show the install, the bridge, the token and each client
   approvals [auto|manual]
-                       Show or set whether design reads ask before they run
+                       Show or set whether design reads ask before they run,
+                       in every client on this machine
   update               Install the latest version and run setup again
 
 Bridge

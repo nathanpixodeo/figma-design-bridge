@@ -5,13 +5,16 @@ const os = require('node:os')
 const path = require('node:path')
 
 const { setup, approvals, parseSetupArgs, isTemporaryCopy, UsageError } = require('./commands')
-const { setTomlKey, tomlHeader, ensureDependencies, versionBelow, SetupError, PLUGIN_ID, AGY_ALLOW, AGY_ASK } = require('./clients')
+const {
+  setTomlKey, tomlHeader, ensureDependencies, versionBelow, SetupError, PLUGIN_ID, AGY_ALLOW, AGY_ASK, CLAUDE_ALLOW, geminiPolicy,
+} = require('./clients')
 
 // setup drives the claude, codex and agy command-line tools. Here they are small
 // scripts on PATH that log their arguments and keep what they "installed" in a
 // state file, in a temporary home, so no real client configuration is touched.
 // Like the real ones, `codex plugin add` turns a plugin back on and `agy mcp add`
-// replaces a server's whole entry.
+// replaces a server's whole entry. Gemini CLI only has to be on PATH: setup
+// writes its settings itself.
 
 const FAKE = `
 const fs = require('fs')
@@ -71,7 +74,7 @@ function envWith(overrides) {
   return { ...env, ...overrides }
 }
 
-function sandbox(t, { clients = ['claude', 'codex', 'agy'], state = {} } = {}) {
+function sandbox(t, { clients = ['claude', 'codex', 'agy', 'gemini'], state = {} } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'figma-bridge-setup-'))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   const home = path.join(root, 'home')
@@ -105,6 +108,7 @@ function sandbox(t, { clients = ['claude', 'codex', 'agy'], state = {} } = {}) {
     CODEX_HOME: path.join(home, '.codex'),
   })
   delete env.CLAUDE_CONFIG_DIR
+  delete env.GEMINI_CLI_HOME
   const lines = []
   // The package sits in the system temporary folder, which setup would take
   // for an npx copy and install globally.
@@ -119,6 +123,9 @@ function sandbox(t, { clients = ['claude', 'codex', 'agy'], state = {} } = {}) {
     codexConfig: path.join(home, '.codex', 'config.toml'),
     agySettings: path.join(home, '.gemini', 'antigravity-cli', 'settings.json'),
     agyServers: path.join(home, '.gemini', 'config', 'mcp_config.json'),
+    claudeSettings: path.join(home, '.claude', 'settings.json'),
+    geminiSettings: path.join(home, '.gemini', 'settings.json'),
+    geminiPolicy: path.join(home, '.gemini', 'policies', 'figma-bridge.toml'),
     state: () => JSON.parse(fs.readFileSync(stateFile, 'utf8')),
     reset: () => { lines.length = 0 },
   }
@@ -155,8 +162,12 @@ test('setup installs into every client it finds and lets reads run without askin
   assert.deepEqual(calls.filter(call => call.startsWith('agy')), [
     `agy mcp add figma-bridge node ${box.entry}`,
   ])
+  assert.deepEqual(calls.filter(call => call.startsWith('gemini')), [])
 
   assert.equal(readJson(path.join(box.dataDir, 'config.json')).approvals, 'auto')
+  assert.deepEqual(readJson(box.claudeSettings), { permissions: { allow: CLAUDE_ALLOW } })
+  assert.deepEqual(readJson(box.geminiSettings), { mcpServers: { 'figma-bridge': { command: 'node', args: [box.entry] } } })
+  assert.equal(fs.readFileSync(box.geminiPolicy, 'utf8'), geminiPolicy('auto'))
   assert.ok(fs.existsSync(path.join(box.dataDir, 'bridge-token.json')))
   // Codex needs no setting for auto: the tools carry readOnlyHint.
   assert.equal(fs.existsSync(box.codexConfig), false)
@@ -169,6 +180,7 @@ test('setup installs into every client it finds and lets reads run without askin
 
   const output = box.lines.join('\n')
   assert.match(output, new RegExp(`installed ${PLUGIN_ID} 9\\.9\\.9`))
+  assert.match(output, /Gemini CLI:\n {4}- registered the figma-bridge MCP server/)
   assert.ok(output.includes(path.join(box.pkgDir, 'plugin', 'manifest.json')))
   assert.ok(!output.includes(fs.readFileSync(path.join(box.dataDir, 'bridge-token.json'), 'utf8').match(/[0-9a-f]{64}/)[0]))
 })
@@ -176,8 +188,8 @@ test('setup installs into every client it finds and lets reads run without askin
 test('running setup again updates instead of installing, and changes no settings', async t => {
   const box = sandbox(t)
   await setup([], box.options)
-  const settings = fs.readFileSync(box.agySettings, 'utf8')
-  const servers = fs.readFileSync(box.agyServers, 'utf8')
+  const files = [box.agySettings, box.agyServers, box.claudeSettings, box.geminiSettings, box.geminiPolicy]
+  const texts = files.map(file => fs.readFileSync(file, 'utf8'))
   const before = box.state().calls.length
   box.reset()
 
@@ -187,11 +199,50 @@ test('running setup again updates instead of installing, and changes no settings
   assert.ok(calls.includes(`claude plugin update ${PLUGIN_ID}`))
   assert.ok(!calls.some(call => call.startsWith('claude plugin marketplace add') || call.startsWith('codex plugin marketplace add')))
   assert.ok(!calls.some(call => call.startsWith('agy')), calls.join('\n'))
-  assert.equal(fs.readFileSync(box.agySettings, 'utf8'), settings)
-  assert.equal(fs.readFileSync(box.agyServers, 'utf8'), servers)
+  assert.deepEqual(files.map(file => fs.readFileSync(file, 'utf8')), texts)
   const output = box.lines.join('\n')
   assert.match(output, /updated figma-bridge@figma-design-bridge to 9\.9\.9/)
-  assert.match(output, /figma-bridge MCP server already runs node/)
+  assert.equal(output.match(/figma-bridge MCP server already runs node/g).length, 2, output)
+})
+
+test('setup moves a Gemini CLI server to this install and keeps its env and the other servers', async t => {
+  const box = sandbox(t, { clients: ['gemini'] })
+  const geminiHome = path.join(box.root, 'gemini home')
+  box.options.env.GEMINI_CLI_HOME = geminiHome
+  const settings = path.join(geminiHome, '.gemini', 'settings.json')
+  const other = { command: 'npx', args: ['other'] }
+  writeFile(settings, JSON.stringify({
+    security: { auth: 'oauth' },
+    mcpServers: { other, 'figma-bridge': { command: 'node', args: ['old/mcp.mjs'], env: { FIGMA_ACCESS_TOKEN: 'figd_x' }, trust: false } },
+  }))
+
+  assert.equal(await setup([], box.options), 0, box.lines.join('\n'))
+  assert.deepEqual(readJson(settings), {
+    security: { auth: 'oauth' },
+    mcpServers: { other, 'figma-bridge': { command: 'node', args: [box.entry], env: { FIGMA_ACCESS_TOKEN: 'figd_x' }, trust: false } },
+  })
+  assert.match(fs.readFileSync(`${settings}.figma-bridge.bak`, 'utf8'), /old\/mcp\.mjs/)
+  assert.equal(fs.readFileSync(path.join(geminiHome, '.gemini', 'policies', 'figma-bridge.toml'), 'utf8'), geminiPolicy('auto'))
+  assert.equal(fs.existsSync(box.geminiSettings), false)
+  assert.match(box.lines.join('\n'), /keeping its other settings/)
+})
+
+test('the Gemini CLI policy allows the reads only in auto, and always asks for pairing and sync', () => {
+  const rule = (tools, decision, priority) => [
+    '[[rule]]',
+    'mcpName = "figma-bridge"',
+    `toolName = [${tools.map(tool => `"${tool}"`).join(', ')}]`,
+    `decision = "${decision}"`,
+    `priority = ${priority}`,
+  ].join('\n')
+  const ask = rule(['approve_figma_pairing', 'sync_figma_design'], 'ask_user', 900)
+  const allow = rule(['get_design_context', 'get_design_assets', 'get_design_image', 'get_design_summary', 'get_design_tree',
+    'get_design_texts', 'get_design_colors', 'search_design', 'get_design_info', 'get_bridge_status'], 'allow', 100)
+
+  assert.ok(geminiPolicy('auto').includes(`${allow}\n\n${ask}\n`), geminiPolicy('auto'))
+  assert.ok(geminiPolicy('manual').endsWith(`\n\n${ask}\n`), geminiPolicy('manual'))
+  assert.ok(!geminiPolicy('manual').includes('decision = "allow"'))
+  assert.match(geminiPolicy('auto'), /^# Written by `figma-bridge approvals`/)
 })
 
 test('setup moves an agy server to this install and keeps its env and on/off state', async t => {
@@ -257,7 +308,7 @@ test('setup replaces a marketplace whose folder is gone', async t => {
   assert.match(box.lines.join('\n'), /no longer exists/)
 })
 
-test('manual makes every tool ask in Codex and agy, and auto undoes it', async t => {
+test('manual makes every tool ask in every client, and auto undoes it', async t => {
   const box = sandbox(t, { state: { codexLegacy: true } })
   writeFile(box.codexConfig, 'model = "gpt"\n\n[mcp_servers.figma-bridge]\ncommand = "node"\n')
 
@@ -268,25 +319,73 @@ test('manual makes every tool ask in Codex and agy, and auto undoes it', async t
   assert.match(toml, new RegExp(`\\[plugins\\."${PLUGIN_ID}"\\.mcp_servers\\.bridge\\]\\ndefault_tools_approval_mode = "prompt"`))
   assert.equal(fs.readFileSync(`${box.codexConfig}.figma-bridge.bak`, 'utf8'), 'model = "gpt"\n\n[mcp_servers.figma-bridge]\ncommand = "node"\n')
   assert.deepEqual(readJson(box.agySettings).permissions, { allow: [], ask: AGY_ASK })
+  // Ask is Claude Code's default, so manual writes nothing there.
+  assert.equal(fs.existsSync(box.claudeSettings), false)
+  assert.equal(fs.readFileSync(box.geminiPolicy, 'utf8'), geminiPolicy('manual'))
   assert.match(box.lines.join('\n'), /codex mcp remove figma-bridge/)
 
   box.reset()
   assert.equal(await approvals(['auto'], box.options), 0, box.lines.join('\n'))
   assert.equal(fs.readFileSync(box.codexConfig, 'utf8'), 'model = "gpt"\n\n[mcp_servers.figma-bridge]\ncommand = "node"\n')
   assert.deepEqual(readJson(box.agySettings).permissions, { allow: AGY_ALLOW, ask: AGY_ASK })
-  assert.match(box.lines.join('\n'), /Claude Code: the plugin's hook follows this/)
+  assert.deepEqual(readJson(box.claudeSettings), { permissions: { allow: CLAUDE_ALLOW } })
+  assert.equal(fs.readFileSync(box.geminiPolicy, 'utf8'), geminiPolicy('auto'))
+  const output = box.lines.join('\n')
+  for (const label of ['Claude Code', 'Codex', 'agy', 'Gemini CLI']) {
+    assert.match(output, new RegExp(`${label}: .* design reads run without asking`), output)
+  }
+  assert.doesNotMatch(output, /not set up here/)
   // The backup still holds the file from before setup first changed it.
   assert.equal(fs.readFileSync(`${box.codexConfig}.figma-bridge.bak`, 'utf8'), 'model = "gpt"\n\n[mcp_servers.figma-bridge]\ncommand = "node"\n')
 })
 
-test('approvals says when the Claude Code plugin is too old for the hook, or missing', async t => {
-  const old = sandbox(t, { clients: ['claude'], state: { claudePlugins: [{ id: PLUGIN_ID, version: '1.3.2', scope: 'user', enabled: true }] } })
-  assert.equal(await approvals(['manual'], old.options), 0)
-  assert.match(old.lines.join('\n'), /Claude Code: plugin 1\.3\.2 predates the approvals hook \(1\.4\.0\); run `figma-bridge update`/)
+test('approvals still sets a client the bridge is not set up in, and says how to set it up', async t => {
+  const box = sandbox(t, { clients: ['claude', 'gemini'] })
 
-  const missing = sandbox(t, { clients: ['claude'] })
-  assert.equal(await approvals(['auto'], missing.options), 0)
-  assert.match(missing.lines.join('\n'), /Claude Code: plugin not set up/)
+  assert.equal(await approvals(['auto'], box.options), 0, box.lines.join('\n'))
+  assert.deepEqual(readJson(box.claudeSettings), { permissions: { allow: CLAUDE_ALLOW } })
+  assert.equal(fs.readFileSync(box.geminiPolicy, 'utf8'), geminiPolicy('auto'))
+  const output = box.lines.join('\n')
+  assert.match(output, /Claude Code: the bridge is not set up here: run `figma-bridge setup --only claude`/)
+  assert.match(output, /Gemini CLI: the bridge is not set up here: run `figma-bridge setup --only gemini`/)
+  assert.doesNotMatch(output, /Codex|agy/)
+})
+
+test('approvals edits only its own rules in the Claude Code profile in use', async t => {
+  const box = sandbox(t, { clients: ['claude'] })
+  const profile = path.join(box.root, 'claude profile')
+  box.options.env.CLAUDE_CONFIG_DIR = profile
+  const settings = path.join(profile, 'settings.json')
+  const mine = { model: 'opus', permissions: { allow: ['Bash(git *)', CLAUDE_ALLOW[0]], deny: ['Bash(rm *)'] } }
+  const original = JSON.stringify(mine, null, 2).replace(/\n/g, '\r\n')
+  writeFile(settings, original)
+
+  assert.equal(await approvals(['Auto'], box.options), 0, box.lines.join('\n'))
+  const text = fs.readFileSync(settings, 'utf8')
+  assert.ok(text.includes('\r\n') && !/[^\r]\n/.test(text), 'changed the line endings')
+  assert.deepEqual(JSON.parse(text), { ...mine, permissions: { allow: ['Bash(git *)', ...CLAUDE_ALLOW], deny: ['Bash(rm *)'] } })
+  assert.equal(fs.readFileSync(`${settings}.figma-bridge.bak`, 'utf8'), original)
+  assert.equal(fs.existsSync(box.claudeSettings), false)
+
+  box.reset()
+  assert.equal(await approvals(['auto'], box.options), 0)
+  assert.equal(fs.readFileSync(settings, 'utf8'), text)
+  assert.doesNotMatch(box.lines.join('\n'), /Claude Code: .*design reads/)
+
+  assert.equal(await approvals(['manual'], box.options), 0)
+  assert.deepEqual(readJson(settings), { ...mine, permissions: { allow: ['Bash(git *)'], deny: ['Bash(rm *)'] } })
+  assert.match(box.lines.join('\n'), /Claude Code: .*settings\.json: design reads ask again/)
+})
+
+test('approvals with no argument shows the mode, and refuses one it does not know', async t => {
+  const box = sandbox(t, { clients: [] })
+
+  // What /figma-bridge:approvals passes when given nothing.
+  assert.equal(await approvals([''], box.options), 0)
+  assert.match(box.lines.join('\n'), /^Approvals: auto, design reads run without asking/)
+  assert.match(box.lines.join('\n'), /Change it with: figma-bridge approvals manual/)
+  await assert.rejects(approvals(['sometimes'], box.options), UsageError)
+  await assert.rejects(approvals(['auto', 'manual'], box.options), UsageError)
 })
 
 test('a client config setup cannot parse fails that client and is left as it was', async t => {
@@ -326,6 +425,7 @@ test('a client that fails does not stop the others, and setup exits 1', async t 
 
 test('setup options are checked before anything runs', () => {
   assert.deepEqual(parseSetupArgs(['--only', 'claude,agy', '--approvals=manual']), { only: ['claude', 'agy'], approvals: 'manual', installed: false })
+  assert.deepEqual(parseSetupArgs(['--only=gemini']).only, ['gemini'])
   assert.throws(() => parseSetupArgs(['--only', 'cursor']), UsageError)
   assert.throws(() => parseSetupArgs(['--only']), UsageError)
   assert.throws(() => parseSetupArgs(['--approvals', 'sometimes']), UsageError)
