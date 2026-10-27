@@ -4,7 +4,7 @@ All notable changes to Figma Design Bridge. Versions follow
 [Semantic Versioning](https://semver.org/); the Claude Code plugin, the
 marketplace entry and both `package.json` files always carry the same number.
 
-## [Unreleased]
+## [1.8.0] - 2026-10-27
 
 One command sets approvals in every AI client on the machine, and Gemini CLI
 joins the clients setup knows.
@@ -462,7 +462,8 @@ audit. Nothing to migrate.
   with page and selection sync and Watch mode, and the MCP server for Claude
   Code.
 
-[1.7.0]: https://github.com/nathanpixodeo/figma-design-bridge/compare/d0e2682...main
+[1.8.0]: https://github.com/nathanpixodeo/figma-design-bridge/compare/c1f0d9e...main
+[1.7.0]: https://github.com/nathanpixodeo/figma-design-bridge/compare/d0e2682...c1f0d9e
 [1.6.0]: https://github.com/nathanpixodeo/figma-design-bridge/compare/df30224...d0e2682
 [1.5.1]: https://github.com/nathanpixodeo/figma-design-bridge/compare/334a489...df30224
 [1.5.0]: https://github.com/nathanpixodeo/figma-design-bridge/compare/fab0416...334a489
