@@ -4,6 +4,21 @@ All notable changes to Figma Design Bridge. Versions follow
 [Semantic Versioning](https://semver.org/); the Claude Code plugin, the
 marketplace entry and both `package.json` files always carry the same number.
 
+## [Unreleased]
+
+The panel gets a Tools menu, and its first tool finds layers in the open file.
+
+### Added
+
+- A **Tools** button in the panel header opens a list of tools. A tool
+  replaces the bridge view until **Back**, and the bridge stays connected
+  meanwhile.
+- **Find node** finds layers by name, text content, type or component. It
+  searches all pages (current page first) or this page only. A node id
+  (`10996:249363`, `10996-249363`, `I1:3;3:9`) or a link with `node-id` finds
+  that one layer. Clicking a match selects it and zooms to it. **Copy** copies
+  a link to the layer for `get_design_context`.
+
 ## [1.9.0] - 2026-11-03
 
 The Figma plugin panel only does what agents need: pair once, then stay

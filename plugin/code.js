@@ -62,13 +62,72 @@ summary::-webkit-details-marker{display:none}
 summary::before{content:'\\25B8';display:inline-block;width:12px}
 details[open] summary::before{content:'\\25BE'}
 details[open] summary{margin-bottom:8px}
+.view{display:flex;flex-direction:column;gap:12px}
+.head-side{display:flex;align-items:center;gap:4px;min-width:0}
+.head-side .title{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.menu-wrap{position:relative}
+button.icon{
+  display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;padding:0;flex-shrink:0;
+  background:transparent;color:var(--figma-color-icon,#1e1e1e)
+}
+button.icon:hover{background:var(--figma-color-bg-hover,#f5f5f5)}
+button.icon[aria-expanded="true"]{background:var(--figma-color-bg-selected,#e5f4ff)}
+.menu{
+  position:absolute;right:0;top:28px;z-index:10;width:224px;padding:4px;border-radius:6px;
+  background:var(--figma-color-bg,#fff);border:1px solid var(--figma-color-border,#e6e6e6);box-shadow:0 4px 16px rgba(0,0,0,.16)
+}
+.menu-item{
+  display:flex;flex-direction:column;align-items:flex-start;gap:2px;width:100%;height:auto;padding:6px 8px;
+  background:transparent;color:inherit;text-align:left;white-space:normal;font-weight:400
+}
+.menu-item:hover,.menu-item:focus-visible{background:var(--figma-color-bg-hover,#f5f5f5)}
+.menu-item strong{font-weight:500}
+.menu-item span{color:var(--figma-color-text-secondary,#757575)}
+select{
+  height:28px;min-width:0;padding:0 4px;border-radius:5px;border:1px solid var(--figma-color-border,#e6e6e6);
+  background:var(--figma-color-bg,#fff);color:var(--figma-color-text,#1e1e1e);font:inherit;outline:none
+}
+select:focus{border-color:var(--figma-color-border-selected,#0d99ff)}
+.filters{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.find-foot{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.find-foot select{flex-shrink:0;margin-left:auto}
+.results{
+  list-style:none;max-height:240px;overflow-y:auto;margin:0 -16px;
+  border-top:1px solid var(--figma-color-border,#e6e6e6)
+}
+.result{display:flex;align-items:center;gap:8px;padding:0 16px 0 0}
+.result:hover{background:var(--figma-color-bg-hover,#f5f5f5)}
+.result-open{
+  display:flex;flex-direction:column;align-items:stretch;gap:2px;flex:1;min-width:0;height:auto;padding:6px 0 6px 16px;
+  border:0;border-radius:0;background:transparent;color:inherit;text-align:left;font-weight:400
+}
+.result-name{display:flex;align-items:baseline;justify-content:space-between;gap:8px}
+.result-name .name{font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.result-name .type{flex-shrink:0;color:var(--figma-color-text-tertiary,#b3b3b3);font-size:10px}
+.result-meta{color:var(--figma-color-text-secondary,#757575);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+button.copy{height:22px;padding:0 8px;flex-shrink:0}
+.clipboard{position:fixed;left:-9999px;top:0;width:1px;height:1px;opacity:0}
 .hidden{display:none!important}
 </style>
 <div id="app">
   <div class="header">
-    <span class="title">Design Bridge</span>
-    <span id="status" class="status" role="status"><span id="statusText">Starting…</span></span>
+    <div class="head-side">
+      <button class="icon hidden" id="backBtn" aria-label="Back to Design Bridge" title="Back">
+        <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M10 3.5 5.5 8l4.5 4.5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
+      <span class="title" id="title">Design Bridge</span>
+    </div>
+    <div class="head-side">
+      <span id="status" class="status" role="status"><span id="statusText">Starting…</span></span>
+      <div class="menu-wrap">
+        <button class="icon" id="toolsBtn" aria-label="Tools" title="Tools" aria-haspopup="menu" aria-expanded="false">
+          <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M3 3h4v4H3zM9 3h4v4H9zM3 9h4v4H3zM9 9h4v4H9z" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/></svg>
+        </button>
+        <div id="toolsMenu" class="menu hidden" role="menu" aria-label="Tools"></div>
+      </div>
+    </div>
   </div>
+  <div id="bridgeView" class="view">
   <p id="message" class="message hidden"></p>
   <div id="pairSection" class="stack hidden">
     <button class="primary" id="pairBtn">Pair with bridge</button>
@@ -101,6 +160,39 @@ details[open] summary{margin-bottom:8px}
       <input id="bridgeToken" type="password" autocomplete="off" spellcheck="false" placeholder="Paste the output of figma-bridge token">
     </div>
   </details>
+  </div>
+  <section id="tool-find" class="view hidden" aria-label="Find node">
+    <input id="findQuery" type="search" autocomplete="off" spellcheck="false" placeholder="Name, text or node id" aria-label="Find layers">
+    <div class="filters">
+      <select id="findMatch" aria-label="Match">
+        <option value="any">Name or text</option>
+        <option value="name">Layer name</option>
+        <option value="text">Text content</option>
+        <option value="component">Component</option>
+      </select>
+      <select id="findType" aria-label="Layer type">
+        <option value="">Any type</option>
+        <option value="FRAME">Frame</option>
+        <option value="SECTION">Section</option>
+        <option value="GROUP">Group</option>
+        <option value="COMPONENT">Component</option>
+        <option value="COMPONENT_SET">Component set</option>
+        <option value="INSTANCE">Instance</option>
+        <option value="TEXT">Text</option>
+        <option value="RECTANGLE">Rectangle</option>
+        <option value="VECTOR">Vector</option>
+      </select>
+    </div>
+    <div class="find-foot">
+      <span id="findStatus" class="message hidden" role="status"></span>
+      <select id="findScope" aria-label="Search in">
+        <option value="all">All pages</option>
+        <option value="page">This page</option>
+      </select>
+    </div>
+    <ul id="findResults" class="results hidden"></ul>
+  </section>
+  <textarea id="clipboard" class="clipboard" aria-hidden="true" tabindex="-1"></textarea>
 </div>
 <script>
 const SERVER_URL = '${SERVER_URL}'
@@ -121,6 +213,18 @@ let waitingForBridge=false,tokenRejected=false
 // invalidating: an invalidate request is in flight. invalidateNext: the latest
 // edit made since, sent when invalidateTimer fires.
 let invalidating=false,invalidateNext=null,invalidateTimer=null
+// Tools open from the header, so the panel shows the bridge until one is
+// picked. A tool is an entry here and a section with id tool-<id>; open and
+// close run when the tool shows and when the panel goes back to the bridge.
+const TOOLS=[
+  {id:'find',title:'Find node',description:'Find layers by name, text, type, component or node id.',open:openFind,close:closeFind},
+]
+let activeTool=null,menuOpen=false
+// findSeq numbers each search, so a result from an older one is dropped.
+// findStale: a search was stopped by leaving the tool, and runs again on return.
+let findSeq=0,findTimer=null,findResults=[],findText='',findError=false,findBusy=false,findStale=false
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c])}
+function toolById(id){return TOOLS.find(tool=>tool.id===id)||null}
 function timeOf(iso){try{return iso?new Date(iso).toLocaleTimeString():''}catch{return ''}}
 function fileSource(){return (q('fileSource').value||'').trim()}
 function needsFile(){return !fileKeyKnown&&!fileSource()}
@@ -149,6 +253,13 @@ const HINT={
 }
 function render(){
   const v=view(),[tone,label]=STATUS[v]
+  const tool=toolById(activeTool)
+  toggle('bridgeView',!tool)
+  TOOLS.forEach(t=>toggle('tool-'+t.id,t===tool))
+  toggle('backBtn',Boolean(tool))
+  q('title').textContent=tool?tool.title:'Design Bridge'
+  toggle('toolsMenu',menuOpen)
+  q('toolsBtn').setAttribute('aria-expanded',String(menuOpen))
   q('status').className='status'+(tone?' '+tone:'')
   q('statusText').textContent=label
   const text=errorText||(v==='waiting'?waitingHint():HINT[v]||'')
@@ -171,10 +282,14 @@ function render(){
   q('pairBtn').disabled=Boolean(pairing)
   fit()
 }
-// The plugin window follows the panel's height, so it never scrolls or leaves a gap.
+// The plugin window follows the panel's height, so it never scrolls or leaves a
+// gap. An open Tools menu floats over the panel, so the window also fits it.
 function fit(){
-  const height=q('app').offsetHeight
-  if(typeof height!=='number'||!height||height===lastHeight) return
+  let height=q('app').offsetHeight
+  if(typeof height!=='number'||!height) return
+  const menu=q('toolsMenu')
+  if(menuOpen&&typeof menu.getBoundingClientRect==='function') height=Math.max(height,Math.ceil(menu.getBoundingClientRect().bottom)+8)
+  if(height===lastHeight) return
   lastHeight=height
   parent.postMessage({pluginMessage:{type:'resize',height}},'*')
 }
@@ -383,6 +498,103 @@ function connect(){
   parent.postMessage({pluginMessage:{type:'connect-bridge',token,fileSource:fileSource()}},'*')
   render()
 }
+function setMenu(open){menuOpen=Boolean(open);render()}
+function renderMenu(){
+  q('toolsMenu').innerHTML=TOOLS.map(tool=>'<button class="menu-item" role="menuitem" data-tool="'+esc(tool.id)+'">'
+    +'<strong>'+esc(tool.title)+'</strong><span>'+esc(tool.description)+'</span></button>').join('')
+}
+// The bridge session keeps running while a tool is open.
+function openTool(id){
+  const tool=toolById(id)
+  if(!tool) return
+  menuOpen=false
+  if(activeTool&&activeTool!==id) closeTool()
+  activeTool=id
+  render()
+  if(tool.open) tool.open()
+}
+function closeTool(){
+  const tool=toolById(activeTool)
+  activeTool=null
+  if(tool&&tool.close) tool.close()
+  render()
+}
+function post(message){parent.postMessage({pluginMessage:message},'*')}
+function findValues(){
+  return {
+    query:(q('findQuery').value||'').trim(),match:q('findMatch').value||'any',
+    nodeType:q('findType').value||'',scope:q('findScope').value||'all',
+  }
+}
+function scheduleFind(){clearTimeout(findTimer);findTimer=setTimeout(runFind,250)}
+function runFind(){
+  clearTimeout(findTimer);findTimer=null;findStale=false
+  const values=findValues()
+  findSeq++
+  findError=false
+  if(!values.query&&!values.nodeType){
+    findBusy=false;findResults=[];findText=''
+    post({type:'find-cancel',seq:findSeq})
+  } else {
+    findBusy=true;findText='Searching…'
+    post({type:'find-nodes',seq:findSeq,query:values.query,match:values.match,nodeType:values.nodeType,scope:values.scope})
+  }
+  renderFind()
+}
+function openFind(){
+  const input=q('findQuery')
+  if(typeof input.focus==='function') input.focus()
+  if(findStale) runFind()
+}
+// Leaving the tool stops a search that is still walking the file.
+function closeFind(){
+  if(findTimer){clearTimeout(findTimer);findTimer=null;findStale=true}
+  if(!findBusy) return
+  findSeq++;findBusy=false;findStale=true;findText=''
+  post({type:'find-cancel',seq:findSeq})
+  renderFind()
+}
+function count(n){return Number(n||0).toLocaleString()}
+function findSummary(msg){
+  const n=findResults.length
+  if(msg.error) return msg.error
+  if(!n) return msg.nodeId?'No layer has id '+msg.nodeId+' in this file.':'No layer matches.'
+  if(msg.more) return 'First '+n+' matches. Narrow the search.'
+  return n===1?'1 match':count(n)+' matches'
+}
+function typeLabel(type){const t=String(type||'').toLowerCase().replace(/_/g,' ');return t.charAt(0).toUpperCase()+t.slice(1)}
+function resultRow(item,i){
+  const meta=[[item.pageName].concat(item.path||[]).filter(Boolean).join(' › ')]
+  if(item.component) meta.push(item.component)
+  if(item.text) meta.push('“'+item.text+'”')
+  if(item.hidden) meta.push('Hidden')
+  return '<li class="result">'
+    +'<button class="result-open" data-open="'+i+'" title="Select and zoom to this layer">'
+    +'<span class="result-name"><span class="name">'+esc(item.name||'Untitled')+'</span><span class="type">'+esc(typeLabel(item.type))+'</span></span>'
+    +'<span class="result-meta">'+esc(meta.filter(Boolean).join(' · '))+'</span></button>'
+    +'<button class="secondary copy" data-copy="'+i+'" title="'+(item.link?'Copy a link to this layer':'Copy the node id')+'">Copy</button></li>'
+}
+function renderFind(){
+  const status=q('findStatus')
+  status.textContent=findText
+  if(findError) status.classList.add('error'); else status.classList.remove('error')
+  toggle('findStatus',Boolean(findText))
+  q('findResults').innerHTML=findResults.map(resultRow).join('')
+  toggle('findResults',findResults.length>0)
+  fit()
+}
+// The plugin iframe may not use navigator.clipboard, so a hidden field is copied.
+function copyLayer(item){
+  if(!item) return
+  const text=item.link||item.id
+  const box=q('clipboard')
+  box.value=text
+  box.select()
+  let copied=false
+  try{copied=document.execCommand('copy')}catch{}
+  if(copied) post({type:'notify',message:(item.link?'Link':'Node id')+' copied: '+item.name})
+  else {findError=true;findText='Could not copy. '+(item.link?'Link':'Node id')+': '+text;renderFind()}
+}
 window.addEventListener('message',async e=>{
   const msg=e.data.pluginMessage
   if(!msg) return
@@ -394,6 +606,15 @@ window.addEventListener('message',async e=>{
     case 'bridge-result': await sendBridgeReply(msg); break
     case 'bridge-invalidate': await invalidateBridge(msg); break
     case 'bridge-stop': cancelPairing(); await stopBridge(msg.reason); break
+    case 'find-progress':
+      if(msg.seq===findSeq&&findBusy){findText='Searching… '+count(msg.checked)+' layers checked';renderFind()}
+      break
+    case 'find-result':
+      if(msg.seq!==findSeq) break
+      findBusy=false;findResults=Array.isArray(msg.results)?msg.results:[];findError=Boolean(msg.error);findText=findSummary(msg)
+      renderFind()
+      break
+    case 'find-error': findError=true;findText=String(msg.error||'');renderFind(); break
   }
 })
 q('bridgeToken').addEventListener('change',e=>{
@@ -410,6 +631,29 @@ q('disconnectBtn').addEventListener('click',()=>{idle=true;stopBridge('plugin-st
 q('pairBtn').addEventListener('click',()=>{startPairing()})
 q('cancelPairBtn').addEventListener('click',()=>{errorText='';cancelPairing()})
 q('advanced').addEventListener('toggle',fit)
+q('toolsBtn').addEventListener('click',()=>setMenu(!menuOpen))
+q('backBtn').addEventListener('click',closeTool)
+q('toolsMenu').addEventListener('click',e=>{
+  const item=e.target.closest&&e.target.closest('[data-tool]')
+  if(item) openTool(item.getAttribute('data-tool'))
+})
+// A click outside the Tools menu, or Escape, closes it.
+document.addEventListener('click',e=>{
+  if(menuOpen&&!(e.target.closest&&e.target.closest('.menu-wrap'))) setMenu(false)
+})
+document.addEventListener('keydown',e=>{if(e.key==='Escape'&&menuOpen) setMenu(false)})
+q('findQuery').addEventListener('input',scheduleFind)
+q('findQuery').addEventListener('keydown',e=>{if(e.key==='Enter') runFind()})
+;['findMatch','findType','findScope'].forEach(id=>q(id).addEventListener('change',runFind))
+q('findResults').addEventListener('click',e=>{
+  const target=e.target.closest&&e.target.closest('[data-open],[data-copy]')
+  if(!target) return
+  const copy=target.getAttribute('data-copy')
+  if(copy!==null){copyLayer(findResults[Number(copy)]);return}
+  const item=findResults[Number(target.getAttribute('data-open'))]
+  if(item) post({type:'select-node',nodeId:item.id})
+})
+renderMenu()
 render()
 parent.postMessage({pluginMessage:{type:'ui-ready'}},'*')
 <\/script>`
@@ -1772,6 +2016,170 @@ function reportBridgeEdit() {
   figma.ui.postMessage({ type: 'bridge-invalidate', fileKey: state.bridgeFileKey, reason: 'documentchange' })
 }
 
+// The Find node tool. The panel asks for layers by name, text, type, component
+// or node id, and the plugin walks the document in slices, so Figma stays
+// responsive on a large file. A newer search or a cancel changes state.findSeq,
+// and the older walk stops at its next slice.
+const FIND_LIMIT = 100
+const FIND_PROGRESS_MS = 250
+const FIND_TEXT_CHARS = 80
+const NODE_ID_QUERY = /^I?\d+[:-]\d+(?:;\d+[:-]\d+)*$/
+
+// A node id as Figma shows it (10996:249363), as a link writes it
+// (10996-249363), or inside a link's node-id parameter.
+function nodeIdFrom(value) {
+  const text = String(value || '').trim()
+  return NODE_ID_QUERY.test(text) ? text.replace(/(\d+)-(\d+)/g, '$1:$2') : null
+}
+
+// What the query asks for when it names one layer: { nodeId, fileKey } for an
+// id or a link with node-id, { error } for a link without one, null for text.
+function parseNodeQuery(query) {
+  const text = String(query || '').trim()
+  const nodeId = nodeIdFrom(text)
+  if (nodeId) return { nodeId, fileKey: null }
+  if (!/^https?:\/\//i.test(text)) return null
+  const param = text.match(/[?&#]node-id=([^&#]+)/i)
+  let raw = ''
+  try { raw = param ? decodeURIComponent(param[1]) : '' } catch {}
+  const fromLink = nodeIdFrom(raw)
+  if (!fromLink) return { error: 'That link has no node-id. In Figma, right-click the layer and choose Copy link to selection.' }
+  return { nodeId: fromLink, fileKey: parseFileKey(text) }
+}
+
+function layerMatcher({ query, match, nodeType }) {
+  const needle = String(query || '').trim().toLowerCase()
+  const type = typeof nodeType === 'string' && nodeType ? nodeType : null
+  const has = value => typeof value === 'string' && value.toLowerCase().includes(needle)
+  const hasText = node => node.type === 'TEXT' && has(node.characters)
+  return async node => {
+    if (type && node.type !== type) return false
+    if (!needle) return true
+    if (match === 'name') return has(node.name)
+    if (match === 'text') return hasText(node)
+    if (match === 'component') {
+      if (node.type === 'COMPONENT_SET') return has(node.name)
+      if (node.type === 'COMPONENT') {
+        const set = node.parent && node.parent.type === 'COMPONENT_SET' ? node.parent : null
+        return has(set ? `${set.name} / ${node.name}` : node.name)
+      }
+      return node.type === 'INSTANCE' && has(await componentName(node))
+    }
+    return has(node.name) || hasText(node)
+  }
+}
+
+// A link an agent can read the layer with, when the plugin knows the file key.
+function layerLink(nodeId) {
+  const fileKey = knownFileKey() || state.bridgeFileKey
+  if (!fileKey) return null
+  const slug = documentName().replace(/[^A-Za-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'Untitled'
+  const id = /^\d+:\d+$/.test(nodeId) ? nodeId.replace(':', '-') : encodeURIComponent(nodeId)
+  return `https://www.figma.com/design/${fileKey}/${slug}?node-id=${id}`
+}
+
+async function describeLayer(node) {
+  const page = findPageForNode(node)
+  const ancestors = []
+  for (let parent = node.parent; parent && parent.type !== 'PAGE' && parent.type !== 'DOCUMENT'; parent = parent.parent) {
+    ancestors.unshift(parent.name)
+  }
+  const item = {
+    id: node.id, name: node.name, type: node.type,
+    pageId: page ? page.id : null, pageName: page ? page.name : null,
+    path: ancestors.length > 3 ? ['…', ...ancestors.slice(-3)] : ancestors,
+    hidden: node.visible === false, link: layerLink(node.id),
+  }
+  if (node.type === 'TEXT' && typeof node.characters === 'string') {
+    const text = node.characters.replace(/\s+/g, ' ').trim()
+    item.text = text.length > FIND_TEXT_CHARS ? `${text.slice(0, FIND_TEXT_CHARS - 1)}…` : text
+  }
+  if (node.type === 'INSTANCE') {
+    const name = await componentName(node)
+    if (name) item.component = name
+  }
+  return item
+}
+
+function pushChildren(stack, node) {
+  const children = node.children
+  if (!children) return
+  for (let i = children.length - 1; i >= 0; i--) stack.push(children[i])
+}
+
+async function findLayers(msg) {
+  const seq = msg.seq
+  const current = () => state.findSeq === seq
+  const reply = body => {
+    if (current()) figma.ui.postMessage(sanitizeForMessage({ type: 'find-result', seq, ...body }))
+  }
+
+  const named = parseNodeQuery(msg.query)
+  if (named) {
+    if (named.error) return reply({ results: [], error: named.error })
+    const openFile = knownFileKey() || state.bridgeFileKey
+    if (named.fileKey && openFile && named.fileKey !== openFile) {
+      return reply({ results: [], error: 'That link is for another file than the one open here.' })
+    }
+    let node = null
+    try { node = await figma.getNodeByIdAsync(named.nodeId) } catch {}
+    const found = node && !node.removed && findPageForNode(node) && node.type !== 'PAGE'
+    return reply({ results: found ? [await describeLayer(node)] : [], nodeId: named.nodeId, checked: found ? 1 : 0 })
+  }
+
+  const matches = layerMatcher(msg)
+  const page = figma.currentPage
+  const others = (figma.root && figma.root.children ? [...figma.root.children] : []).filter(other => other !== page)
+  const pages = msg.scope === 'page' ? [page] : [page, ...others]
+  const stack = []
+  for (let i = pages.length - 1; i >= 0; i--) pushChildren(stack, pages[i])
+
+  const pace = createPacer()
+  const results = []
+  let checked = 0, more = false, progressAt = Date.now()
+  while (stack.length) {
+    await pace()
+    if (!current()) return
+    if (Date.now() - progressAt >= FIND_PROGRESS_MS) {
+      progressAt = Date.now()
+      figma.ui.postMessage({ type: 'find-progress', seq, checked })
+    }
+    const node = stack.pop()
+    // A layer deleted while the walk was paused is skipped with its children.
+    try {
+      if (node.removed) continue
+      checked++
+      if (await matches(node)) {
+        if (results.length === FIND_LIMIT) { more = true; break }
+        results.push(await describeLayer(node))
+      }
+      pushChildren(stack, node)
+    } catch {}
+  }
+  reply({ results, more, checked })
+}
+
+// Picking a result shows the layer: its page, selected, in view.
+async function selectLayer(msg) {
+  let node = null
+  try { node = await figma.getNodeByIdAsync(String(msg.nodeId || '')) } catch {}
+  const page = node && !node.removed ? findPageForNode(node) : null
+  if (!page || node === page) {
+    figma.ui.postMessage({ type: 'find-error', error: 'That layer is gone. Search again.' })
+    return
+  }
+  try {
+    if (figma.currentPage !== page) {
+      if (typeof figma.setCurrentPageAsync === 'function') await figma.setCurrentPageAsync(page)
+      else figma.currentPage = page
+    }
+    page.selection = [node]
+    figma.viewport.scrollAndZoomIntoView([node])
+  } catch (error) {
+    figma.ui.postMessage({ type: 'find-error', error: `Figma could not select that layer: ${error.message || error}` })
+  }
+}
+
 // clientStorage is per Figma user, not per document, so a file link is kept per
 // document name: another document never inherits it. Links saved by 1.1 under
 // a single `fileSource` key are ignored for that reason.
@@ -1849,6 +2257,7 @@ const state = {
   ready: false,
   bridgeFileKey: null, bridgeFileName: null, bridgeConnected: false, bridgeToken: '',
   lastBridgeNode: null, lastBridgeRequest: null, bridgeReading: false, editedDuringRead: false, editSeq: 0,
+  findSeq: 0,
   pluginInstanceId: `plugin-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
 }
 
@@ -1966,6 +2375,24 @@ function main() {
       case 'bridge-stopped':
         state.bridgeConnected = false
         updateUIStatus()
+        break
+
+      // Find node. A search with a newer seq, or a cancel, stops the one before.
+      case 'find-nodes':
+        state.findSeq = msg.seq
+        await findLayers(msg)
+        break
+
+      case 'find-cancel':
+        state.findSeq = msg.seq
+        break
+
+      case 'select-node':
+        await selectLayer(msg)
+        break
+
+      case 'notify':
+        if (msg.message) figma.notify(String(msg.message).slice(0, 200))
         break
     }
   }

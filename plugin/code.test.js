@@ -61,6 +61,8 @@ function bridgePlugin({
     notify(message) { notifications.push(message) },
     closePlugin() { this.closed = true },
     getNodeByIdAsync: async id => nodes.get(id) || null,
+    async setCurrentPageAsync(page) { this.currentPage = page },
+    viewport: { shown: null, scrollAndZoomIntoView(list) { this.shown = Array.from(list, node => node.id) } },
     clientStorage: {
       getAsync: async key => storage.get(key),
       setAsync: async (key, value) => storage.set(key, structuredClone(value)),
@@ -70,7 +72,7 @@ function bridgePlugin({
   if (now) context.Date = class extends Date { static now() { return now() } }
   vm.runInNewContext(source, context)
   return {
-    figma, time, sent, notifications, target, activePage, otherPage, storage,
+    figma, time, sent, notifications, target, activePage, otherPage, storage, nodes,
     emit: event => events.get(event)?.(),
     message: message => figma.ui.onmessage(message),
     ready: () => figma.ui.onmessage({ type: 'ui-ready' }),
@@ -634,32 +636,48 @@ test('a pairing approval is saved and connects the panel', async () => {
   assert.ok(p.notifications.includes('Paired with the bridge'))
 })
 
-function ui(fetch) {
-  const time = clock(), elements = new Map(), messages = []
+function ui(fetch, { copies = true } = {}) {
+  const time = clock(), elements = new Map(), messages = [], documentListeners = {}, copied = []
   let onMessage
   function element(id) {
     if (!elements.has(id)) {
       const classes = new Set(['hidden'])
-      const listeners = {}
+      const listeners = {}, attributes = {}
       elements.set(id, {
-        textContent: '', className: '', disabled: false, checked: true, value: '', listeners,
+        textContent: '', innerHTML: '', className: '', disabled: false, checked: true, value: '', listeners, attributes,
+        focused: false, selected: false,
         classList: { add: name => classes.add(name), remove: name => classes.delete(name) },
         isHidden: () => classes.has('hidden'),
         hasClass: name => classes.has(name),
         addEventListener: (type, callback) => { listeners[type] = callback },
+        setAttribute(name, value) { attributes[name] = String(value) },
+        focus() { this.focused = true },
+        select() { this.selected = true },
       })
     }
     return elements.get(id)
   }
   const script = bridgePlugin({ command: '' }).figma.html.match(/<script>([\s\S]*?)<\/script>/)[1]
   vm.runInNewContext(script, {
-    document: { getElementById: element },
+    document: {
+      getElementById: element,
+      addEventListener: (type, callback) => { documentListeners[type] = callback },
+      execCommand: command => {
+        if (command === 'copy' && copies) copied.push(element('clipboard').value)
+        return copies
+      },
+    },
     parent: { postMessage: message => messages.push(structuredClone(message.pluginMessage)) },
     window: { addEventListener: (_, callback) => { onMessage = callback } },
     fetch, AbortController, setTimeout: time.setTimeout, clearTimeout: time.clearTimeout,
   })
+  // A click on markup the panel built, such as a result row: the event's
+  // target finds the element carrying the given attributes.
+  const clickInside = (id, attributes) => element(id).listeners.click({
+    target: { closest: () => ({ getAttribute: name => (name in attributes ? String(attributes[name]) : null) }) },
+  })
   return {
-    time, element, messages,
+    time, element, messages, copied, documentListeners, clickInside,
     post: message => onMessage({ data: { pluginMessage: message } }),
     click: id => element(id).listeners.click(),
   }
@@ -1636,4 +1654,315 @@ test('Bridge renders a node, scaled down to 4096 px, and says when it is too lar
   assert.equal(reply.result.truncated, true)
   assert.equal(reply.result.payload.base64, undefined)
   assert.equal(reply.result.payload.byteLength, 4000)
+})
+
+// Find node. The fixture adds a button component set and a login screen to the
+// active page; the other page keeps its archived screen with one text layer.
+function finderPlugin(options) {
+  const p = bridgePlugin({ command: '', ...options })
+  const add = (parent, node) => {
+    node.parent = parent
+    parent.children = parent.children || []
+    parent.children.push(node)
+    p.nodes.set(node.id, node)
+    return node
+  }
+  const set = add(p.activePage, { id: '3:1', name: 'Button', type: 'COMPONENT_SET' })
+  const variant = add(set, { id: '3:2', name: 'State=Default', type: 'COMPONENT' })
+  const login = add(p.activePage, { id: '1:1', name: 'Login', type: 'FRAME' })
+  add(login, { id: '1:2', name: 'Title', type: 'TEXT', characters: 'Sign in to continue' })
+  add(login, { id: '1:3', name: 'Primary', type: 'INSTANCE', getMainComponentAsync: async () => variant })
+  const form = add(login, { id: '1:4', name: 'Form', type: 'GROUP', visible: false })
+  add(form, { id: '1:5', name: 'Email label', type: 'TEXT', characters: 'Email' })
+  return { ...p, add }
+}
+
+function addLabels(p, count) {
+  const { screen, nodes } = flatScreen(p.otherPage, count)
+  p.otherPage.children.push(screen)
+  for (const [id, node] of nodes) p.nodes.set(id, node)
+}
+
+const findMessage = query => ({ type: 'find-nodes', seq: 1, query: '', match: 'any', nodeType: '', scope: 'all', ...query })
+const findResults = p => p.sent.filter(sent => sent.type === 'find-result')
+
+async function findIn(p, query) {
+  await settle(p, p.message(findMessage(query)))
+  return findResults(p).at(-1)
+}
+
+const ids = reply => reply.results.map(item => item.id)
+
+test('Find node finds layers by name on every page, the current page first, with page, path and link', async () => {
+  const p = finderPlugin()
+  const reply = await findIn(p, { query: 'LOGIN' })
+  assert.deepEqual(reply.results, [{
+    id: '1:1', name: 'Login', type: 'FRAME', pageId: '0:1', pageName: 'Screens', path: [], hidden: false,
+    link: 'https://www.figma.com/design/AAAAfileKeyAAAA/Bridge-Test-File?node-id=1-1',
+  }])
+  assert.equal(reply.more, false)
+
+  const both = await findIn(p, { query: 'a' })
+  assert.deepEqual(ids(both), ['3:2', '1:3', '1:5', '2:1', '2:2'])
+  assert.equal(both.results.at(-1).pageName, 'Archive', 'the other page comes last')
+
+  const label = (await findIn(p, { query: 'email label' })).results[0]
+  assert.deepEqual(label.path, ['Login', 'Form'])
+  assert.equal(label.text, 'Email')
+  assert.equal((await findIn(p, { query: 'form' })).results[0].hidden, true)
+})
+
+test('Find node matches text content, and layer name mode leaves a text-only match out', async () => {
+  const p = finderPlugin()
+  assert.deepEqual(ids(await findIn(p, { query: 'sign in' })), ['1:2'])
+  assert.deepEqual(ids(await findIn(p, { query: 'sign in', match: 'text' })), ['1:2'])
+  assert.deepEqual(ids(await findIn(p, { query: 'sign in', match: 'name' })), [])
+  assert.deepEqual(ids(await findIn(p, { query: 'title', match: 'text' })), [], 'text mode skips names')
+  assert.deepEqual(ids(await findIn(p, { query: 'nothing like this' })), [])
+})
+
+test('Find node lists every layer of a type when no text is given, and scopes to this page', async () => {
+  const p = finderPlugin()
+  assert.deepEqual(ids(await findIn(p, { nodeType: 'TEXT' })), ['1:2', '1:5', '2:2'])
+  assert.deepEqual(ids(await findIn(p, { nodeType: 'TEXT', scope: 'page' })), ['1:2', '1:5'])
+  assert.deepEqual(ids(await findIn(p, { query: 'screen', nodeType: 'FRAME' })), ['2:1'])
+})
+
+test('Find node finds instances by their main component and component set names', async () => {
+  const p = finderPlugin()
+  assert.deepEqual(ids(await findIn(p, { query: 'state=default', match: 'component' })), ['3:2', '1:3'])
+  const bySet = await findIn(p, { query: 'button', match: 'component' })
+  assert.deepEqual(ids(bySet), ['3:1', '3:2', '1:3'])
+  assert.equal(bySet.results.find(item => item.id === '1:3').component, 'Button / State=Default')
+  assert.deepEqual(ids(await findIn(p, { query: 'button', match: 'component', nodeType: 'INSTANCE' })), ['1:3'])
+  assert.deepEqual(ids(await findIn(p, { query: 'button', match: 'name' })), ['3:1'])
+})
+
+test('Find node finds one layer by node id or link, whatever the filters, and says when there is none', async () => {
+  const p = finderPlugin()
+  const filters = { match: 'text', nodeType: 'VECTOR', scope: 'page' }
+  for (const query of ['2:2', '2-2', ' 2-2 ', 'https://www.figma.com/design/AAAAfileKeyAAAA/File?node-id=2-2&t=abc',
+    'https://www.figma.com/design/AAAAfileKeyAAAA/File?node-id=2%3A2']) {
+    const reply = await findIn(p, { query, ...filters })
+    assert.deepEqual(ids(reply), ['2:2'], query)
+    assert.equal(reply.results[0].pageName, 'Archive')
+  }
+  p.add(p.nodes.get('1:3'), { id: 'I1:3;3:9', name: 'Label', type: 'TEXT', characters: 'OK' })
+  const part = await findIn(p, { query: 'I1:3;3:9' })
+  assert.deepEqual(ids(part), ['I1:3;3:9'])
+  assert.equal(part.results[0].link, 'https://www.figma.com/design/AAAAfileKeyAAAA/Bridge-Test-File?node-id=I1%3A3%3B3%3A9')
+
+  const missing = await findIn(p, { query: '10996-249363' })
+  assert.deepEqual(missing.results, [])
+  assert.equal(missing.nodeId, '10996:249363')
+
+  const other = await findIn(p, { query: 'https://www.figma.com/design/BBBBotherFileBBBB/File?node-id=2-2' })
+  assert.equal(other.error, 'That link is for another file than the one open here.')
+  const bare = await findIn(p, { query: 'https://www.figma.com/design/AAAAfileKeyAAAA/File' })
+  assert.match(bare.error, /no node-id/)
+  assert.deepEqual(ids(await findIn(p, { query: '0:1' })), [], 'a page is not a layer')
+})
+
+test('Find node stops at 100 matches and says more exist', async () => {
+  const p = finderPlugin()
+  addLabels(p, 150)
+  const reply = await findIn(p, { query: 'label', match: 'name' })
+  assert.equal(reply.results.length, 100)
+  assert.equal(reply.more, true)
+  assert.equal(reply.results[0].id, '1:5')
+})
+
+test('a newer search or a cancel stops the walk before it, which never answers', async () => {
+  const p = finderPlugin({ now: steppingClock(), manualYield: true })
+  addLabels(p, 300)
+
+  const first = p.message(findMessage({ seq: 1, query: 'label' }))
+  await new Promise(resolve => setImmediate(resolve))
+  const second = p.message(findMessage({ seq: 2, query: 'login' }))
+  await settle(p, Promise.all([first, second]))
+  assert.deepEqual(findResults(p).map(sent => sent.seq), [2])
+  assert.deepEqual(ids(findResults(p)[0]), ['1:1'])
+
+  const third = p.message(findMessage({ seq: 3, query: 'label' }))
+  for (let i = 0; i < 10; i++) {
+    await new Promise(resolve => setImmediate(resolve))
+    p.time.flush()
+  }
+  assert.ok(p.sent.some(sent => sent.type === 'find-progress' && sent.seq === 3), 'a long walk reports progress')
+  await p.message({ type: 'find-cancel', seq: 4 })
+  await settle(p, third)
+  assert.equal(findResults(p).length, 1, 'the cancelled search sent nothing')
+})
+
+test('Find node skips a layer deleted while the walk was paused, with its children', async () => {
+  const p = finderPlugin()
+  const form = p.nodes.get('1:4')
+  form.removed = true
+  Object.defineProperty(form, 'children', { get() { throw new Error('The node with id "1:4" does not exist') } })
+  assert.deepEqual(ids(await findIn(p, { nodeType: 'TEXT' })), ['1:2', '2:2'])
+})
+
+test('picking a result switches to its page, selects it and zooms to it', async () => {
+  const p = finderPlugin()
+  await p.message({ type: 'select-node', nodeId: '2:2' })
+  assert.equal(p.figma.currentPage, p.otherPage)
+  assert.deepEqual([...p.otherPage.selection].map(node => node.id), ['2:2'])
+  assert.deepEqual(p.figma.viewport.shown, ['2:2'])
+
+  await p.message({ type: 'select-node', nodeId: '1:2' })
+  assert.equal(p.figma.currentPage, p.activePage)
+  assert.deepEqual([...p.activePage.selection].map(node => node.id), ['1:2'])
+
+  await p.message({ type: 'select-node', nodeId: '9:9' })
+  assert.deepEqual(p.sent.at(-1), { type: 'find-error', error: 'That layer is gone. Search again.' })
+
+  await p.message({ type: 'notify', message: 'Link copied: Login' })
+  assert.equal(p.notifications.at(-1), 'Link copied: Login')
+})
+
+const connectedStatus = { type: 'status', connected: true, fileName: 'File', fileKeyKnown: true, bridgeToken: 't' }
+
+test('the Tools menu lists each tool, and a tool replaces the bridge view until Back', async () => {
+  const panel = ui(async () => { throw new Error('no bridge') })
+  panel.post(connectedStatus)
+  assert.equal(panel.element('toolsMenu').isHidden(), true, 'tools stay out of the way')
+  assert.equal(panel.element('tool-find').isHidden(), true)
+  assert.match(panel.element('toolsMenu').innerHTML, /data-tool="find"/)
+  assert.match(panel.element('toolsMenu').innerHTML, /Find node/)
+
+  panel.click('toolsBtn')
+  assert.equal(panel.element('toolsMenu').isHidden(), false)
+  assert.equal(panel.element('toolsBtn').attributes['aria-expanded'], 'true')
+  panel.documentListeners.keydown({ key: 'Escape' })
+  assert.equal(panel.element('toolsMenu').isHidden(), true)
+
+  panel.click('toolsBtn')
+  panel.documentListeners.click({ target: { closest: () => null } })
+  assert.equal(panel.element('toolsMenu').isHidden(), true, 'a click outside closes the menu')
+
+  panel.click('toolsBtn')
+  panel.clickInside('toolsMenu', { 'data-tool': 'find' })
+  assert.equal(panel.element('toolsMenu').isHidden(), true)
+  assert.equal(panel.element('bridgeView').isHidden(), true)
+  assert.equal(panel.element('tool-find').isHidden(), false)
+  assert.equal(panel.element('backBtn').isHidden(), false)
+  assert.equal(panel.element('title').textContent, 'Find node')
+  assert.equal(panel.element('findQuery').focused, true)
+
+  // The bridge keeps running behind the tool.
+  panel.post({ ...connectedStatus, connected: false })
+  assert.equal(panel.element('statusText').textContent, 'Connecting…')
+  panel.post(connectedStatus)
+  assert.equal(panel.element('statusText').textContent, 'Connected')
+
+  panel.click('backBtn')
+  assert.equal(panel.element('bridgeView').isHidden(), false)
+  assert.equal(panel.element('tool-find').isHidden(), true)
+  assert.equal(panel.element('backBtn').isHidden(), true)
+  assert.equal(panel.element('title').textContent, 'Design Bridge')
+})
+
+function openFinder(options) {
+  const panel = ui(async () => { throw new Error('no bridge') }, options)
+  panel.post(connectedStatus)
+  panel.click('toolsBtn')
+  panel.clickInside('toolsMenu', { 'data-tool': 'find' })
+  return panel
+}
+
+function search(panel, query) {
+  panel.element('findQuery').value = query
+  panel.element('findQuery').listeners.keydown({ key: 'Enter' })
+}
+
+const finds = panel => panel.messages.filter(message => message.type === 'find-nodes' || message.type === 'find-cancel')
+const found = {
+  id: '1:1', name: '<img src=x onerror=alert(1)>', type: 'COMPONENT_SET', pageName: 'Screens', path: ['Login'], hidden: true,
+  link: 'https://www.figma.com/design/K/F?node-id=1-1',
+}
+
+test('typing searches once it pauses, and the results list escaped names that select and copy', async () => {
+  const panel = openFinder()
+  panel.element('findQuery').value = 'log'
+  panel.element('findQuery').listeners.input()
+  panel.element('findQuery').value = 'login '
+  panel.element('findQuery').listeners.input()
+  assert.equal(finds(panel).length, 0, 'waits for typing to pause')
+  panel.time.flush()
+  assert.deepEqual(finds(panel), [{ type: 'find-nodes', seq: 1, query: 'login', match: 'any', nodeType: '', scope: 'all' }])
+  assert.equal(panel.element('findStatus').textContent, 'Searching…')
+
+  panel.post({ type: 'find-progress', seq: 1, checked: 1200 })
+  assert.match(panel.element('findStatus').textContent, /^Searching… 1.?200 layers checked$/)
+
+  panel.element('findType').value = 'TEXT'
+  panel.element('findType').listeners.change()
+  assert.equal(finds(panel).at(-1).seq, 2)
+  assert.equal(finds(panel).at(-1).nodeType, 'TEXT')
+
+  panel.post({ type: 'find-result', seq: 1, results: [{ ...found, name: 'Stale' }] })
+  assert.equal(panel.element('findResults').isHidden(), true, 'an older search is dropped')
+
+  panel.post({ type: 'find-result', seq: 2, results: [found], more: false })
+  const html = panel.element('findResults').innerHTML
+  assert.equal(panel.element('findResults').isHidden(), false)
+  assert.ok(!html.includes('<img'), 'a layer name is text, not markup')
+  assert.match(html, /&lt;img src=x onerror=alert\(1\)&gt;/)
+  assert.match(html, /Component set/)
+  assert.match(html, /Screens › Login · Hidden/)
+  assert.equal(panel.element('findStatus').textContent, '1 match')
+
+  panel.clickInside('findResults', { 'data-open': 0 })
+  assert.deepEqual(panel.messages.at(-1), { type: 'select-node', nodeId: '1:1' })
+
+  panel.clickInside('findResults', { 'data-copy': 0 })
+  assert.deepEqual(panel.copied, [found.link])
+  assert.equal(panel.element('clipboard').selected, true)
+  assert.equal(panel.messages.at(-1).type, 'notify')
+
+  panel.post({ type: 'find-result', seq: 2, results: [{ ...found, link: null }] })
+  panel.clickInside('findResults', { 'data-copy': 0 })
+  assert.deepEqual(panel.copied, [found.link, '1:1'], 'without a file key the node id is copied')
+})
+
+test('the finder says what a search found, and clears when the query is emptied', async () => {
+  const panel = openFinder()
+  search(panel, '10996-249363')
+  panel.post({ type: 'find-result', seq: 1, results: [], nodeId: '10996:249363' })
+  assert.equal(panel.element('findStatus').textContent, 'No layer has id 10996:249363 in this file.')
+
+  search(panel, 'label')
+  panel.post({ type: 'find-result', seq: 2, results: Array.from({ length: 100 }, (_, i) => ({ ...found, id: `1:${i}` })), more: true })
+  assert.equal(panel.element('findStatus').textContent, 'First 100 matches. Narrow the search.')
+
+  panel.post({ type: 'find-error', error: 'That layer is gone. Search again.' })
+  assert.equal(panel.element('findStatus').textContent, 'That layer is gone. Search again.')
+  assert.equal(panel.element('findStatus').hasClass('error'), true)
+
+  search(panel, '')
+  assert.deepEqual(finds(panel).at(-1), { type: 'find-cancel', seq: 3 })
+  assert.equal(panel.element('findResults').isHidden(), true)
+  assert.equal(panel.element('findStatus').isHidden(), true)
+})
+
+test('leaving the finder stops a running search, and coming back runs it again', async () => {
+  const panel = openFinder()
+  search(panel, 'card')
+  panel.click('backBtn')
+  assert.deepEqual(finds(panel).at(-1), { type: 'find-cancel', seq: 2 })
+  panel.post({ type: 'find-result', seq: 1, results: [found] })
+  assert.equal(panel.element('findResults').isHidden(), true)
+
+  panel.click('toolsBtn')
+  panel.clickInside('toolsMenu', { 'data-tool': 'find' })
+  assert.deepEqual(finds(panel).at(-1), { type: 'find-nodes', seq: 3, query: 'card', match: 'any', nodeType: '', scope: 'all' })
+})
+
+test('a failed copy shows the link to copy by hand', async () => {
+  const panel = openFinder({ copies: false })
+  search(panel, 'x')
+  panel.post({ type: 'find-result', seq: 1, results: [found] })
+  panel.clickInside('findResults', { 'data-copy': 0 })
+  assert.equal(panel.element('findStatus').textContent, `Could not copy. Link: ${found.link}`)
+  assert.equal(panel.element('findStatus').hasClass('error'), true)
 })

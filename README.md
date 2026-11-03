@@ -902,6 +902,17 @@ read a file you do not have open. The two paths are never both required.
 
 **Advanced** holds the bridge token, to paste the output of `figma-bridge token` by hand.
 
+#### Tools
+
+The grid button at the top right opens **Tools**. A tool replaces the bridge view until you press the back arrow, and the bridge stays connected the whole time.
+
+- **Find node** finds layers in the open file:
+  - It matches the layer name, the text content, or the component (an instance matches by its main component or component set name). It can also list every layer of one type, such as Frame, Instance or Text.
+  - It searches **All pages**, starting with the current one, or **This page** only.
+  - A node id finds that one layer, whatever the filters. The id can be in any of these forms: `10996:249363`, `10996-249363`, an instance sublayer id such as `I1:3;3:9`, or a Figma link with `node-id`.
+  - It stops at 100 matches and asks for a narrower search. A newer search, or leaving the tool, stops the one before it.
+  - Clicking a match switches to its page, selects it and zooms to it. **Copy** copies a link to the layer that an agent can read with `get_design_context`, or the node id when the plugin does not know the file key.
+
 Each edit tells the bridge that what it cached for this file is out of date. The plugin uses Figma's [`documentchange` event](https://developers.figma.com/docs/plugins/api/properties/figma-on/) with the legacy document-access manifest. If migrating the manifest to `dynamic-page`, load pages before subscribing to `documentchange` or migrate to page-scoped events.
 
 `plugin/manifest.json` sets `enablePrivatePluginApi`, which lets a development plugin read `figma.fileKey`, so the panel knows which file it is in. Changing the manifest requires **Plugins → Development → Import plugin from manifest…** again. Until then, a menu imported before 1.9.0 keeps its old entries, and each of them (**Open Design Bridge**, **Quick Sync**, and the older **Connect On-Demand Bridge** and **Watch Mode**) opens the panel.
