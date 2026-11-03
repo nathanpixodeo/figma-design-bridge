@@ -975,6 +975,64 @@ test('a reply that arrives after its read timed out is kept for the next read, u
   assert.equal(ctx.cache.calls.puts.length, 1)
 })
 
+// A read the plugin stopped at its deadline answers with what it read, says so,
+// and names the Figma call it was waiting on. It is not kept: a later read may
+// have more time.
+function timeCutResult(extra = {}) {
+  return restResult({
+    truncated: true,
+    completeness: { nodeCount: 3, byteSize: 400, limitHit: true, truncatedNodeIds: ['12:35'], stoppedBy: 'time' },
+    timing: {
+      countMs: 4, exportMs: 25000, outlineMs: 12, variablesMs: 0, totalMs: 25020,
+      stalled: { step: 'export', nodeId: '12:35', ms: 24990 },
+    },
+    ...extra,
+  })
+}
+
+test('a read the plugin stopped at its deadline says so, names the call it waited on, and is not cached', async t => {
+  const ctx = await withServer(t)
+  await ctx.register('FILE1', 'plugin-a', CURRENT_PLUGIN)
+  ctx.broker.nextResult = timeCutResult()
+
+  const res = await ctx.authed({ method: 'POST', path: '/bridge/read', body: REST_READ })
+  assert.equal(res.status, 200)
+  assert.equal(res.body.truncated, true)
+  assert.equal(res.body.completeness.stoppedBy, 'time')
+  assert.deepEqual(res.body.timing, {
+    countMs: 4, exportMs: 25000, outlineMs: 12, variablesMs: 0, totalMs: 25020,
+    stalled: { step: 'export', nodeId: '12:35', ms: 24990 },
+  })
+  assert.equal(res.body.cached, false)
+  assert.equal(ctx.cache.calls.puts.length, 0)
+
+  // Any other stop reason is dropped, and the read is cached as before.
+  ctx.broker.nextResult = restResult({ completeness: { nodeCount: 1, byteSize: 10, limitHit: false, truncatedNodeIds: [], stoppedBy: 'other' } })
+  const plain = await ctx.authed({ method: 'POST', path: '/bridge/read', body: { ...REST_READ, fresh: true } })
+  assert.equal(plain.body.completeness.stoppedBy, undefined)
+  assert.equal(ctx.cache.calls.puts.length, 1)
+})
+
+test('a late reply the plugin stopped at its deadline is not kept for the retry', async t => {
+  const ctx = await withServer(t)
+  const session = await ctx.register('FILE1', 'plugin-a', CURRENT_PLUGIN)
+  ctx.broker.reply = () => ({
+    accepted: false, reason: 'REQUEST_TIMED_OUT',
+    late: {
+      requestId: 'req-8', fileKey: 'FILE1', op: 'read-node', sessionId: session.sessionId,
+      params: { fileKey: 'FILE1', nodeId: '12:34', representation: 'figma-rest' },
+    },
+  })
+
+  const res = await ctx.authed({
+    method: 'POST', path: `/bridge/session/${session.sessionId}/reply`,
+    headers: { 'x-session-secret': session.sessionSecret },
+    body: { requestId: 'req-8', ok: true, result: timeCutResult() },
+  })
+  assert.equal(res.status, 200)
+  assert.equal(ctx.cache.calls.puts.length, 0)
+})
+
 // ── Cached reads ──────────────────────────────────────────
 
 test('an explicit cached read discloses unknown freshness and never claims to be live', async t => {

@@ -304,6 +304,8 @@ function createRoutes(options = {}) {
       truncatedNodeIds: Array.isArray(raw.truncatedNodeIds)
         ? raw.truncatedNodeIds.filter(id => typeof id === 'string').slice(0, 500)
         : [],
+      // The plugin stopped at the read's deadline, with what it had read.
+      ...(raw.stoppedBy === 'time' ? { stoppedBy: 'time' } : {}),
     }
   }
 
@@ -759,12 +761,15 @@ function createRoutes(options = {}) {
     const entry = entryFor({ fileKey, nodeId, representation, result, sessionId: answer.sessionId || null, fetchedAt })
 
     let cached = false
-    try {
-      cache.put(entry)
-      cached = true
-    } catch (error) {
-      // A cache failure must not fail a read that already succeeded.
-      log('warn', `bridge: could not cache the read result: ${safeText(error.message)}`)
+    // A read cut by its deadline is not kept: a later read may have more time.
+    if (!entry.completeness.stoppedBy) {
+      try {
+        cache.put(entry)
+        cached = true
+      } catch (error) {
+        // A cache failure must not fail a read that already succeeded.
+        log('warn', `bridge: could not cache the read result: ${safeText(error.message)}`)
+      }
     }
 
     return sendJSON(req, res, 200, {
@@ -849,8 +854,15 @@ function createRoutes(options = {}) {
     if (typeof result.fallbackReason === 'string') details.fallbackReason = safeText(result.fallbackReason)
     if (isPlainObject(result.timing)) {
       const timing = {}
-      for (const key of ['countMs', 'exportMs', 'totalMs']) {
+      for (const key of ['countMs', 'exportMs', 'outlineMs', 'variablesMs', 'totalMs']) {
         if (Number.isFinite(result.timing[key])) timing[key] = result.timing[key]
+      }
+      // The Figma call the read was waiting on when its deadline came.
+      const stalled = result.timing.stalled
+      if (isPlainObject(stalled) && typeof stalled.step === 'string') {
+        timing.stalled = { step: safeText(stalled.step, 40) }
+        if (typeof stalled.nodeId === 'string') timing.stalled.nodeId = safeText(stalled.nodeId, 200)
+        if (Number.isFinite(stalled.ms)) timing.stalled.ms = stalled.ms
       }
       details.timing = timing
     }
@@ -904,6 +916,7 @@ function createRoutes(options = {}) {
     const nodeId = late.op === 'read-node' && typeof params.nodeId === 'string' ? params.nodeId : null
     const representation = typeof params.representation === 'string' ? params.representation : null
     if (!representation || !sessionId || refuseResult(result, { fileKey, nodeId })) return
+    if (normalizeCompleteness(result.completeness).stoppedBy) return
     try {
       const existing = cache.get({ fileKey, nodeId, representation })
       if (existing && existing.sessionId === sessionId && Number.isInteger(existing.editSeq)

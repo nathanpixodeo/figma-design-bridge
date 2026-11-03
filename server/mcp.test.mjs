@@ -325,6 +325,7 @@ test("a read waits as long as timeoutMs asks, and a timeout says what to try nex
   const waited = Date.now() - started;
   assert.equal(read.isError, true);
   assert.match(textOf(read), /TIMEOUT: Request timed out waiting for a plugin reply\. Figma loads .*larger timeoutMs/);
+  assert.match(textOf(read), /If even a small read times out, the panel is stuck on an earlier read: ask the user to close and reopen Design Bridge in Figma\.$/);
   assert.ok(waited >= 1400 && waited < 10_000, `waited ${waited} ms instead of about 1500`);
 });
 
@@ -522,6 +523,44 @@ test("a derived tool reads a cut node again whole, and every answer names what i
   assert.doesNotMatch(bounded, /Chaînes/);
   assert.match(bounded, /"Channels" \(1:9\)/);
   assert.deepEqual(reads, ["figma-rest+d50", "figma-rest+d50+n20000+b10000000", "figma-rest+d50+b50000"]);
+});
+
+test("a read the plugin stopped at its time limit says what Figma was doing, and is not read again larger", async t => {
+  const dataDir = tempDataDir(t);
+  const port = await freePort();
+  const client = await connectMcp(t, { FIGMA_BRIDGE_DATA_DIR: dataDir, FIGMA_BRIDGE_PORT: String(port) });
+  await waitFor(() => bridgeHealthy(port));
+  const reads = [];
+  await fakePlugin(t, port, dataDir, "SlowFile1", request => {
+    if (request.op === "edit-seq") return { fileKey: "SlowFile1", editSeq: 1 };
+    reads.push(request.params.representation);
+    return {
+      fileKey: "SlowFile1", fileName: "Slow", nodeId: request.params.nodeId, pageId: "0:1", pageName: "Home",
+      format: "figma-rest", editSeq: 1, truncated: true,
+      completeness: { nodeCount: 3, byteSize: 400, limitHit: true, truncatedNodeIds: ["1:2"], stoppedBy: "time" },
+      timing: { countMs: 2, exportMs: 24000, totalMs: 25010, stalled: { step: "export", nodeId: "1:3", ms: 24000 } },
+      payload: {
+        document: {
+          id: request.params.nodeId, name: "Finance Manager", type: "SECTION", partial: true, truncated: true,
+          children: [
+            { id: "1:3", name: "Overview", type: "FRAME", partial: true },
+            { id: "1:4", name: "Refunds", type: "FRAME", truncated: true },
+          ],
+        },
+        components: {}, componentSets: {}, styles: {}, variables: {},
+      },
+    };
+  }, ["read-node", "read-document-index", "figma-rest", "edit-seq"]);
+  const source = "https://www.figma.com/design/SlowFile1/Slow?node-id=1-2";
+
+  const texts = textOf(await client.callTool({ name: "get_design_texts", arguments: { source } }));
+  assert.match(texts, /The plugin stopped this read at its time limit after 25010 ms\. Figma was still exporting layer 1:3\./);
+  assert.match(texts, /1 layer\(s\) were left out, with everything inside them: "Refunds" \(1:4\)\. Read one screen frame by its id as node-id rather than this whole node, or pass a larger timeoutMs \(up to 120000\)\./);
+  assert.deepEqual(reads, ["figma-rest+d50"], "no larger read after a read cut by time");
+
+  const context = JSON.parse(textOf(await client.callTool({ name: "get_design_context", arguments: { source, fresh: true } })));
+  assert.equal(context.completeness.stoppedBy, "time");
+  assert.deepEqual(context.timing.stalled, { step: "export", nodeId: "1:3", ms: 24000 });
 });
 
 const ASSET_CAPABILITIES = ["read-node", "read-document-index", "figma-rest", "edit-seq", "assets", "render"];

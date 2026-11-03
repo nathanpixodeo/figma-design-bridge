@@ -1390,6 +1390,167 @@ test('Bridge answers a read waiting right behind the same read with its answer, 
   assert.deepEqual(results().slice(-3).map(message => message.requestId), ['before', 'index', 'behind'])
 })
 
+// Read deadlines. Figma can leave a call unsettled. A read still ends a little
+// before the bridge gives up on it, with what it read, and the reads queued
+// behind it run. In these tests the fake clock's timers stand for time
+// passing: settle() fires the deadline timer as soon as a call is waiting.
+const never = () => new Promise(() => {})
+
+// A section of leaf layers, each exportable. maxNodes 3 keeps the section from
+// being exported whole, so each layer is exported on its own.
+function deadlineSection(p, count = 3) {
+  const section = { id: '9:1', name: 'Finance Manager', type: 'SECTION', parent: p.otherPage, children: [] }
+  const nodes = new Map([[section.id, section]])
+  for (let i = 0; i < count; i++) {
+    const layer = { id: `9:${i + 2}`, name: `Screen ${i}`, type: 'RECTANGLE', parent: section }
+    section.children.push(layer)
+    nodes.set(layer.id, layer)
+  }
+  exportable(section)
+  p.figma.getNodeByIdAsync = async id => nodes.get(id) || null
+  return { section, nodes }
+}
+
+function timedRequest(requestId, nodeId, { options = { maxNodes: 3 }, representation = 'figma-rest', timeoutMs = 60_000, enqueuedAt = Date.now() } = {}) {
+  return {
+    type: 'bridge-request', sessionId: 'session-1',
+    request: {
+      requestId, op: 'read-node', enqueuedAt, expiresAt: enqueuedAt + timeoutMs,
+      params: { fileKey: 'AAAAfileKeyAAAA', nodeId, representation, options },
+    },
+  }
+}
+
+const bridgeReplies = p => p.sent.filter(message => message.type === 'bridge-result')
+
+test('Bridge stops a read at its deadline when Figma never finishes an export, and answers with what it read', async () => {
+  const p = await connectedBridgePlugin()
+  const { section } = deadlineSection(p)
+  section.children[0].exportAsync = never
+
+  await settle(p, p.message(timedRequest('stuck', section.id)))
+  const [reply] = bridgeReplies(p)
+  assert.equal(reply.ok, true)
+  assert.equal(reply.result.format, 'figma-rest', 'a timed-out export is not a reason to read the old way')
+  assert.equal(reply.result.fallbackReason, undefined)
+  assert.equal(reply.result.truncated, true)
+  assert.equal(reply.result.completeness.stoppedBy, 'time')
+  assert.equal(reply.result.timing.stalled.step, 'export')
+  assert.equal(reply.result.timing.stalled.nodeId, '9:2')
+  assert.equal(typeof reply.result.timing.outlineMs, 'number')
+  const [first, ...rest] = reply.result.payload.document.children
+  assert.deepEqual([first.id, first.partial], ['9:2', true], 'the layer Figma did not export is outlined')
+  assert.deepEqual(rest, [
+    { id: '9:3', name: 'Screen 1', type: 'RECTANGLE', truncated: true },
+    { id: '9:4', name: 'Screen 2', type: 'RECTANGLE', truncated: true },
+  ])
+  // 60 s to answer: the read stops 5 s before the bridge gives up.
+  assert.ok(p.time.delays.some(delay => delay > 54_000 && delay <= 55_000), String(p.time.delays))
+})
+
+test('Bridge serves the reads queued behind one that Figma never finishes', async () => {
+  const p = await connectedBridgePlugin()
+  const { section } = deadlineSection(p)
+  section.children[0].exportAsync = never
+  const index = { type: 'bridge-request', sessionId: 'session-1', request: { requestId: 'index', op: 'read-document-index', params: { fileKey: 'AAAAfileKeyAAAA' } } }
+
+  await settle(p, Promise.all([p.message(timedRequest('stuck', section.id)), p.message(index)]))
+  assert.deepEqual(bridgeReplies(p).map(message => [message.requestId, message.ok]), [['stuck', true], ['index', true]])
+})
+
+test('Bridge keeps the variables it named before its deadline', async () => {
+  const p = await connectedBridgePlugin()
+  const frame = p.target.parent
+  p.target.rest = {
+    fills: [
+      { type: 'SOLID', boundVariables: { color: { type: 'VARIABLE_ALIAS', id: 'VariableID:7:1' } } },
+      { type: 'SOLID', boundVariables: { color: { type: 'VARIABLE_ALIAS', id: 'VariableID:7:2' } } },
+    ],
+  }
+  exportable(frame)
+  p.figma.variables = {
+    getVariableByIdAsync: id => (id === 'VariableID:7:1'
+      ? Promise.resolve({ id, name: 'color/ink', resolvedType: 'COLOR', variableCollectionId: 'VariableCollectionId:7:0' })
+      : never()),
+    getVariableCollectionByIdAsync: async id => ({ id, name: 'Tokens' }),
+  }
+
+  await settle(p, p.message(timedRequest('variables', frame.id, { options: {} })))
+  const [reply] = bridgeReplies(p)
+  assert.equal(reply.ok, true)
+  assert.deepEqual(reply.result.payload.variables, { 'VariableID:7:1': { name: 'color/ink', resolvedType: 'COLOR', collection: 'Tokens' } })
+  assert.equal(reply.result.payload.document.children[0].characters, 'Hello from another page', 'the tree is whole')
+  assert.equal(reply.result.truncated, true)
+  assert.equal(reply.result.completeness.stoppedBy, 'time')
+  assert.deepEqual([reply.result.timing.stalled.step, reply.result.timing.stalled.nodeId], ['variable', 'VariableID:7:2'])
+})
+
+test('Bridge says Figma is still loading the page when the layer does not load in time', async () => {
+  const p = await connectedBridgePlugin()
+  const { section, nodes } = deadlineSection(p)
+  p.figma.getNodeByIdAsync = never
+
+  await settle(p, p.message(timedRequest('loading', section.id)))
+  const [reply] = bridgeReplies(p)
+  assert.equal(reply.ok, false)
+  assert.equal(reply.error, 'Figma is still loading the page of layer 9:1. Retry the read in a moment, or open that page in Figma first.')
+
+  p.figma.getNodeByIdAsync = async id => nodes.get(id) || null
+  await settle(p, p.message(timedRequest('loaded', section.id)))
+  assert.equal(bridgeReplies(p).at(-1).ok, true)
+})
+
+test('Bridge gives up on a render Figma never finishes, and serves the next read', async () => {
+  const p = await connectedBridgePlugin()
+  const { nodes } = assetFigma(p, { id: '7:1', name: 'Search', type: 'FRAME', width: 300, height: 100, fills: [SOLID] })
+  const render = nodes.get('7:1').exportAsync
+  nodes.get('7:1').exportAsync = never
+
+  await settle(p, p.message(timedRequest('render', '7:1', { options: {}, representation: 'render+s1' })))
+  const [reply] = bridgeReplies(p)
+  assert.equal(reply.ok, false)
+  assert.equal(reply.error, "Figma did not finish exporting layer 7:1 before the read's time limit. Pass a larger timeoutMs, or read a smaller layer.")
+
+  nodes.get('7:1').exportAsync = render
+  await settle(p, p.message(timedRequest('again', '7:1', { options: {}, representation: 'render+s1' })))
+  assert.equal(bridgeReplies(p).at(-1).result.payload.type, 'RENDER')
+})
+
+test('Bridge reads again rather than reuse an answer its deadline cut', async () => {
+  const p = await connectedBridgePlugin()
+  const { section } = deadlineSection(p)
+  let attempts = 0
+  section.children[0].exportAsync = () => { attempts++; return never() }
+
+  await settle(p, Promise.all([p.message(timedRequest('first', section.id)), p.message(timedRequest('retry', section.id))]))
+  assert.deepEqual(bridgeReplies(p).map(message => message.requestId), ['first', 'retry'])
+  assert.equal(attempts, 2)
+})
+
+test('Bridge tells a read it did not start when it waited past its deadline', async () => {
+  const p = await connectedBridgePlugin()
+  const { section } = deadlineSection(p)
+
+  // Queued 60 s ago with 60.5 s to answer: half a second is left, less than
+  // the 5 s the answer needs.
+  await settle(p, p.message(timedRequest('late', section.id, { timeoutMs: 60_500, enqueuedAt: Date.now() - 60_000 })))
+  const [reply] = bridgeReplies(p)
+  assert.equal(reply.ok, false)
+  assert.equal(reply.error, 'This read waited behind earlier reads until its time limit, so the plugin did not start it. Retry it, or pass a larger timeoutMs.')
+})
+
+test('Bridge sets no deadline timer for a read without a deadline', async () => {
+  const p = await connectedBridgePlugin()
+  const { section } = deadlineSection(p)
+  const before = p.time.delays.length
+
+  const reply = await readRest(p, section.id, { maxNodes: 3 })
+  assert.equal(reply.ok, true)
+  assert.equal(reply.result.completeness.stoppedBy, undefined)
+  assert.equal(reply.result.timing.stalled, undefined)
+  assert.equal(p.time.delays.length, before)
+})
+
 // A layer tree for the asset tests: every layer gets a parent, a place in
 // nodes and Figma's exports. An SVG is drawn from the layer's visible shapes,
 // with an id carrying the layer's id, as Figma's ids do.

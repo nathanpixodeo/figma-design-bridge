@@ -258,7 +258,9 @@ function describeError(error, { read = false } = {}) {
   } else if (error.code === "TIMEOUT" && read) {
     hint = " Figma loads a large page slowly the first time it is read. Retrying is safe: a read the plugin "
       + "was already working on is kept when it finishes and answers the retry. Otherwise pass a larger timeoutMs "
-      + "(up to 120000), or a smaller depth or maxNodes. Keep the Design Bridge panel open in Figma.";
+      + "(up to 120000), or a smaller depth or maxNodes. Keep the Design Bridge panel open in Figma. If even a "
+      + "small read times out, the panel is stuck on an earlier read: ask the user to close and reopen Design "
+      + "Bridge in Figma.";
   } else if (error.code === "SESSION_LOST" && read) {
     hint = " The Design Bridge panel closed or stopped answering during this read. If Figma's console shows "
       + "\"Plugin runtime aborted\", the read was too large for the plugin's memory. Ask the user to reopen "
@@ -350,6 +352,30 @@ function cutLayers(bridge) {
 
 const CUT_LAYERS_LISTED = 15;
 
+// The plugin stopped this read at its deadline and answered with what it had.
+function stoppedForTime(bridge) {
+  return bridge?.completeness?.stoppedBy === "time";
+}
+
+// What Figma was doing when a read's deadline came, by the plugin's step name.
+const STALLED_STEPS = {
+  load: "loading the page of layer",
+  export: "exporting layer",
+  variable: "looking up variable",
+  geometry: "reading the vector paths of layer",
+  image: "reading image",
+};
+
+function timeNote(bridge) {
+  const total = bridge.timing?.totalMs;
+  const stalled = bridge.timing?.stalled;
+  const after = Number.isFinite(total) ? ` after ${total} ms` : "";
+  const waiting = stalled?.step
+    ? ` Figma was still ${STALLED_STEPS[stalled.step] || stalled.step}${stalled.nodeId ? ` ${stalled.nodeId}` : ""}.`
+    : "";
+  return `The plugin stopped this read at its time limit${after}.${waiting}`;
+}
+
 // What limits how far a bridge read can be trusted.
 function readNotes(bridge) {
   const notes = [];
@@ -358,13 +384,20 @@ function readNotes(bridge) {
   }
   if (bridge.truncated) {
     const cut = bridge.completeness?.truncatedNodeIds?.length;
-    let note = `The read was truncated${cut ? ` (${cut} subtree(s) cut)` : ""} at depth, maxNodes or maxBytes.`;
+    const timeUp = stoppedForTime(bridge);
+    let note = timeUp
+      ? timeNote(bridge)
+      : `The read was truncated${cut ? ` (${cut} subtree(s) cut)` : ""} at depth, maxNodes or maxBytes.`;
     const layers = bridge.nodeId ? cutLayers(bridge) : [];
     if (layers.length) {
       const named = layers.slice(0, CUT_LAYERS_LISTED).map(layer => `"${layer.name ?? ""}" (${layer.id})`).join(", ");
       const more = layers.length > CUT_LAYERS_LISTED ? `, and ${layers.length - CUT_LAYERS_LISTED} more` : "";
-      note += ` ${layers.length} layer(s) were left out, with everything inside them: ${named}${more}.`
-        + " Read each one with the same link and its id as node-id, or raise maxBytes (up to 10000000).";
+      note += ` ${layers.length} layer(s) were left out, with everything inside them: ${named}${more}.`;
+    }
+    if (timeUp) {
+      note += " Read one screen frame by its id as node-id rather than this whole node, or pass a larger timeoutMs (up to 120000).";
+    } else if (layers.length) {
+      note += " Read each one with the same link and its id as node-id, or raise maxBytes (up to 10000000).";
     } else {
       note += " Raise them or read a child node before concluding that something is missing.";
     }
@@ -430,8 +463,10 @@ async function resolveDesign(args = {}) {
     }));
     // The usual limits first, so a read get_design_context already made is
     // reused; a cut read is taken again whole unless the caller set a limit.
+    // A read cut by its time limit is not: a larger one would stop there too.
     let result = await read(readOptionsFromArgs(args));
-    if (result?.truncated && result.nodeId && LIMIT_KEYS.every(key => args[key] === undefined)) {
+    if (result?.truncated && result.nodeId && !stoppedForTime(result)
+      && LIMIT_KEYS.every(key => args[key] === undefined)) {
       result = await read(readOptionsFromArgs(args, FULL_READ));
     }
     return bridgeResultToDesign(result);

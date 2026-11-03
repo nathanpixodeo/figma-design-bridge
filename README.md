@@ -809,7 +809,8 @@ panel reads one node at a time; reads of different files run in parallel. Since
 
 - **One native export instead of a walk.** A node is read with Figma's own
   `exportAsync({ format: 'JSON_REST_V1' })` instead of property by property in
-  JavaScript. Each read reports `timing: { countMs, exportMs, totalMs }`.
+  JavaScript. Each read reports
+  `timing: { countMs, exportMs, outlineMs, variablesMs, totalMs }`.
 - **Unchanged reads are reused.** A read of a node the same panel read in the
   last five minutes is answered from the cache once the panel confirms no edit
   since (`reused: true`, with `ageMs` and the original `fetchedAt`). The panel
@@ -819,6 +820,11 @@ panel reads one node at a time; reads of different files run in parallel. Since
   skipped. One the panel was already working on is kept when it finishes, and
   answers the caller's retry. Identical reads waiting together share one answer.
 - **A timeout says why.** `TIMEOUT` counts the reads that were ahead of it.
+- **A read ends on time.** Figma can leave a call unsettled, such as an export
+  inside a very large section. A read stops a little before its `timeoutMs` and
+  answers with what it read: a truncated read with
+  `completeness.stoppedBy: "time"`, and `timing.stalled` naming the Figma call
+  it was waiting on. So one slow read no longer holds the reads behind it.
 
 Full route contract, request/response schemas and error codes:
 **[docs/BRIDGE_PROTOCOL.md](docs/BRIDGE_PROTOCOL.md)**.
@@ -842,6 +848,9 @@ the same command on Linux and Windows against Node 20, 22 and 24.
 - The first read of a large page can take longer than the default 30-second
   timeout while Figma loads it. Pass a larger `timeoutMs` (up to 120000), or a
   smaller `depth` or `maxNodes`; a retry is fast.
+- Figma can take minutes, or never finish, exporting a layer inside a very
+  large section. The read then stops at its time limit and names the layer.
+  Read one screen frame by its id rather than the whole section.
 - A read is capped at 20,000 nodes and 10 MB. Figma can still close the plugin
   when a large read runs it out of memory; read one screen frame rather than a
   section of many screens.
@@ -1189,7 +1198,8 @@ claude -p "Based on these text nodes, write better copy for the landing page: $T
 | MCP server not connecting | Run `figma-bridge status`, then `figma-bridge setup` to reinstall the plugin, and restart the client. In a hand-written MCP config, use `figma-bridge mcp` as the command. |
 | `figma-bridge pair` says the bridge "rejected the token" | The bridge on port 3456 keeps a different data directory — usually a Claude Code session still running a plugin older than 1.3.0. [Update the plugin](#updating), restart Claude Code, then press **Pair with bridge** again. `figma-bridge status` shows whether the running bridge uses another data directory. |
 | `figma-bridge start` says a bridge "uses another data directory" | A launcher that keeps its own data directory, or a version older than 1.3.0, holds port 3456 and would keep the Figma plugin on a different token. Stop or update it, then run `figma-bridge start` again. When the running bridge shares the data directory, `figma-bridge start` just says it is not needed. |
-| `get_design_context` returns `TIMEOUT` | Reads of one file take turns in the plugin, and the error says how many were ahead. Figma also loads a large page slowly the first time it is read. Retry: a read the plugin was already working on answers the retry when it finishes. Otherwise pass a larger `timeoutMs` (up to 120000) or a smaller `depth` or `maxNodes`, and keep the panel open. |
+| `get_design_context` returns `TIMEOUT` | Reads of one file take turns in the plugin, and the error says how many were ahead. Figma also loads a large page slowly the first time it is read. Retry: a read the plugin was already working on answers the retry when it finishes. Otherwise pass a larger `timeoutMs` (up to 120000) or a smaller `depth` or `maxNodes`, and keep the panel open. If even a small read times out, the panel is stuck on an earlier read, which a plugin older than 1.10.1 never stops: close Design Bridge and open it again. |
+| A read says the plugin stopped it at its time limit | Figma did not finish a call in time, and the note names the call and the layer. The layers it did not reach are placeholders. Read one screen frame by its id as `node-id` rather than the whole section, or pass a larger `timeoutMs` (up to 120000). |
 | A read says `pluginOutdated: true`, or that Design Bridge is too old to export REST JSON | The panel open in Figma runs a plugin older than 1.5.0, which reads its own way and can miss attributes such as per-corner radii. Close Design Bridge and open it again: Figma loads the plugin's code anew. With a clone, `git pull` first. |
 | A read says the bridge is older than the MCP server | Every agent session shares the bridge the first one started, and that one runs an older version. Close every Claude Code, Codex, agy and Gemini CLI session so the next one starts the new bridge, then reopen Design Bridge in Figma. |
 | Figma's console shows `Plugin runtime aborted` and the panel closes; the read fails with `SESSION_LOST` | The read was too large for the plugin's memory. Reopen Design Bridge, then read one screen frame rather than a section of many screens, or pass a smaller `depth` or `maxNodes`, or `includeHidden: false`. A panel left open for hours is closer to the limit; reopening it starts fresh. |

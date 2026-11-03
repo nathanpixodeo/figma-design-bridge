@@ -667,7 +667,93 @@ function markBridgeTruncated(limits, nodeId) {
 }
 
 function bridgeBudgetSpent(limits) {
-  return limits.state.nodeCount >= limits.maxNodes || limits.state.byteSize >= limits.maxBytes
+  return limits.state.nodeCount >= limits.maxNodes || limits.state.byteSize >= limits.maxBytes || readTimeUp(limits)
+}
+
+// A read ends by its deadline, with what it has read so far. Figma can leave a
+// call unsettled: an export inside a very large section never answered, in
+// testing. The plugin serves one read at a time, so without a deadline that
+// one read would hold every read after it until the panel was reopened.
+function readTimeUp(limits) {
+  if (!limits || !limits.state || !Number.isFinite(limits.deadline)) return false
+  if (!limits.state.timeUp) {
+    if (Date.now() < limits.deadline) return false
+    stopForTime(limits)
+  }
+  return true
+}
+
+// Whatever the read skips from here on makes it incomplete.
+function stopForTime(limits) {
+  limits.state.timeUp = true
+  limits.state.limitHit = true
+}
+
+// The read stops a little before the bridge gives up on it, so its answer
+// still has time to be serialized and sent.
+const READ_RESERVE_MIN_MS = 1000
+const READ_RESERVE_MAX_MS = 5000
+
+function readDeadline(request) {
+  const expiresAt = request && request.expiresAt
+  if (!Number.isFinite(expiresAt)) return Infinity
+  const enqueuedAt = Number.isFinite(request.enqueuedAt) ? request.enqueuedAt : expiresAt - 30_000
+  const reserve = Math.min(READ_RESERVE_MAX_MS, Math.max(READ_RESERVE_MIN_MS, (expiresAt - enqueuedAt) / 5))
+  return expiresAt - reserve
+}
+
+const TIME_UP_MESSAGES = {
+  load: id => `Figma is still loading the page of layer ${id}. Retry the read in a moment, or open that page in Figma first.`,
+  export: id => `Figma did not finish exporting layer ${id} before the read's time limit. Pass a larger timeoutMs, or read a smaller layer.`,
+}
+
+function timeUpError(step, id) {
+  const message = TIME_UP_MESSAGES[step] ? TIME_UP_MESSAGES[step](id) : `Figma did not answer in time (${step} ${id}).`
+  const error = new Error(message)
+  error.timeUp = true
+  return error
+}
+
+// Runs one Figma call, waiting for it no longer than the read's deadline. When
+// the deadline comes first, the read records the call it was waiting on and
+// the call's answer, if it ever comes, is dropped.
+function untilDeadline(limits, step, id, call) {
+  if (!limits || !limits.state || !Number.isFinite(limits.deadline)) return call()
+  if (readTimeUp(limits)) return Promise.reject(timeUpError(step, id))
+  const started = Date.now()
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      stopForTime(limits)
+      limits.state.stalled = { step, nodeId: id, ms: Date.now() - started }
+      reject(timeUpError(step, id))
+    }, Math.max(0, limits.deadline - started))
+    Promise.resolve().then(call).then(
+      value => { clearTimeout(timer); resolve(value) },
+      error => { clearTimeout(timer); reject(error) },
+    )
+  })
+}
+
+// The layer a read is for. Loading it can load its page, which Figma does
+// slowly the first time on a large file.
+async function loadBridgeNode(nodeId, limits) {
+  return untilDeadline(limits, 'load', nodeId, () => figma.getNodeByIdAsync(nodeId))
+}
+
+// One Figma lookup: null when it fails, as a lookup that finds nothing. It
+// throws only when the read is out of time.
+async function lookupWithin(limits, step, id, call) {
+  try {
+    return await untilDeadline(limits, step, id, call)
+  } catch (error) {
+    if (error && error.timeUp) throw error
+    return null
+  }
+}
+
+// The completeness field a read cut by its deadline adds.
+function timeUpFields(limits) {
+  return limits && limits.state && limits.state.timeUp ? { stoppedBy: 'time' } : {}
 }
 
 // Decides whether a node is walked. Returns a placeholder when a limit cuts it,
@@ -923,7 +1009,8 @@ function parseFileKey(source) {
 // about 90 seconds to walk, and the bridge waits two minutes at most. Depth
 // is not limited unless asked: nested instances put text 20 levels down, and
 // maxNodes and maxBytes already bound the read.
-function bridgeLimits(options = {}) {
+// deadline: when the read stops and answers with what it has (readDeadline).
+function bridgeLimits(options = {}, deadline = Infinity) {
   const integer = (value, fallback, min, max) => Number.isInteger(value) ? Math.max(min, Math.min(max, value)) : fallback
   return {
     maxDepth: integer(options.depth, 50, 0, 50),
@@ -931,7 +1018,8 @@ function bridgeLimits(options = {}) {
     maxBytes: integer(options.maxBytes, 2_000_000, 1024, 10_000_000),
     maxTextChars: 100_000,
     includeHidden: options.includeHidden !== false,
-    state: { nodeCount: 0, byteSize: 0, limitHit: false, truncatedNodeIds: [] },
+    deadline,
+    state: { nodeCount: 0, byteSize: 0, limitHit: false, truncatedNodeIds: [], timeUp: false, stalled: null },
   }
 }
 
@@ -990,6 +1078,7 @@ function completenessFor(payload, limits, knownSize) {
     byteSize,
     limitHit: limits.state.limitHit || byteSize > limits.maxBytes,
     truncatedNodeIds: limits.state.truncatedNodeIds.slice(0, 200),
+    ...timeUpFields(limits),
   }
 }
 
@@ -1141,8 +1230,8 @@ function missingBridgeNode(nodeId) {
 
 async function readBridgeNode(request) {
   const params = request.params || {}
-  const limits = bridgeLimits(params.options || {})
-  const node = await figma.getNodeByIdAsync(params.nodeId)
+  const limits = bridgeLimits(params.options || {}, readDeadline(request))
+  const node = await loadBridgeNode(params.nodeId, limits)
   if (!node) return missingBridgeNode(params.nodeId)
 
   // The walked tree is released as soon as it is serialized, and parsing that
@@ -1203,6 +1292,9 @@ async function measureSubtree(node, room, levels, read) {
   const known = read.sizes.get(node.id)
   if (known) return known
   await read.pace()
+  // Out of time: the node does not fit, so it is outlined and its children
+  // come back as placeholders.
+  if (readTimeUp(read.limits)) return { count: Infinity, height: Infinity }
   const size = { count: 1, height: 0 }
   let children = []
   // A layer deleted while the walk was paused counts as nothing.
@@ -1229,8 +1321,9 @@ async function exportRestNode(node, read) {
   const started = Date.now()
   let exported
   try {
-    exported = await node.exportAsync({ format: 'JSON_REST_V1' })
+    exported = await untilDeadline(read.limits, 'export', node.id, () => node.exportAsync({ format: 'JSON_REST_V1' }))
   } catch (error) {
+    if (error && error.timeUp) throw error
     throw exportFailure(node, (error && error.message) || String(error))
   } finally {
     read.timing.exportMs += Date.now() - started
@@ -1384,16 +1477,21 @@ async function exportWithin(node, depth, read) {
         if (depth > 0) limits.state.byteSize += JSON.stringify(exported).length + 1
         return exported
       } catch (error) {
-        // Until one export has worked, a failure may mean this Figma cannot
-        // export JSON at all, and the read falls back as a whole.
-        if (!error.exportFailed || read.exports === 0) throw error
-        exportError = error.message
+        // Out of time while Figma exported it: the node is outlined instead.
+        if (!error.timeUp) {
+          // Until one export has worked, a failure may mean this Figma cannot
+          // export JSON at all, and the read falls back as a whole.
+          if (!error.exportFailed || read.exports === 0) throw error
+          exportError = error.message
+        }
       }
     }
   }
 
   limits.state.nodeCount++
+  const outlined = Date.now()
   const outline = outlineNode(node)
+  read.timing.outlineMs += Date.now() - outlined
   if (exportError) outline.exportError = exportError
   limits.state.byteSize += JSON.stringify(outline).length + 1
   let children = []
@@ -1423,7 +1521,14 @@ async function addGeometry(read) {
   for (const restNode of read.vectors) {
     await read.pace()
     let node = null
-    try { node = await figma.getNodeByIdAsync(restNode.id) } catch {}
+    try {
+      node = await lookupWithin(read.limits, 'geometry', restNode.id, () => figma.getNodeByIdAsync(restNode.id))
+    } catch (error) {
+      if (!error.timeUp) throw error
+      // Out of time: the vectors left keep the paths the export gave them.
+      markBridgeTruncated(read.limits)
+      return
+    }
     if (!node) continue
     for (const field of ['fillGeometry', 'strokeGeometry']) {
       try {
@@ -1444,15 +1549,21 @@ async function resolveVariables(ids, read) {
   for (const id of ids.slice(0, MAX_BRIDGE_VARIABLES)) {
     await read.pace()
     let variable = null
-    try { variable = await api.getVariableByIdAsync(id) } catch {}
+    try {
+      variable = await lookupWithin(read.limits, 'variable', id, () => api.getVariableByIdAsync(id))
+      const collectionId = variable && variable.variableCollectionId
+      if (variable && !collections.has(collectionId)) {
+        collections.set(collectionId, await lookupWithin(read.limits, 'variable', collectionId, () => api.getVariableCollectionByIdAsync(collectionId)))
+      }
+    } catch (error) {
+      if (!error.timeUp) throw error
+      // Out of time: the variables named so far are kept, the rest stay ids.
+      markBridgeTruncated(read.limits)
+      break
+    }
     // A library variable the file never imported cannot be looked up.
     if (!variable) continue
     const collectionId = variable.variableCollectionId
-    if (!collections.has(collectionId)) {
-      let collection = null
-      try { collection = await api.getVariableCollectionByIdAsync(collectionId) } catch {}
-      collections.set(collectionId, collection)
-    }
     const collection = collections.get(collectionId)
     const entry = { name: variable.name, resolvedType: variable.resolvedType }
     if (collection && collection.name) entry.collection = collection.name
@@ -1482,15 +1593,15 @@ function fitRestPayloadToLimit(payload, limits, nodeId, size) {
 async function readBridgeNodeRest(request) {
   const started = Date.now()
   const params = request.params || {}
-  const limits = bridgeLimits(params.options || {})
-  const node = await figma.getNodeByIdAsync(params.nodeId)
+  const limits = bridgeLimits(params.options || {}, readDeadline(request))
+  const node = await loadBridgeNode(params.nodeId, limits)
   if (!node) return missingBridgeNode(params.nodeId)
 
   const read = {
     limits, pace: createPacer(), sizes: new Map(), exports: 0,
     geometry: representationParts(request).includes('geometry'), vectors: [],
     components: {}, componentSets: {}, styles: {},
-    timing: { countMs: 0, exportMs: 0, totalMs: 0 },
+    timing: { countMs: 0, exportMs: 0, outlineMs: 0, variablesMs: 0, totalMs: 0 },
   }
   let document
   try {
@@ -1512,13 +1623,16 @@ async function readBridgeNodeRest(request) {
   let size = utf8Length(text)
   const variableIds = [...new Set(text.match(/"VariableID:[^"\\]*"/g) || [])].map(id => id.slice(1, -1))
   text = null
+  const named = Date.now()
   payload.variables = await resolveVariables(variableIds, read)
+  read.timing.variablesMs = Date.now() - named
   size += utf8Length(',"variables":') + jsonBytes(payload.variables)
   if (size > limits.maxBytes) size = fitRestPayloadToLimit(payload, limits, node.id, size)
 
   const completeness = completenessFor(payload.document, limits, size)
   const page = findPageForNode(node)
   read.timing.totalMs = Date.now() - started
+  if (limits.state.stalled) read.timing.stalled = limits.state.stalled
   return {
     fileKey: state.bridgeFileKey, fileName: state.bridgeFileName, nodeId: node.id,
     pageId: page ? page.id : null, pageName: page ? page.name : null, found: true,
@@ -1674,9 +1788,10 @@ async function exportSvg(node, read) {
   const started = Date.now()
   try {
     try {
-      return { svg: await node.exportAsync({ format: 'SVG_STRING' }) }
-    } catch {
-      return { svgBase64: figma.base64Encode(await node.exportAsync({ format: 'SVG' })) }
+      return { svg: await untilDeadline(read.limits, 'export', node.id, () => node.exportAsync({ format: 'SVG_STRING' })) }
+    } catch (error) {
+      if (error && error.timeUp) throw error
+      return { svgBase64: figma.base64Encode(await untilDeadline(read.limits, 'export', node.id, () => node.exportAsync({ format: 'SVG' }))) }
     }
   } finally {
     read.timing.exportMs += Date.now() - started
@@ -1755,9 +1870,9 @@ async function exportImages(read) {
     }
     const started = Date.now()
     try {
-      const size = typeof source.getSizeAsync === 'function' ? await source.getSizeAsync() : null
+      const size = typeof source.getSizeAsync === 'function' ? await untilDeadline(read.limits, 'image', image.hash, () => source.getSizeAsync()) : null
       if (size) Object.assign(image, { width: size.width, height: size.height })
-      const bytes = await source.getBytesAsync()
+      const bytes = await untilDeadline(read.limits, 'image', image.hash, () => source.getBytesAsync())
       image.byteLength = bytes.length
       if (fitsBudget(read, Math.ceil(bytes.length / 3) * 4 + 512)) image.base64 = figma.base64Encode(bytes)
       else {
@@ -1777,8 +1892,8 @@ async function exportImages(read) {
 async function readBridgeAssets(request) {
   const started = Date.now()
   const params = request.params || {}
-  const limits = bridgeLimits({ ...(params.options || {}), includeHidden: false })
-  const node = await figma.getNodeByIdAsync(params.nodeId)
+  const limits = bridgeLimits({ ...(params.options || {}), includeHidden: false }, readDeadline(request))
+  const node = await loadBridgeNode(params.nodeId, limits)
   if (!node) return missingBridgeNode(params.nodeId)
 
   const read = {
@@ -1800,8 +1915,9 @@ async function readBridgeAssets(request) {
   read.timing.totalMs = Date.now() - started
   const completeness = {
     nodeCount: limits.state.nodeCount, byteSize,
-    limitHit: limits.state.limitHit, truncatedNodeIds: limits.state.truncatedNodeIds,
+    limitHit: limits.state.limitHit, truncatedNodeIds: limits.state.truncatedNodeIds, ...timeUpFields(limits),
   }
+  if (limits.state.stalled) read.timing.stalled = limits.state.stalled
   return {
     fileKey: state.bridgeFileKey, fileName: state.bridgeFileName, nodeId: node.id,
     pageId: page ? page.id : null, pageName: page ? page.name : null, found: true,
@@ -1814,9 +1930,9 @@ async function readBridgeAssets(request) {
 async function readBridgeRender(request) {
   const started = Date.now()
   const params = request.params || {}
-  const limits = bridgeLimits(params.options || {})
+  const limits = bridgeLimits(params.options || {}, readDeadline(request))
   const parts = representationParts(request)
-  const node = await figma.getNodeByIdAsync(params.nodeId)
+  const node = await loadBridgeNode(params.nodeId, limits)
   if (!node) return missingBridgeNode(params.nodeId)
   if (typeof node.exportAsync !== 'function') throw new Error(`Figma cannot render layer ${node.id} (${node.type})`)
 
@@ -1828,7 +1944,7 @@ async function readBridgeRender(request) {
   const height = roundSize(readValue(node, 'height'))
   const payload = { type: 'RENDER', name: node.name, format, width, height }
   if (format === 'svg') {
-    const exported = await exportSvg(node, { timing: { exportMs: 0 } })
+    const exported = await exportSvg(node, { limits, timing: { exportMs: 0 } })
     const markup = exported.svg !== undefined ? exported.svg : exported.svgBase64
     if (utf8Length(markup) + 512 > limits.maxBytes) markBridgeTruncated(limits, node.id)
     else Object.assign(payload, exported)
@@ -1839,7 +1955,7 @@ async function readBridgeRender(request) {
       scale = MAX_RENDER_SIDE / longest
       constraint = width >= height ? { type: 'WIDTH', value: MAX_RENDER_SIDE } : { type: 'HEIGHT', value: MAX_RENDER_SIDE }
     }
-    const bytes = await node.exportAsync({ format: format === 'jpg' ? 'JPG' : 'PNG', constraint })
+    const bytes = await untilDeadline(limits, 'export', node.id, () => node.exportAsync({ format: format === 'jpg' ? 'JPG' : 'PNG', constraint }))
     payload.scale = Math.round(scale * 1000) / 1000
     payload.byteLength = bytes.length
     // Too large to send: the answer says so, and the caller asks again smaller.
@@ -1924,6 +2040,16 @@ async function handleBridgeRequest(sessionId, request) {
     replyBridgeRead(sessionId, request, previous.result)
     return
   }
+  // Too little time is left to read anything: the caller hears why now,
+  // rather than a timeout later.
+  const deadline = readDeadline(request)
+  if (Number.isFinite(deadline) && Date.now() >= deadline) {
+    figma.ui.postMessage({
+      type: 'bridge-result', sessionId, requestId: request.requestId, ok: false,
+      error: 'This read waited behind earlier reads until its time limit, so the plugin did not start it. Retry it, or pass a larger timeoutMs.',
+    })
+    return
+  }
   state.bridgeReading = true
   // Taken before the read starts: an edit made while it runs leaves the result
   // behind the count, so the bridge never reuses it.
@@ -1934,7 +2060,8 @@ async function handleBridgeRequest(sessionId, request) {
     else if (request.op === 'read-document-index') result = readBridgeDocumentIndex(request)
     else throw new Error(`Unsupported bridge operation: ${request.op}`)
     result.editSeq = editSeq
-    keepForNextRead({ key, editSeq, result })
+    // A read cut by its deadline is not reused: a retry may have more time.
+    if (!(result.completeness && result.completeness.stoppedBy)) keepForNextRead({ key, editSeq, result })
     replyBridgeRead(sessionId, request, result)
   } catch (error) {
     figma.ui.postMessage({ type: 'bridge-result', sessionId, requestId: request.requestId, ok: false, error: error.message || String(error) })

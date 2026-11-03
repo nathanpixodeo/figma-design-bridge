@@ -213,7 +213,12 @@ of a read.
 
 The plugin serves reads one at a time, in the order they arrive. A read still
 waiting when its `expiresAt` passes is skipped: its caller already has its
-`TIMEOUT`. A read waiting right behind the same read (same op, node,
+`TIMEOUT`. A read has a deadline a little before `expiresAt`: a fifth of the
+time between `enqueuedAt` and `expiresAt`, between 1 and 5 seconds, is left for
+the answer to reach the bridge. A read that reaches its turn after that
+deadline is refused at once with an error that says so. One that is still
+running at the deadline stops, and answers with what it read (see
+[A read cut by its deadline](#a-read-cut-by-its-deadline)). A read waiting right behind the same read (same op, node,
 representation and options) is answered with that read's result when no edit
 came in since it began, which is what a caller retrying after a timeout asks
 for.
@@ -255,6 +260,20 @@ Delivers a result for one polled request.
   }
 }
 ```
+
+### A read cut by its deadline
+
+Figma can leave a call unsettled, such as an export inside a very large section.
+The plugin waits for each Figma call no longer than the read's deadline, so
+the read never holds the reads behind it. A read that reaches the deadline
+turns every layer it has not read into a placeholder, as `maxNodes` does. It
+answers with `truncated: true`, `completeness.stoppedBy: "time"` and
+`timing.stalled: { step, nodeId, ms }`. `step` names the Figma call it was
+waiting on: `load`, `export`, `variable`, `geometry` or `image`. When the layer
+itself does not load in time, or an `assets` or `render` export does not finish,
+the read fails with an error that says so. The bridge does not cache a read cut
+by its deadline, and the plugin does not reuse it for a retry: the next read may
+have more time.
 
 `editSeq` is the plugin's edit count when the read began. `format` says how the
 payload is laid out, `timing` how long the read took, and `fallbackReason` why a
@@ -538,7 +557,7 @@ a field:
 | `stale` | "not verified against the live document", not "known out of date" |
 | `ageMs` | Age of the entry, `0` for a read made now |
 | `truncated` | Whether a limit cut the payload |
-| `completeness` | `{ nodeCount, byteSize, limitHit, truncatedNodeIds }` |
+| `completeness` | `{ nodeCount, byteSize, limitHit, truncatedNodeIds }`, plus `stoppedBy: "time"` when the read stopped at its deadline |
 
 > **Do not branch on `source` to decide whether a response is live.** A cached
 > replay of plugin-produced data still reports `source: "plugin"`; only
@@ -823,7 +842,8 @@ re-probes and reuses the winner.
   marked unverified.
 - **Truncation does not say which limit was hit.** `completeness.limitHit` and
   `truncatedNodeIds` show that and where a result was cut, not whether
-  `depth`, `maxNodes` or `maxBytes` did it.
+  `depth`, `maxNodes` or `maxBytes` did it. Only the read's deadline is named,
+  with `completeness.stoppedBy: "time"`.
 - **`networkAccess` pins the bridge to port 3456.** `plugin/manifest.json`
   declares `allowedDomains: ["none"]` with `http://localhost:3456` in
   `devAllowedDomains`. Moving the bridge with `FIGMA_BRIDGE_PORT` therefore

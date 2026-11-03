@@ -4,6 +4,27 @@ All notable changes to Figma Design Bridge. Versions follow
 [Semantic Versioning](https://semver.org/); the Claude Code plugin, the
 marketplace entry and both `package.json` files always carry the same number.
 
+## [Unreleased]
+
+A read that Figma does not finish no longer blocks the plugin.
+
+### Fixed
+
+- A read stops a little before its `timeoutMs` and answers with what it read,
+  rather than wait for a Figma call that does not finish. Before, an export
+  inside a very large section could hold the plugin for minutes. Every read
+  after it timed out until the panel was reopened. The answer is truncated,
+  with `completeness.stoppedBy: "time"`, and `timing.stalled` names the Figma
+  call and the layer. The note tells the agent to read one screen frame instead.
+- A layer that does not load in time, and an `assets` or `render` export that
+  does not finish, fail with an error that says so instead of a `TIMEOUT`. A
+  read that waited past its deadline is refused at once.
+- A read cut by its time limit is not cached and is not reused for a retry.
+  Derived tools (`get_design_texts`, `search_design` and the others) no longer
+  read such a node again at the bridge's caps.
+- The `TIMEOUT` hint says to reopen the panel when even a small read times out.
+- `timing` adds `outlineMs` and `variablesMs`.
+
 ## [1.10.0] - 2026-11-03
 
 The panel gets a Tools menu, and its first tool finds layers in the open file.
@@ -515,7 +536,8 @@ audit. Nothing to migrate.
   with page and selection sync and Watch mode, and the MCP server for Claude
   Code.
 
-[1.10.0]: https://github.com/nathanpixodeo/figma-design-bridge/compare/711d037...main
+[Unreleased]: https://github.com/nathanpixodeo/figma-design-bridge/compare/f95d3f1...main
+[1.10.0]: https://github.com/nathanpixodeo/figma-design-bridge/compare/711d037...f95d3f1
 [1.9.0]: https://github.com/nathanpixodeo/figma-design-bridge/compare/48d758e...711d037
 [1.8.0]: https://github.com/nathanpixodeo/figma-design-bridge/compare/c1f0d9e...48d758e
 [1.7.0]: https://github.com/nathanpixodeo/figma-design-bridge/compare/d0e2682...c1f0d9e
