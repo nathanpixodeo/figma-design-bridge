@@ -1,9 +1,9 @@
 // The legacy single-design HTTP API: /design, /figma/import and /snapshots.
 //
 // Both the standalone server (server/index.js) and an MCP process that owns the
-// bridge port serve these routes, so the Figma plugin's Sync commands reach
-// whichever of the two is listening. The /bridge/* routes are mounted beside
-// them by the caller.
+// bridge port serve these routes, so `figma-bridge import` reaches whichever of
+// the two is listening. The Figma plugin no longer posts here since 1.9.0; it
+// answers reads through /bridge/*, which the caller mounts beside these routes.
 
 const path = require('path')
 const { URL } = require('url')

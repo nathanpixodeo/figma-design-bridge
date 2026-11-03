@@ -2,7 +2,7 @@
 
 Base URL: `http://127.0.0.1:3456` (port configurable via `FIGMA_BRIDGE_PORT`)
 
-All endpoints return JSON unless otherwise noted. Design data reaches the server by either of two supported paths: the Figma plugin posts it to `POST /design`, or `POST /figma/import` pulls it through the official Figma REST API using `FIGMA_ACCESS_TOKEN`. Both produce the same normalized schema.
+All endpoints return JSON unless otherwise noted. Design data reaches this snapshot API through the official Figma REST API: `POST /figma/import` pulls it using `FIGMA_ACCESS_TOKEN`, and `figma-bridge import` posts the normalized result to `POST /design`. The Figma plugin does not post snapshots since 1.9.0; it answers live reads under `/bridge/*` instead (see [BRIDGE_PROTOCOL.md](./BRIDGE_PROTOCOL.md)).
 
 ## Access control
 
@@ -123,9 +123,9 @@ Common causes are a missing/invalid token, missing `file_content:read` scope, no
 
 ## `POST /design`
 
-Receive already-normalized bridge data. The legacy Figma plugin and `figma-bridge import` use this endpoint.
+Receive already-normalized bridge data. `figma-bridge import` uses this endpoint, as did the Figma plugin before 1.9.0.
 
-The panel's **Sync page** button and **Quick Sync → Sync Full Page** post a `type: "page"` snapshot of the current page: all roots and descendants, regardless of selection (subject to the serializer's 30-level depth limit). With **Auto-sync page changes** on, edits and page switches re-sync it, debounced. **Sync selection** and **Quick Sync → Sync Selected Nodes** post `type: "selection"` with the selected subtrees. These are complete snapshots, not incremental patches: each successful POST replaces the current design rather than merging pages or selections. Previously synced data remains in retained snapshots. Auto-sync needs the panel open; reading an arbitrary node from a Figma URL is what the live `/bridge/*` reads do.
+Each POST is a complete snapshot, not an incremental patch: it replaces the current design rather than merging into it. Previously synced data remains in retained snapshots. Reading an arbitrary node from a Figma URL is what the live `/bridge/*` reads do.
 
 **Request Body:**
 
@@ -171,7 +171,7 @@ The panel's **Sync page** button and **Quick Sync → Sync Full Page** post a `t
 
 ## `GET /design`
 
-Returns the current normalized design data, whether it came from the plugin or a Figma REST import.
+Returns the current normalized design data from the last import.
 
 **Response `200 OK`:**
 

@@ -165,7 +165,7 @@ async function createDaemon(options = {}) {
       .then(ok => {
         if (ok) return
         // Not a bridge route. The MCP adapter passes the legacy router in, so
-        // the Figma plugin's /design syncs reach this daemon too.
+        // /design imports reach this daemon too.
         if (typeof fallbackHandler === 'function') return fallbackHandler(req, res)
         endJSON(res, 404, { error: 'Not found', code: 'NOT_FOUND' })
       })

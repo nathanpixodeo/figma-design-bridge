@@ -18,6 +18,6 @@ Then, depending on the argument:
 - `texts` — `get_design_texts`.
 - `colors` — `get_design_colors`.
 
-If the tools report that no design is loaded, do not guess at why. Say which data directory the server reported and list the two things that put data there: running the Figma plugin's **Sync Full Page** or **Sync Selected Nodes**, or calling `sync_figma_design` with a Figma URL, which needs `FIGMA_ACCESS_TOKEN` in the server's environment.
+If the tools report that no design is loaded, do not guess at why. Say which data directory the server reported and list the two things that put data there: calling `sync_figma_design` with a Figma URL, which needs `FIGMA_ACCESS_TOKEN` in the server's environment, or running `figma-bridge import <figma-url>`. The Figma plugin does not fill this cache: with its panel open and paired, read the file live instead by passing a Figma node link as `source` to `get_design_context` or the other design tools.
 
 A stale `syncedAt` is worth calling out on its own. Design data that is hours or days old will produce a confident and wrong answer in any comparison built on it, so say how old it is rather than only that it loaded.

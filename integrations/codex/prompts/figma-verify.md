@@ -43,7 +43,7 @@ Use the `figma-bridge` MCP server:
 
 If no render is available, mark every layout and visual-weight check as **not verified** rather than passed.
 
-If nothing is loaded, stop and say which data directory the server reported. Two things put data there: the Figma plugin's **Sync Full Page** or **Sync Selected Nodes**, or `sync_figma_design` with a Figma URL, which needs `FIGMA_ACCESS_TOKEN`. Do not review the code against assumptions about the design.
+If nothing is loaded, stop and say which data directory the server reported. Two things put data there: `sync_figma_design` with a Figma URL, which needs `FIGMA_ACCESS_TOKEN`, or `figma-bridge import <figma-url>`. With the Figma plugin's panel open and paired, read the node live by its link instead. Do not review the code against assumptions about the design.
 
 ## 2. Read the implementation
 

@@ -9,6 +9,6 @@ Call `sync_figma_design` with `source` set to the URL or file key, and `node_ids
 
 Confirm the result with `get_design_info` and report the page name, node count, and sync time.
 
-If the call fails for a missing token, say so directly: the server needs `FIGMA_ACCESS_TOKEN` with the `file_content:read` scope in its own environment, and that is a change to how the MCP server is launched, not something this command can fix. The token-free alternative is the Figma plugin's **Sync Full Page** or **Sync Selected Nodes**, which pushes the current page to the running bridge without any REST access at all.
+If the call fails for a missing token, say so directly: the server needs `FIGMA_ACCESS_TOKEN` with the `file_content:read` scope in its own environment, and that is a change to how the MCP server is launched, not something this command can fix. The token-free alternative is the Figma plugin: with its panel open and paired, the design tools read any node of that file live when given its link as `source`, without any REST access at all.
 
 Never print the token, and never echo an environment variable that might hold it.

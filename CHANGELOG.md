@@ -4,6 +4,44 @@ All notable changes to Figma Design Bridge. Versions follow
 [Semantic Versioning](https://semver.org/); the Claude Code plugin, the
 marketplace entry and both `package.json` files always carry the same number.
 
+## [Unreleased]
+
+The Figma plugin panel only does what agents need: pair once, then stay
+connected. It follows Figma's light or dark theme and asks for something only
+when it needs it.
+
+### Upgrading
+
+- Import `plugin/manifest.json` again (**Plugins → Development → Import plugin
+  from manifest…**) to drop the old menu. Until then, every entry of the old
+  menu opens the panel.
+
+### Changed
+
+- The plugin has no menu: **Plugins → Development → Design Bridge** opens the
+  panel directly.
+- The panel is redesigned with Figma's theme colors and type, and its window
+  fits its content. One status says what it is doing: Not paired, Pairing…,
+  Connecting…, Connected, Waiting for bridge, Disconnected, Token rejected or
+  File link needed.
+- While it waits for the bridge, **Retry now** tries at once. **Connect** shows
+  only after **Disconnect**.
+- A token pasted under **Advanced**, or a file link pasted when Figma does not
+  give the plugin one, connects at once, without a Connect click.
+- The bridge's setup hints and the `/figma-bridge:pair`, `/figma-bridge:page`
+  and `/figma-bridge:sync` commands name the new menu path, and point to live
+  reads instead of the removed sync buttons.
+
+### Removed
+
+- **Sync page**, **Sync selection**, **Auto-sync page changes**, and the menu's
+  **Quick Sync → Sync Full Page / Sync Selected Nodes**. Agents read nodes live
+  through the panel. `POST /design` stays for `figma-bridge import`, and
+  `sync_figma_design` still pulls a file through the REST API.
+- The **Bridge URL** field. The manifest lets the plugin reach
+  `http://localhost:3456` only, so another value could never connect; a saved
+  one is dropped.
+
 ## [1.8.0] - 2026-10-27
 
 One command sets approvals in every AI client on the machine, and Gemini CLI

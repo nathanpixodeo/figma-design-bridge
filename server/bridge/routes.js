@@ -697,7 +697,7 @@ function createRoutes(options = {}) {
     if (!hasSession) {
       return sendError(req, res, 409, 'NO_SESSION_FOR_FILE',
         `No Figma plugin session is connected for file ${fileKey}. `
-        + 'Open that file in Figma and run Plugins → Development → Design Bridge → Open Design Bridge '
+        + 'Open that file in Figma and run Plugins → Development → Design Bridge '
         + '(press Pair with bridge the first time), then retry. '
         + 'Pass mode "cached" to read explicitly unverified data instead.',
         { ...envelope, mode: 'live', representation })
@@ -1055,8 +1055,8 @@ function createRoutes(options = {}) {
     const pairingStats = pairing.stats()
     const setupHints = ready ? [] : [
       'No Figma plugin session is connected.',
-      'Open the Figma file you want to read and run Plugins → Development → Design Bridge → '
-        + 'Open Design Bridge. A paired plugin connects by itself; otherwise press Pair with bridge.',
+      'Open the Figma file you want to read and run Plugins → Development → Design Bridge. '
+        + 'A paired plugin connects by itself; otherwise press Pair with bridge.',
     ]
     if (pairingStats.pending > 0) {
       setupHints.push('A Figma plugin is waiting for pairing approval. Ask the user for the 6-digit code shown '

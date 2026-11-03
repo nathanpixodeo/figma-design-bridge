@@ -144,8 +144,8 @@ let bridgeStartup = null;
 let takeoverPending = false; // a reused bridge went away and has not been replaced yet
 let anonymousLegacyWarned = false;
 
-// When this process ends up owning the port, the Figma plugin's legacy Sync
-// commands post to it as well, so it serves /design next to /bridge/*.
+// When this process ends up owning the port, `figma-bridge import` posts to it
+// as well, so it serves /design next to /bridge/*.
 function legacyRoutesFor({ token, currentToken }) {
   // Once per process: a start that keeps failing is retried every 10 s.
   if (ALLOW_ANONYMOUS_LEGACY && !anonymousLegacyWarned) {

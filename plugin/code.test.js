@@ -23,37 +23,6 @@ function clock() {
   }
 }
 
-function page() {
-  const heading = { id: '1:2', name: 'Heading', type: 'TEXT', characters: 'Hello' }
-  const frame = { id: '1:1', name: 'Screen', type: 'FRAME', children: [heading] }
-  const sibling = { id: '1:3', name: 'Other screen', type: 'FRAME' }
-  return { id: '0:1', name: 'Screens', selection: [frame], children: [frame, sibling] }
-}
-
-function plugin(command = 'watch', currentPage = page()) {
-  const time = clock()
-  const sent = [], notifications = [], events = new Map()
-  const figma = {
-    command, currentPage, closed: false,
-    ui: { postMessage(message) { sent.push(structuredClone(message)) } },
-    showUI(html) { this.html = html },
-    on(event, callback) { events.set(event, callback) },
-    notify(message) { notifications.push(message) },
-    closePlugin() { this.closed = true },
-  }
-  vm.runInNewContext(source, { figma, setTimeout: time.setTimeout, clearTimeout: time.clearTimeout })
-  return {
-    figma, time, sent, notifications,
-    syncs: () => sent.filter(message => message.type === 'sync'),
-    emit: event => events.get(event)?.(),
-    message: message => figma.ui.onmessage(message),
-    ready: () => figma.ui.onmessage({ type: 'ui-ready' }),
-    done(requestId, success = true) {
-      figma.ui.onmessage({ type: 'done', requestId, success, error: success ? undefined : 'Offline' })
-    },
-  }
-}
-
 function bridgePlugin({
   characters = 'Hello from another page', command = 'bridge', fileKey = 'AAAAfileKeyAAAA',
   rootName = 'Bridge Test File', saved, now, manualYield = false,
@@ -83,8 +52,11 @@ function bridgePlugin({
   const nodes = new Map([[root.id, root], [activePage.id, activePage], [otherPage.id, otherPage], [frame.id, frame], [target.id, target]])
   const figma = {
     command, currentPage: activePage, root, fileKey, closed: false,
-    ui: { postMessage(message) { sent.push(structuredClone(message)) } },
-    showUI(html) { this.html = html },
+    ui: {
+      postMessage(message) { sent.push(structuredClone(message)) },
+      resize(width, height) { this.size = [width, height] },
+    },
+    showUI(html, options) { this.html = html; this.uiOptions = options },
     on(event, callback) { events.set(event, callback) },
     notify(message) { notifications.push(message) },
     closePlugin() { this.closed = true },
@@ -104,191 +76,6 @@ function bridgePlugin({
     ready: () => figma.ui.onmessage({ type: 'ui-ready' }),
   }
 }
-
-test('Sync Full Page ignores selection and includes every root and descendant', async () => {
-  const p = plugin('sync-page')
-  await p.ready()
-  const { data, requestId } = p.syncs()[0]
-  assert.equal(data.type, 'page')
-  assert.equal(data.nodeCount, 3)
-  assert.deepEqual(data.nodes.map(node => node.id), ['1:1', '1:3'])
-  assert.equal(data.nodes[0].children[0].characters, 'Hello')
-  p.done(requestId)
-  assert.equal(p.figma.closed, true)
-  assert.match(p.notifications[0], /Synced 3 nodes/)
-})
-
-test('Sync Selected Nodes includes descendants but not unrelated roots', async () => {
-  const p = plugin('sync-selection')
-  await p.ready()
-  const { data } = p.syncs()[0]
-  assert.equal(data.type, 'selection')
-  assert.equal(data.selectionCount, 1)
-  assert.equal(data.nodeCount, 2)
-  assert.equal(data.nodes[0].children[0].id, '1:2')
-})
-
-test('empty selection reports an error without overwriting the cache', async () => {
-  const currentPage = page()
-  currentPage.selection = []
-  const p = plugin('sync-selection', currentPage)
-  await p.ready()
-  assert.equal(p.syncs().length, 0)
-  assert.match(p.notifications[0], /Select a frame/)
-  assert.equal(p.figma.closed, true)
-})
-
-test('Watch initially syncs the whole page once, not the current selection', async () => {
-  const p = plugin()
-  p.emit('documentchange')
-  assert.equal(p.time.timers.size, 0)
-  await p.ready()
-  await p.ready()
-  assert.equal(p.syncs().length, 1)
-  assert.equal(p.syncs()[0].data.nodeCount, 3)
-  p.done(1)
-  p.figma.currentPage.selection = [p.figma.currentPage.children[1]]
-  p.emit('selectionchange')
-  p.time.flush()
-  assert.equal(p.syncs().length, 1, 'selection changes must not replace the page snapshot')
-  assert.equal(p.figma.closed, false)
-})
-
-test('content changes without selection changes are debounced into one fresh snapshot', async () => {
-  const p = plugin()
-  await p.ready()
-  p.done(1)
-  p.figma.currentPage.children[0].children[0].characters = 'Updated'
-  for (let i = 0; i < 100; i++) p.emit('documentchange')
-  assert.equal(p.time.timers.size, 1)
-  assert.equal(p.syncs().length, 1)
-  p.time.flush()
-  assert.equal(p.syncs().length, 2)
-  assert.equal(p.syncs()[1].data.nodes[0].children[0].characters, 'Updated')
-})
-
-test('page switches and edits in flight coalesce, with no overlapping sends or stale acknowledgements', async () => {
-  const p = plugin()
-  await p.ready()
-  p.figma.currentPage = { id: '0:2', name: 'Settings', selection: [], children: [] }
-  for (let i = 0; i < 3; i++) {
-    p.emit('currentpagechange')
-    p.time.flush()
-  }
-  assert.equal(p.syncs().length, 1)
-  p.done(99)
-  assert.equal(p.syncs().length, 1)
-  p.done(1)
-  assert.equal(p.syncs().length, 2)
-  assert.equal(p.syncs()[1].data.pageId, '0:2')
-  assert.equal(p.sent.filter(message => message.type === 'status').at(-1).pageName, 'Screens')
-  p.done(1)
-  p.done(2)
-  assert.equal(p.sent.at(-1).pageName, 'Settings')
-  assert.equal(p.sent.at(-1).nodeCount, 0)
-})
-
-test('disabling auto sync cancels queued and debounced work; manual sync still works', async () => {
-  const p = plugin()
-  await p.ready()
-  p.emit('documentchange')
-  p.time.flush() // Queued behind the initial request.
-  p.emit('documentchange') // Another debounced request.
-  p.message({ type: 'set-auto-sync', enabled: false })
-  assert.equal(p.time.timers.size, 0)
-  p.done(1)
-  p.emit('documentchange')
-  p.time.flush()
-  assert.equal(p.syncs().length, 1)
-  p.message({ type: 'request-sync' })
-  assert.equal(p.syncs().length, 2)
-  p.done(2)
-  p.message({ type: 'set-auto-sync', enabled: true })
-  assert.equal(p.syncs().length, 3, 're-enabling immediately catches up')
-})
-
-test('queued manual sync survives disabling auto sync and a failed request', async () => {
-  const p = plugin()
-  await p.ready()
-  p.message({ type: 'request-sync' })
-  p.emit('documentchange')
-  p.time.flush()
-  p.message({ type: 'set-auto-sync', enabled: false })
-  p.done(1, false)
-  assert.equal(p.syncs().length, 2)
-  p.done(2)
-  assert.equal(p.sent.at(-1).connected, true)
-})
-
-test('mixed text and corner properties do not break full-page serialization or messaging', async () => {
-  const currentPage = page()
-  Object.assign(currentPage.children[0], {
-    cornerRadius: Symbol('mixed'), topLeftRadius: 12, topRightRadius: 12, bottomRightRadius: 0, bottomLeftRadius: 4,
-  })
-  Object.assign(currentPage.children[0].children[0], {
-    fontSize: Symbol('mixed'), fontName: Symbol('mixed'), letterSpacing: Symbol('mixed'),
-  })
-  const p = plugin('sync-page', currentPage)
-  await p.ready()
-  assert.equal(p.notifications.length, 0)
-  const frame = p.syncs()[0].data.nodes[0]
-  assert.equal(frame.cornerRadius, undefined)
-  assert.deepEqual(frame.rectangleCornerRadii, [12, 12, 0, 4])
-  assert.equal(frame.children[0].fontSize, undefined)
-  assert.equal(frame.children[0].characters, 'Hello')
-})
-
-test('Sync handles variants without reading unsupported component property definitions', async () => {
-  const currentPage = page()
-  const variant = { id: '3:2', name: 'State=On', type: 'COMPONENT' }
-  const componentSet = {
-    id: '3:1', name: 'Button', type: 'COMPONENT_SET', children: [variant],
-    componentPropertyDefinitions: { Label: { type: 'TEXT', defaultValue: 'Go' } },
-  }
-  variant.parent = componentSet
-  Object.defineProperty(variant, 'componentPropertyDefinitions', {
-    get() { throw new Error('Can only get component property definitions of a component set or non-variant component') },
-  })
-  const standalone = {
-    id: '3:3', name: 'Icon', type: 'COMPONENT',
-    componentPropertyDefinitions: { Visible: { type: 'BOOLEAN', defaultValue: true } },
-  }
-  currentPage.children = [componentSet, standalone]
-  const p = plugin('sync-page', currentPage)
-  await p.ready()
-  assert.equal(p.notifications.length, 0)
-  assert.equal(p.syncs().length, 1)
-  const [set, component] = p.syncs()[0].data.nodes
-  assert.equal(set.componentPropertyDefinitions.Label.defaultValue, 'Go')
-  assert.equal(set.children[0].componentPropertyDefinitions, undefined)
-  assert.equal(component.componentPropertyDefinitions.Visible.defaultValue, true)
-})
-
-test('serialization failures are visible and do not leave Watch stuck busy', async () => {
-  const p = plugin()
-  const children = p.figma.currentPage.children
-  Object.defineProperty(p.figma.currentPage, 'children', {
-    configurable: true, get() { throw new Error('Node removed') },
-  })
-  await p.ready()
-  assert.equal(p.syncs().length, 0)
-  assert.equal(p.sent.at(-1).type, 'error')
-  assert.match(p.sent.at(-1).error, /Node removed/)
-  Object.defineProperty(p.figma.currentPage, 'children', { value: children })
-  p.message({ type: 'request-sync' })
-  assert.equal(p.syncs().length, 1)
-})
-
-test('closing Watch cancels scheduled work', async () => {
-  const p = plugin()
-  await p.ready()
-  p.done(1)
-  p.emit('documentchange')
-  p.emit('close')
-  p.time.flush()
-  assert.equal(p.syncs().length, 1)
-  assert.equal(p.time.timers.size, 0)
-})
 
 test('Bridge reads an exact node on another page without switching pages or selection', async () => {
   const p = bridgePlugin()
@@ -750,19 +537,70 @@ test('Bridge document index is lightweight and document changes invalidate only 
   assert.equal(invalidation.fileKey, 'AAAAfileKeyAAAA')
 })
 
-test('Open Design Bridge connects by itself once paired, with the file key Figma provides', async () => {
-  const p = bridgePlugin({ command: 'open', saved: { bridgeUrl: 'http://localhost:3456', bridgeToken: 'pairing-token' } })
+test('the panel connects by itself once paired, with the file key Figma provides', async () => {
+  // 1.8.0 and earlier saved a bridge URL; the plugin can reach only its own.
+  const p = bridgePlugin({ command: '', saved: { bridgeUrl: 'http://localhost:9999', bridgeToken: 'pairing-token' } })
   await p.ready()
 
   const start = p.sent.find(message => message.type === 'bridge-start')
   assert.ok(start, 'no bridge-start after the panel opened')
   assert.equal(start.config.fileKey, 'AAAAfileKeyAAAA')
   assert.equal(start.config.token, 'pairing-token')
+  assert.equal(start.config.url, 'http://localhost:3456')
+  assert.equal(p.storage.get('design-bridge-pairing').bridgeUrl, undefined)
   const status = p.sent.find(message => message.type === 'status')
-  assert.equal(status.mode, 'open')
   assert.equal(status.fileKeyKnown, true)
-  // The panel serves agents; uploading the whole page is opt-in.
-  assert.equal(p.sent.filter(message => message.type === 'sync').length, 0)
+  assert.equal(status.fileName, 'Bridge Test File')
+})
+
+test('every command a menu imported before 1.9.0 can send opens the panel, and none uploads the page', async () => {
+  for (const command of ['', 'open', 'bridge', 'watch', 'sync-page', 'sync-selection']) {
+    const p = bridgePlugin({ command, saved: { bridgeToken: 'pairing-token' } })
+    assert.equal(p.figma.closed, false, command)
+    assert.match(p.figma.html, /Design Bridge/, command)
+    assert.equal(p.figma.uiOptions.themeColors, true, command)
+    await p.ready()
+    p.emit('documentchange')
+    p.emit('currentpagechange')
+    assert.ok(p.sent.some(message => message.type === 'bridge-start'), command)
+    assert.equal(p.sent.some(message => message.type === 'sync'), false, command)
+    assert.equal(p.figma.closed, false, command)
+  }
+})
+
+test('an unknown command closes the plugin without a panel', () => {
+  const p = bridgePlugin({ command: 'extension' })
+  assert.equal(p.figma.closed, true)
+  assert.equal(p.figma.html, undefined)
+})
+
+test('the manifest has no menu, so running the plugin opens the panel', () => {
+  const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, 'manifest.json'), 'utf8'))
+  assert.equal(manifest.menu, undefined)
+  assert.deepEqual(manifest.networkAccess.devAllowedDomains, ['http://localhost:3456'])
+})
+
+test('the plugin window follows the height the panel reports, within bounds', async () => {
+  const p = bridgePlugin({ command: '' })
+  await p.message({ type: 'resize', height: 333.2 })
+  assert.deepEqual(p.figma.ui.size, [300, 334])
+  await p.message({ type: 'resize', height: 5000 })
+  assert.deepEqual(p.figma.ui.size, [300, 560])
+  await p.message({ type: 'resize', height: 40 })
+  assert.deepEqual(p.figma.ui.size, [300, 120])
+  await p.message({ type: 'resize', height: 'tall' })
+  assert.deepEqual(p.figma.ui.size, [300, 120])
+})
+
+test('a pasted link that is not a Figma file link is refused with what to copy', async () => {
+  const p = bridgePlugin({ command: '', fileKey: null })
+  await p.ready()
+  await p.message({ type: 'connect-bridge', token: 'pairing-token', fileSource: 'my design' })
+  assert.match(p.sent.find(message => message.type === 'error').error, /not a Figma file link\. Copy it from Share/)
+  assert.equal(p.sent.some(message => message.type === 'bridge-start'), false)
+
+  await p.message({ type: 'connect-bridge', token: 'pairing-token', fileSource: 'https://www.figma.com/design/LINKKEY123/Studio' })
+  assert.equal(p.sent.find(message => message.type === 'bridge-start').config.fileKey, 'LINKKEY123')
 })
 
 test('without a file key from Figma, a saved link applies only to the document it was saved for', async () => {
@@ -796,24 +634,6 @@ test('a pairing approval is saved and connects the panel', async () => {
   assert.ok(p.notifications.includes('Paired with the bridge'))
 })
 
-test('the panel syncs the selection or the page on request and stays open', async () => {
-  const p = bridgePlugin({ command: 'open' })
-  const hero = { id: '9:1', name: 'Hero', type: 'FRAME', width: 10, height: 10, parent: p.activePage, children: [] }
-  p.activePage.children = [hero]
-  p.activePage.selection = [hero]
-  await p.ready()
-
-  await p.message({ type: 'request-sync', scope: 'selection' })
-  const selection = p.sent.filter(message => message.type === 'sync').at(-1)
-  assert.equal(selection.data.type, 'selection')
-  await p.message({ type: 'done', requestId: selection.requestId, success: true })
-
-  await p.message({ type: 'request-sync', scope: 'page' })
-  const page = p.sent.filter(message => message.type === 'sync').at(-1)
-  assert.equal(page.data.type, 'page')
-  assert.equal(p.figma.closed, false)
-})
-
 function ui(fetch) {
   const time = clock(), elements = new Map(), messages = []
   let onMessage
@@ -825,12 +645,13 @@ function ui(fetch) {
         textContent: '', className: '', disabled: false, checked: true, value: '', listeners,
         classList: { add: name => classes.add(name), remove: name => classes.delete(name) },
         isHidden: () => classes.has('hidden'),
-        querySelector: () => element('dot'), addEventListener: (type, callback) => { listeners[type] = callback },
+        hasClass: name => classes.has(name),
+        addEventListener: (type, callback) => { listeners[type] = callback },
       })
     }
     return elements.get(id)
   }
-  const script = plugin().figma.html.match(/<script>([\s\S]*?)<\/script>/)[1]
+  const script = bridgePlugin({ command: '' }).figma.html.match(/<script>([\s\S]*?)<\/script>/)[1]
   vm.runInNewContext(script, {
     document: { getElementById: element },
     parent: { postMessage: message => messages.push(structuredClone(message.pluginMessage)) },
@@ -839,46 +660,10 @@ function ui(fetch) {
   })
   return {
     time, element, messages,
-    send: () => onMessage({ data: { pluginMessage: {
-      type: 'sync', requestId: 7, data: { type: 'page', nodes: [], nodeCount: 0 },
-    } } }),
     post: message => onMessage({ data: { pluginMessage: message } }),
     click: id => element(id).listeners.click(),
   }
 }
-
-test('generated UI script compiles, boots, posts the snapshot, and acknowledges its request', async () => {
-  let request
-  const panel = ui(async (url, options) => {
-    request = { url, options }
-    return { ok: true, json: async () => ({ message: 'Saved' }) }
-  })
-  assert.equal(panel.messages[0].type, 'ui-ready')
-  await panel.send()
-  assert.equal(request.url, 'http://localhost:3456/design')
-  assert.equal(request.options.method, 'POST')
-  assert.equal(JSON.parse(request.options.body).type, 'page')
-  assert.equal(panel.messages.at(-1).requestId, 7)
-  assert.equal(panel.messages.at(-1).success, true)
-  assert.equal(panel.time.timers.size, 0)
-  assert.equal(panel.element('syncBtn').disabled, false)
-})
-
-test('UI reports HTTP errors and network failures, releasing the request for retry', async () => {
-  for (const fetch of [
-    async () => ({ ok: false, status: 413, statusText: 'Payload Too Large' }),
-    async () => { throw new Error('Network offline') },
-  ]) {
-    const panel = ui(fetch)
-    await panel.send()
-    const reply = panel.messages.at(-1)
-    assert.equal(reply.success, false)
-    assert.equal(reply.requestId, 7)
-    assert.match(panel.element('errorMsg').textContent, /HTTP 413|Network offline/)
-    assert.equal(panel.time.timers.size, 0)
-    assert.equal(panel.element('syncBtn').disabled, false)
-  }
-})
 
 test('UI turns a refused bridge reply into an error reply instead of dropping the session', async () => {
   const calls = []
@@ -936,9 +721,16 @@ test('the panel shows a pairing code, collects the token once approved and hands
     return respondWith(200, {})
   })
 
+  panel.post({ type: 'status', connected: false, fileName: 'Studio', fileKeyKnown: true, bridgeToken: '' })
+  assert.equal(panel.element('statusText').textContent, 'Not paired')
+  assert.equal(panel.element('pairSection').isHidden(), false)
+
   panel.click('pairBtn')
   await settleUi()
   assert.equal(calls[0].method, 'POST')
+  assert.equal(panel.element('statusText').textContent, 'Pairing…')
+  assert.equal(panel.element('pairInfo').isHidden(), false)
+  assert.equal(panel.element('pairSection').isHidden(), true)
   assert.equal(panel.element('pairCode').textContent, '482 913')
   assert.equal(panel.element('pairCommand').textContent, '/figma-bridge:pair 482913')
   assert.equal(panel.element('pairCli').textContent, 'figma-bridge pair 482913')
@@ -952,10 +744,12 @@ test('the panel shows a pairing code, collects the token once approved and hands
   const paired = panel.messages.find(message => message.type === 'paired')
   assert.equal(paired.token, 'fresh-token')
   assert.equal(panel.element('bridgeToken').value, 'fresh-token')
+  assert.equal(panel.element('pairInfo').isHidden(), true)
   const checksSent = calls.filter(call => call.url.includes('/bridge/pair/'))
   assert.equal(checksSent.length, 2)
   assert.ok(checksSent.every(call => call.headers['X-Pairing-Secret'] === 'b'.repeat(64)))
   assert.equal(panel.time.timers.size, 0)
+  assert.ok(calls.every(call => !call.url.endsWith('/design')), 'the panel uploaded the page')
 })
 
 test('an expired pairing code asks the user to pair again', async () => {
@@ -968,7 +762,9 @@ test('an expired pairing code asks the user to pair again', async () => {
   panel.time.flush()
   await settleUi()
 
-  assert.match(panel.element('errorMsg').textContent, /expired\. Press Pair with bridge/)
+  assert.match(panel.element('message').textContent, /code expired\. Pair again/)
+  assert.equal(panel.element('message').hasClass('error'), true)
+  assert.equal(panel.element('pairInfo').isHidden(), true)
   assert.equal(panel.element('pairBtn').disabled, false)
   assert.equal(panel.messages.some(message => message.type === 'paired'), false)
 })
@@ -982,7 +778,7 @@ test('a bridge too old to pair says so instead of asking for a token', async () 
     panel.click('pairBtn')
     await settleUi()
 
-    const shown = panel.element('errorMsg').textContent
+    const shown = panel.element('message').textContent
     assert.match(shown, /too old to pair: pairing needs 1\.2\.0 or later/, String(status))
     assert.doesNotMatch(shown, /bridge token/, String(status))
     assert.equal(panel.element('pairBtn').disabled, false)
@@ -990,21 +786,11 @@ test('a bridge too old to pair says so instead of asking for a token', async () 
   }
 })
 
-test('UI aborts a stalled upload and reports a timeout instead of hanging', async () => {
-  const panel = ui((_, options) => new Promise((resolve, reject) => {
-    options.signal.addEventListener('abort', () => {
-      const error = new Error('Aborted')
-      error.name = 'AbortError'
-      reject(error)
-    })
-  }))
-  const sending = panel.send()
-  assert.equal(panel.element('syncBtn').disabled, true)
-  panel.time.flush()
-  await sending
-  assert.equal(panel.messages.at(-1).success, false)
-  assert.match(panel.messages.at(-1).error, /timed out/)
-  assert.equal(panel.element('syncBtn').disabled, false)
+test('pairing with no bridge running says how to start one', async () => {
+  const panel = ui(async () => { throw new TypeError('Failed to fetch') })
+  panel.click('pairBtn')
+  await settleUi()
+  assert.match(panel.element('message').textContent, /^No bridge at http:\/\/localhost:3456\. Start Claude Code/)
 })
 
 const savedConfig = { url: 'http://localhost:3456', token: 'saved-token', fileKey: 'AAAAfileKeyAAAA', fileName: 'File', pluginInstanceId: 'plugin-1' }
@@ -1020,10 +806,12 @@ test('the panel waits quietly while no bridge runs, then connects by itself', as
 
   await panel.post({ type: 'bridge-start', config: savedConfig })
   await settleUi()
-  assert.equal(panel.element('statusText').textContent, 'Waiting for the bridge...')
-  assert.equal(panel.element('waitHint').isHidden(), false)
-  assert.match(panel.element('waitHint').textContent, /^Nothing answers at http:\/\/localhost:3456 yet\./)
-  assert.equal(panel.element('errorMsg').isHidden(), true, 'nothing running yet is not an error')
+  assert.equal(panel.element('statusText').textContent, 'Waiting for bridge')
+  assert.match(panel.element('message').textContent, /^No bridge at http:\/\/localhost:3456 yet\./)
+  assert.equal(panel.element('message').hasClass('error'), false, 'nothing running yet is not an error')
+  assert.equal(panel.element('retryBtn').isHidden(), false)
+  assert.equal(panel.element('disconnectBtn').isHidden(), false)
+  assert.equal(panel.element('connectBtn').isHidden(), true)
   assert.equal(lastBridgeStatus(panel).error, null)
   assert.equal(panel.time.timers.size, 1, 'it stopped trying')
 
@@ -1031,7 +819,7 @@ test('the panel waits quietly while no bridge runs, then connects by itself', as
     panel.time.flush()
     await settleUi()
   }
-  assert.equal(panel.element('statusText').textContent, 'Waiting for the bridge...')
+  assert.equal(panel.element('statusText').textContent, 'Waiting for bridge')
   assert.deepEqual(panel.time.delays, [750, 1500, 3000, 5000, 5000])
 
   running = true
@@ -1039,7 +827,80 @@ test('the panel waits quietly while no bridge runs, then connects by itself', as
   await settleUi()
   assert.equal(lastBridgeStatus(panel).connected, true)
   assert.equal(panel.element('statusText').textContent, 'Connected')
-  assert.equal(panel.element('waitHint').isHidden(), true)
+  assert.doesNotMatch(panel.element('message').textContent, /No bridge/)
+  assert.equal(panel.element('retryBtn').isHidden(), true)
+  assert.equal(panel.element('disconnectBtn').isHidden(), false)
+})
+
+test('Retry now tries at once and starts the wait over', async () => {
+  let sessions = 0
+  const panel = ui(async url => {
+    if (url.endsWith('/bridge/session')) sessions++
+    throw new TypeError('Failed to fetch')
+  })
+  await panel.post({ type: 'bridge-start', config: savedConfig })
+  await settleUi()
+  for (let retry = 0; retry < 3; retry++) {
+    panel.time.flush()
+    await settleUi()
+  }
+  assert.equal(sessions, 4)
+  assert.equal(panel.time.delays.at(-1), 5000)
+
+  panel.click('retryBtn')
+  await settleUi()
+  assert.equal(sessions, 5)
+  assert.equal(panel.time.timers.size, 1)
+  assert.equal(panel.time.delays.at(-1), 750)
+})
+
+test('Disconnect stops the retries and offers Connect, which connects again', async () => {
+  const panel = ui(async () => { throw new TypeError('Failed to fetch') })
+  panel.post({ type: 'status', connected: false, fileName: 'Studio', fileKeyKnown: true, bridgeToken: 'saved-token' })
+  await panel.post({ type: 'bridge-start', config: savedConfig })
+  await settleUi()
+  assert.equal(panel.element('statusText').textContent, 'Waiting for bridge')
+
+  panel.click('disconnectBtn')
+  await settleUi()
+  assert.equal(panel.time.timers.size, 0, 'it kept retrying after Disconnect')
+  assert.equal(panel.element('statusText').textContent, 'Disconnected')
+  assert.equal(panel.element('connectBtn').isHidden(), false)
+  assert.equal(panel.element('disconnectBtn').isHidden(), true)
+  assert.ok(panel.messages.some(message => message.type === 'bridge-stopped'))
+
+  panel.click('connectBtn')
+  assert.deepEqual(panel.messages.at(-1), { type: 'connect-bridge', token: 'saved-token', fileSource: '' })
+  assert.equal(panel.element('statusText').textContent, 'Connecting…')
+})
+
+test('a connected panel shows the file and the last read', async () => {
+  const panel = ui(async () => respondWith(200, {}))
+  panel.post({
+    type: 'status', connected: true, fileName: 'Landing page', fileKeyKnown: true, bridgeToken: 'saved-token',
+    lastNode: '12:3', lastRequest: new Date().toISOString(),
+  })
+  assert.equal(panel.element('statusText').textContent, 'Connected')
+  assert.equal(panel.element('status').className, 'status success')
+  assert.equal(panel.element('infoSection').isHidden(), false)
+  assert.equal(panel.element('fileName').textContent, 'Landing page')
+  assert.match(panel.element('lastRead').textContent, /^12:3 · /)
+  assert.equal(panel.element('fileSection').isHidden(), true)
+  assert.equal(panel.element('pairSection').isHidden(), true)
+  assert.equal(panel.element('disconnectBtn').isHidden(), false)
+})
+
+test('without a file key the panel asks for the link and connects once it is pasted', async () => {
+  const panel = ui(async () => respondWith(200, {}))
+  panel.post({ type: 'status', connected: false, fileName: 'Studio', fileKeyKnown: false, bridgeToken: 'saved-token' })
+  assert.equal(panel.element('statusText').textContent, 'File link needed')
+  assert.equal(panel.element('fileSection').isHidden(), false)
+
+  panel.element('fileSource').value = 'https://www.figma.com/design/LINKKEY123/Studio'
+  panel.element('fileSource').listeners.change()
+  assert.deepEqual(panel.messages.at(-1), {
+    type: 'connect-bridge', token: 'saved-token', fileSource: 'https://www.figma.com/design/LINKKEY123/Studio',
+  })
 })
 
 test('a token the bridge rejects stops the retries and offers pairing', async () => {
@@ -1055,15 +916,15 @@ test('a token the bridge rejects stops the retries and offers pairing', async ()
     }
     return respondWith(200, { status: 'approved', token: 'fresh-token' })
   })
-  panel.element('bridgeToken').value = 'saved-token'
 
   await panel.post({ type: 'bridge-start', config: savedConfig })
   await settleUi()
   assert.equal(panel.time.timers.size, 0, 'it kept retrying a token the bridge refuses')
   assert.equal(calls.filter(url => url.endsWith('/bridge/session')).length, 1)
-  assert.equal(panel.element('statusText').textContent, 'Pairing needed')
+  assert.equal(panel.element('statusText').textContent, 'Token rejected')
   assert.equal(panel.element('pairSection').isHidden(), false, 'a saved token hid the way out')
-  assert.match(panel.element('errorMsg').textContent, /did not accept the saved token/)
+  assert.match(panel.element('message').textContent, /did not accept the saved token/)
+  assert.equal(panel.element('message').hasClass('error'), true)
 
   panel.click('pairBtn')
   await settleUi()
@@ -1073,33 +934,17 @@ test('a token the bridge rejects stops the retries and offers pairing', async ()
   assert.equal(panel.element('pairSection').isHidden(), true)
 })
 
-test('a sync with no bridge running says how to start one', async () => {
-  const panel = ui(async () => { throw new TypeError('Failed to fetch') })
-  await panel.send()
-  assert.match(panel.element('errorMsg').textContent, /^No bridge is running at http:\/\/localhost:3456\. Open Claude Code/)
-  assert.match(panel.messages.at(-1).error, /No bridge is running/)
-})
-
-test('an upload the running bridge cuts off is not blamed on a missing bridge', async () => {
-  const panel = ui(async url => {
-    if (url.endsWith('/bridge/health')) return respondWith(200, { status: 'ok' })
-    throw new TypeError('Failed to fetch')
-  })
-  await panel.send()
-  assert.match(panel.messages.at(-1).error, /dropped the upload.*FIGMA_BRIDGE_MAX_BODY_BYTES/)
-})
-
-test('a pasted token clears the rejection it replaces', async () => {
+test('a pasted token clears the rejection it replaces and connects', async () => {
   const panel = ui(async () => respondWith(401, { code: 'UNAUTHORIZED', error: 'Missing or invalid bridge token.' }))
   await panel.post({ type: 'bridge-start', config: savedConfig })
   await settleUi()
-  assert.equal(panel.element('statusText').textContent, 'Pairing needed')
+  assert.equal(panel.element('statusText').textContent, 'Token rejected')
 
   panel.element('bridgeToken').value = 'new-token'
   panel.element('bridgeToken').listeners.change({ target: panel.element('bridgeToken') })
-  assert.equal(panel.element('statusText').textContent, 'Not connected')
-  assert.equal(panel.element('errorMsg').isHidden(), true)
-  assert.equal(panel.messages.at(-1).type, 'set-token')
+  assert.equal(panel.element('statusText').textContent, 'Connecting…')
+  assert.equal(panel.element('message').hasClass('error'), false)
+  assert.deepEqual(panel.messages.at(-1), { type: 'connect-bridge', token: 'new-token', fileSource: '' })
 })
 
 test('waiting for the bridge does not reach the panel as an error', async () => {

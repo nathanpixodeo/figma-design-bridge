@@ -2,7 +2,7 @@
 
 Status: **implemented and accepted in a real Figma session on Windows.** Both
 `figma-bridge start` and the MCP server mount these routes, and the Figma plugin's
-**Open Design Bridge** panel pairs, opens a session and answers reads. See
+panel pairs, opens a session and answers reads. See
 [Known limitations](#known-limitations) and
 [the implementation plan](https://github.com/nathanpixodeo/figma-design-bridge/blob/main/docs/PLAN_PLUGIN_ON_DEMAND_MCP.md).
 
@@ -701,7 +701,7 @@ An error body is **flat**: `error` is the human-readable message string and
 
 ```json
 {
-  "error": "No Figma plugin session is connected for file abc123DEF456. Open that file in Figma and run Plugins → Development → Design Bridge → Open Design Bridge (press Pair with bridge the first time), then retry. Pass mode \"cached\" to read explicitly unverified data instead.",
+  "error": "No Figma plugin session is connected for file abc123DEF456. Open that file in Figma and run Plugins → Development → Design Bridge (press Pair with bridge the first time), then retry. Pass mode \"cached\" to read explicitly unverified data instead.",
   "code": "NO_SESSION_FOR_FILE"
 }
 ```
@@ -784,9 +784,8 @@ re-probes and reuses the winner.
 
 ## Known limitations
 
-- **Accepted on Windows with Figma desktop only.** The **Open Design Bridge**
-  panel speaks this protocol and its Sync buttons post to the legacy
-  `POST /design` route. Pairing and live node reads were accepted against a real
+- **Accepted on Windows with Figma desktop only.** The plugin panel speaks
+  this protocol and nothing else. Pairing and live node reads were accepted against a real
   Figma file on Windows (1.1.1 and 1.3.0); macOS and Linux run the automated
   suite only.
 - **A first read can be slow.** Figma loads a page the first time a plugin

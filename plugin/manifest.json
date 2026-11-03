@@ -9,17 +9,6 @@
   "networkAccess": {
     "allowedDomains": ["none"],
     "devAllowedDomains": ["http://localhost:3456"],
-    "reasoning": "The plugin pairs with, answers reads from and syncs pages to a Design Bridge server the user runs on their own machine. It contacts no external service, so production network access is 'none' and the loopback origin is declared for development only."
-  },
-  "menu": [
-    { "command": "open", "name": "Open Design Bridge" },
-    { "separator": true },
-    {
-      "name": "Quick Sync",
-      "menu": [
-        { "command": "sync-page", "name": "Sync Full Page" },
-        { "command": "sync-selection", "name": "Sync Selected Nodes" }
-      ]
-    }
-  ]
+    "reasoning": "The plugin pairs with and answers reads from a Design Bridge server the user runs on their own machine. It contacts no external service, so production network access is 'none' and the loopback origin is declared for development only."
+  }
 }
