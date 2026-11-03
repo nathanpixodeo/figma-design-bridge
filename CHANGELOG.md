@@ -4,7 +4,7 @@ All notable changes to Figma Design Bridge. Versions follow
 [Semantic Versioning](https://semver.org/); the Claude Code plugin, the
 marketplace entry and both `package.json` files always carry the same number.
 
-## [Unreleased]
+## [1.10.0] - 2026-11-03
 
 The panel gets a Tools menu, and its first tool finds layers in the open file.
 
@@ -515,7 +515,8 @@ audit. Nothing to migrate.
   with page and selection sync and Watch mode, and the MCP server for Claude
   Code.
 
-[1.9.0]: https://github.com/nathanpixodeo/figma-design-bridge/compare/48d758e...main
+[1.10.0]: https://github.com/nathanpixodeo/figma-design-bridge/compare/711d037...main
+[1.9.0]: https://github.com/nathanpixodeo/figma-design-bridge/compare/48d758e...711d037
 [1.8.0]: https://github.com/nathanpixodeo/figma-design-bridge/compare/c1f0d9e...48d758e
 [1.7.0]: https://github.com/nathanpixodeo/figma-design-bridge/compare/d0e2682...c1f0d9e
 [1.6.0]: https://github.com/nathanpixodeo/figma-design-bridge/compare/df30224...d0e2682
