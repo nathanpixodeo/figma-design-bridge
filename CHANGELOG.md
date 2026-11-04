@@ -4,7 +4,7 @@ All notable changes to Figma Design Bridge. Versions follow
 [Semantic Versioning](https://semver.org/); the Claude Code plugin, the
 marketplace entry and both `package.json` files always carry the same number.
 
-## [Unreleased]
+## [1.11.0] - 2026-11-04
 
 `search_design` searches inside the plugin, and a hidden Figma no longer slows
 reads down.
@@ -562,8 +562,8 @@ audit. Nothing to migrate.
   with page and selection sync and Watch mode, and the MCP server for Claude
   Code.
 
-[Unreleased]: https://github.com/nathanpixodeo/figma-design-bridge/compare/c8d47c4...main
-[1.10.1]: https://github.com/nathanpixodeo/figma-design-bridge/compare/f95d3f1...main
+[1.11.0]: https://github.com/nathanpixodeo/figma-design-bridge/compare/c8d47c4...main
+[1.10.1]: https://github.com/nathanpixodeo/figma-design-bridge/compare/f95d3f1...c8d47c4
 [1.10.0]: https://github.com/nathanpixodeo/figma-design-bridge/compare/711d037...f95d3f1
 [1.9.0]: https://github.com/nathanpixodeo/figma-design-bridge/compare/48d758e...711d037
 [1.8.0]: https://github.com/nathanpixodeo/figma-design-bridge/compare/c1f0d9e...48d758e
