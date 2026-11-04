@@ -4,6 +4,32 @@ All notable changes to Figma Design Bridge. Versions follow
 [Semantic Versioning](https://semver.org/); the Claude Code plugin, the
 marketplace entry and both `package.json` files always carry the same number.
 
+## [Unreleased]
+
+`search_design` searches inside the plugin, and a hidden Figma no longer slows
+reads down.
+
+### Added
+
+- `search_design` asks the Design Bridge panel to search the node itself (read
+  representation `search` with the new `query` option). The panel reads only
+  layer names and text, with no export, so a section of many screens takes
+  seconds where reading it whole took minutes or timed out. Each match lists
+  its id, path, text, size, position and fill. The panel stops at 200 matches,
+  or at the read's time limit with what it found, and the answer says so. A
+  plugin or bridge older than this reads the node whole, as before.
+- `timing` adds `yields`, `yieldMs` and `maxYieldMs`: how often a read handed
+  control back to Figma and how long Figma kept it waiting.
+
+### Fixed
+
+- Reads no longer crawl while the Figma window is minimized or behind another
+  window. The plugin paced long reads with `setTimeout(0)`, which Figma
+  throttles in a hidden window to one a second and then one a minute, so a read
+  of a large section could take minutes and time out, and its time limit fired
+  late. The plugin now paces with a message to its panel and back, and keeps the
+  timer only as a fallback.
+
 ## [1.10.1] - 2026-11-03
 
 A read that Figma does not finish no longer blocks the plugin.
@@ -536,6 +562,7 @@ audit. Nothing to migrate.
   with page and selection sync and Watch mode, and the MCP server for Claude
   Code.
 
+[Unreleased]: https://github.com/nathanpixodeo/figma-design-bridge/compare/c8d47c4...main
 [1.10.1]: https://github.com/nathanpixodeo/figma-design-bridge/compare/f95d3f1...main
 [1.10.0]: https://github.com/nathanpixodeo/figma-design-bridge/compare/711d037...f95d3f1
 [1.9.0]: https://github.com/nathanpixodeo/figma-design-bridge/compare/48d758e...711d037

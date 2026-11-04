@@ -1033,6 +1033,89 @@ test('a late reply the plugin stopped at its deadline is not kept for the retry'
   assert.equal(ctx.cache.calls.puts.length, 0)
 })
 
+// ── Search reads ───────────────────────────────────────────
+
+const SEARCH_PLUGIN = [...CURRENT_PLUGIN, 'assets', 'render', 'search']
+
+function searchResult(extra = {}) {
+  return {
+    ...defaultResult(),
+    format: 'search',
+    timing: { countMs: 40, totalMs: 41, yields: 3, yieldMs: 2, maxYieldMs: 1 },
+    payload: { query: 'Sponsor', matches: [{ id: '12:40', name: 'Sponsorship', type: 'FRAME', path: ['Hero'] }], checked: 9, more: false },
+    ...extra,
+  }
+}
+
+test('a search needs its query, and only a search takes one', async t => {
+  const ctx = await withServer(t)
+  await ctx.register('FILE1', 'plugin-a', SEARCH_PLUGIN)
+  const bad = [
+    { representation: 'search' },
+    { query: 'Sponsor' },
+    { representation: 'figma-rest', query: 'Sponsor' },
+    { representation: 'search', query: '' },
+    { representation: 'search', query: '   ' },
+    { representation: 'search', query: 'x'.repeat(201) },
+    { representation: 'search', query: 7 },
+  ]
+  for (const options of bad) {
+    const res = await ctx.authed({ method: 'POST', path: '/bridge/read', body: { source: FILE_URL, options } })
+    assert.equal(res.status, 400, JSON.stringify(options).slice(0, 80))
+    assert.equal(res.body.code, 'BAD_REQUEST')
+  }
+  assert.equal(ctx.broker.calls.requests.length, 0)
+
+  const longest = await ctx.authed({
+    method: 'POST', path: '/bridge/read', body: { source: FILE_URL, options: { representation: 'search', query: 'x'.repeat(200) } },
+  })
+  assert.equal(longest.status, 200)
+})
+
+test('a search goes to the plugin with its query, under a key of its own for each query', async t => {
+  const ctx = await withServer(t)
+  await ctx.register('FILE1', 'plugin-a', SEARCH_PLUGIN)
+  ctx.broker.nextResult = searchResult()
+  const search = query => ctx.authed({
+    method: 'POST', path: '/bridge/read', body: { source: FILE_URL, options: { representation: 'search', query, includeHidden: false } },
+  })
+
+  const res = await search('Sponsor')
+  assert.equal(res.status, 200)
+  assert.equal(res.body.format, 'search')
+  assert.deepEqual(res.body.timing, { countMs: 40, totalMs: 41, yields: 3, yieldMs: 2, maxYieldMs: 1 })
+  assert.match(res.body.representation, /^search\+visible-only\+q[0-9a-f]{16}$/)
+  assert.equal(res.body.payload.matches[0].name, 'Sponsorship')
+  const [request] = ctx.broker.calls.requests
+  assert.equal(request.params.options.query, 'Sponsor')
+  assert.equal(request.params.representation, res.body.representation)
+
+  await search('sponsor')
+  await search('Refund')
+  const keys = ctx.cache.calls.puts.map(entry => entry.representation)
+  assert.equal(keys.length, 3)
+  assert.equal(keys[0], keys[1], 'the plugin ignores case, and so does the key')
+  assert.notEqual(keys[0], keys[2])
+})
+
+test('a search is refused by a plugin too old for it, and needs a node link', async t => {
+  const ctx = await withServer(t)
+  await ctx.register('FILE1', 'plugin-a', [...CURRENT_PLUGIN, 'assets', 'render'])
+  const options = { representation: 'search', query: 'Sponsor' }
+
+  const old = await ctx.authed({ method: 'POST', path: '/bridge/read', body: { source: FILE_URL, options } })
+  assert.equal(old.status, 409)
+  assert.equal(old.body.code, 'PLUGIN_OUTDATED')
+  assert.match(old.body.error, /too old to read "search"/)
+
+  const fileLink = await ctx.authed({
+    method: 'POST', path: '/bridge/read', body: { source: 'https://www.figma.com/design/FILE1/App', options },
+  })
+  assert.equal(fileLink.status, 400)
+  assert.match(fileLink.body.error, /node-id/)
+  assert.equal(ctx.broker.calls.requests.length, 0)
+})
+
 // ── Cached reads ──────────────────────────────────────────
 
 test('an explicit cached read discloses unknown freshness and never claims to be live', async t => {

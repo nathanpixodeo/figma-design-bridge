@@ -825,6 +825,17 @@ panel reads one node at a time; reads of different files run in parallel. Since
   answers with what it read: a truncated read with
   `completeness.stoppedBy: "time"`, and `timing.stalled` naming the Figma call
   it was waiting on. So one slow read no longer holds the reads behind it.
+- **A hidden Figma does not slow a read.** Figma throttles timers while its
+  window is minimized or behind another one, to one a second and then one a
+  minute. Since 1.11.0 the panel paces a read with messages instead, so a read
+  takes as long with Figma hidden as in front. `timing.yields` and
+  `timing.yieldMs` show how often the read handed control back to Figma and how
+  long it waited.
+- **Search runs in the plugin.** `search_design` asks the panel to search the
+  node itself: it reads only layer names and text, with no export, and answers
+  with each match's id, path, text, size, position and fill. A section of many
+  screens takes seconds. A plugin older than 1.11.0 reads the node whole
+  instead.
 
 Full route contract, request/response schemas and error codes:
 **[docs/BRIDGE_PROTOCOL.md](docs/BRIDGE_PROTOCOL.md)**.
@@ -1106,7 +1117,7 @@ Restart the MCP client after changing its environment configuration.
 | `get_design_tree` | ASCII tree for an explicit `source` or the legacy snapshot |
 | `get_design_texts` | Text content for a node link (with `node-id`) or the legacy snapshot; a file link is refused |
 | `get_design_colors` | Color palette for a node link (with `node-id`) or the legacy snapshot; a file link is refused |
-| `search_design` | Search a node link (with `node-id`) or the legacy snapshot by node name/text (`q` required); a file link is refused |
+| `search_design` | Search a node link (with `node-id`) or the legacy snapshot by node name/text (`q` required). The plugin searches the node itself, reading names and text only, and lists each match's id and path. A file link is refused |
 | `get_design_info` | Basic info for an explicit `source` or the legacy snapshot |
 
 ### Usage Flow with MCP
@@ -1199,6 +1210,7 @@ claude -p "Based on these text nodes, write better copy for the landing page: $T
 | `figma-bridge pair` says the bridge "rejected the token" | The bridge on port 3456 keeps a different data directory — usually a Claude Code session still running a plugin older than 1.3.0. [Update the plugin](#updating), restart Claude Code, then press **Pair with bridge** again. `figma-bridge status` shows whether the running bridge uses another data directory. |
 | `figma-bridge start` says a bridge "uses another data directory" | A launcher that keeps its own data directory, or a version older than 1.3.0, holds port 3456 and would keep the Figma plugin on a different token. Stop or update it, then run `figma-bridge start` again. When the running bridge shares the data directory, `figma-bridge start` just says it is not needed. |
 | `get_design_context` returns `TIMEOUT` | Reads of one file take turns in the plugin, and the error says how many were ahead. Figma also loads a large page slowly the first time it is read. Retry: a read the plugin was already working on answers the retry when it finishes. Otherwise pass a larger `timeoutMs` (up to 120000) or a smaller `depth` or `maxNodes`, and keep the panel open. If even a small read times out, the panel is stuck on an earlier read, which a plugin older than 1.10.1 never stops: close Design Bridge and open it again. |
+| Reads are slow, or time out, only while Figma is minimized or behind another window | Figma throttles timers in a hidden window, and a plugin older than 1.11.0 paced its reads with them. Close Design Bridge and open it again to load the current plugin. Until then, keep Figma visible during a large read. |
 | A read says the plugin stopped it at its time limit | Figma did not finish a call in time, and the note names the call and the layer. The layers it did not reach are placeholders. Read one screen frame by its id as `node-id` rather than the whole section, or pass a larger `timeoutMs` (up to 120000). |
 | A read says `pluginOutdated: true`, or that Design Bridge is too old to export REST JSON | The panel open in Figma runs a plugin older than 1.5.0, which reads its own way and can miss attributes such as per-corner radii. Close Design Bridge and open it again: Figma loads the plugin's code anew. With a clone, `git pull` first. |
 | A read says the bridge is older than the MCP server | Every agent session shares the bridge the first one started, and that one runs an older version. Close every Claude Code, Codex, agy and Gemini CLI session so the next one starts the new bridge, then reopen Design Bridge in Figma. |

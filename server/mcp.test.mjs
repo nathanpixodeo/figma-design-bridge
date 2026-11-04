@@ -563,6 +563,69 @@ test("a read the plugin stopped at its time limit says what Figma was doing, and
   assert.deepEqual(context.timing.stalled, { step: "export", nodeId: "1:3", ms: 24000 });
 });
 
+test("search_design has the plugin search the node, and reads the node whole only for a plugin too old to search", async t => {
+  const dataDir = tempDataDir(t);
+  const port = await freePort();
+  const client = await connectMcp(t, { FIGMA_BRIDGE_DATA_DIR: dataDir, FIGMA_BRIDGE_PORT: String(port) });
+  await waitFor(() => bridgeHealthy(port));
+  const searches = [];
+  await fakePlugin(t, port, dataDir, "SearchFile1", request => {
+    if (request.op === "edit-seq") return { fileKey: "SearchFile1", editSeq: 1 };
+    const { query } = request.params.options;
+    searches.push({ representation: request.params.representation, query });
+    const late = query === "late";
+    return {
+      fileKey: "SearchFile1", fileName: "Finance", nodeId: request.params.nodeId, pageId: "0:1", pageName: "Home",
+      format: "search", truncated: true,
+      completeness: { nodeCount: 120, byteSize: 400, limitHit: true, truncatedNodeIds: [], ...(late ? { stoppedBy: "time" } : {}) },
+      timing: { countMs: 900, totalMs: 901, yields: 18, yieldMs: 9, maxYieldMs: 1 },
+      payload: {
+        query, checked: 120, more: !late,
+        matches: [
+          { id: "1:7", name: "Sponsorship", type: "FRAME", path: ["Finance Manager", "All Finances"], x: 0, y: 40, width: 1920, height: 1080, fill: "#FFFFFF" },
+          { id: "1:8", name: "Title", type: "TEXT", path: ["Finance Manager", "All Finances", "Sponsorship"], text: "Sponsorship overview" },
+        ],
+      },
+    };
+  }, ["read-node", "read-document-index", "figma-rest", "edit-seq", "assets", "render", "search"]);
+  const source = "https://www.figma.com/design/SearchFile1/Finance?node-id=1-2";
+
+  const found = textOf(await client.callTool({ name: "search_design", arguments: { source, q: "Sponsor", includeHidden: false } }));
+  assert.match(found, /^> Source: Finance, node 1:2, live read at /);
+  assert.match(found, /# Search: "Sponsor" \(2\+ matches in 120 layer\(s\)\)/);
+  assert.match(found, /\*\*1\. Sponsorship\*\* \(FRAME\)\n- Id: 1:7\n- Path: Finance Manager > All Finances > Sponsorship\n- Size: 1920x1080\n- Position: \(0, 40\)\n- Fill: #FFFFFF/);
+  assert.match(found, /\*\*2\. Title\*\* \(TEXT\)\n- Id: 1:8\n- Path: Finance Manager > All Finances > Sponsorship > Title\n- Text: "Sponsorship overview"/);
+  assert.match(found, /Only the first 2 matches are listed\. Use a narrower query/);
+  assert.equal(searches.length, 1);
+  assert.match(searches[0].representation, /^search\+visible-only\+q[0-9a-f]{16}$/);
+  assert.equal(searches[0].query, "Sponsor");
+
+  const late = textOf(await client.callTool({ name: "search_design", arguments: { source, q: "late" } }));
+  assert.match(late, /The plugin stopped this search at its time limit after 901 ms, with 120 layer\(s\) searched: .*pass a larger timeoutMs \(up to 120000\)\./);
+  assert.equal(searches.length, 2, "a search cut by time is not made again some other way");
+
+  const oldReads = [];
+  await fakePlugin(t, port, dataDir, "OldFile1", request => {
+    if (request.op === "edit-seq") return { fileKey: "OldFile1", editSeq: 1 };
+    oldReads.push(request.params.representation);
+    return {
+      fileKey: "OldFile1", fileName: "Old", nodeId: request.params.nodeId, pageId: "0:1", pageName: "Home",
+      format: "figma-rest", editSeq: 1,
+      completeness: { nodeCount: 2, byteSize: 300, limitHit: false, truncatedNodeIds: [] },
+      payload: {
+        document: { id: request.params.nodeId, name: "Screen", type: "FRAME", children: [{ id: "2:3", name: "Sponsor badge", type: "FRAME" }] },
+        components: {}, componentSets: {}, styles: {}, variables: {},
+      },
+    };
+  }, ["read-node", "read-document-index", "figma-rest", "edit-seq"]);
+  const old = textOf(await client.callTool({
+    name: "search_design", arguments: { source: "https://www.figma.com/design/OldFile1/Old?node-id=2-2", q: "Sponsor" },
+  }));
+  assert.match(old, /# Search: "Sponsor" \(1 matches\)/);
+  assert.match(old, /\*\*1\. Sponsor badge\*\* \(FRAME\)/);
+  assert.deepEqual(oldReads, ["figma-rest+d50"], "the plugin too old to search reads the node whole");
+});
+
 const ASSET_CAPABILITIES = ["read-node", "read-document-index", "figma-rest", "edit-seq", "assets", "render"];
 const svgOf = (width, height, d) => `<svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}"><path d="${d}" fill="#E30613"/></svg>`;
 const PNG_BYTES = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]);

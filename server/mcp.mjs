@@ -15,6 +15,7 @@ const { fetchFigmaDesign, normalizeFigmaNode } = figmaApi;
 const require = createRequire(import.meta.url);
 const { startOrReuse } = require("./bridge/daemon.js");
 const { createClient } = require("./bridge/client.js");
+const { parseSource } = require("./bridge/identity.js");
 const createSnapshotStore = require("./snapshot-store.js");
 const createLegacyRoutes = require("./legacy-routes.js");
 const { prepareDataDir, readConfig } = require("./data-dir.js");
@@ -376,6 +377,18 @@ function timeNote(bridge) {
   return `The plugin stopped this read at its time limit${after}.${waiting}`;
 }
 
+// Whether the answer was read just now: a cached or reused read may miss an
+// edit made since.
+function freshnessNotes(bridge) {
+  const notes = [];
+  if (bridge.stale || bridge.freshness === "cached") notes.push("Cached data, not verified against the open file.");
+  if (bridge.reused) {
+    const age = Number.isFinite(bridge.ageMs) ? ` from ${Math.round(bridge.ageMs / 1000)} s ago` : "";
+    notes.push(`Reused the plugin's read${age}: it reported no edit since. Figma does not report every edit to plugins, such as a change to a variable's value alone; pass fresh: true to read again after one.`);
+  }
+  return notes;
+}
+
 // What limits how far a bridge read can be trusted.
 function readNotes(bridge) {
   const notes = [];
@@ -403,11 +416,7 @@ function readNotes(bridge) {
     }
     notes.push(note);
   }
-  if (bridge.stale || bridge.freshness === "cached") notes.push("Cached data, not verified against the open file.");
-  if (bridge.reused) {
-    const age = Number.isFinite(bridge.ageMs) ? ` from ${Math.round(bridge.ageMs / 1000)} s ago` : "";
-    notes.push(`Reused the plugin's read${age}: it reported no edit since. Figma does not report every edit to plugins, such as a change to a variable's value alone; pass fresh: true to read again after one.`);
-  }
+  notes.push(...freshnessNotes(bridge));
   if (bridge.pluginOutdated) {
     notes.push("The Design Bridge plugin open in Figma is too old to export Figma's REST JSON, so this read can miss attributes such as per-corner radii and mixed text styles. Ask the user to close and reopen Design Bridge in Figma.");
   } else if (bridge.nodeId && String(bridge.representation || "").startsWith("figma-rest") && !isRestResult(bridge)) {
@@ -476,6 +485,87 @@ async function resolveDesign(args = {}) {
   const error = new Error('No design source provided. Pass "source" with a Figma URL/file key, or explicitly import a legacy REST snapshot first.');
   error.code = "NO_DESIGN_SOURCE";
   throw error;
+}
+
+// ── Search ─────────────────────────────────────────────────
+
+// The bridge takes a query of up to this many characters.
+const MAX_SEARCH_QUERY = 200;
+
+function namesNode(source) {
+  try {
+    return Boolean(parseSource(source).nodeId);
+  } catch {
+    return false;
+  }
+}
+
+// A bridge from before 1.11.0 does not know the query option, and a plugin
+// from before then cannot search: the search is then made the old way.
+function searchUnsupported(error) {
+  return error?.code === "PLUGIN_OUTDATED"
+    || (error?.code === "BAD_REQUEST" && /Unknown option "query"/.test(error.message || ""))
+    || error?.code === "NO_CACHED_DATA";
+}
+
+// The plugin searches the node's layers itself and reads only their names and
+// text, which takes seconds where reading the node whole can take minutes.
+// null: this bridge or plugin cannot, or the query does not fit.
+async function searchInPlugin(args, q) {
+  if (!args.source || !namesNode(args.source)) return null;
+  if (!q.trim() || q.length > MAX_SEARCH_QUERY) return null;
+  const options = { representation: "search", query: q };
+  if (args.includeHidden !== undefined) options.includeHidden = args.includeHidden;
+  if (args.depth !== undefined) options.depth = args.depth;
+  try {
+    const result = await withBridge(client => client.read({
+      source: args.source,
+      mode: args.mode || "live",
+      timeoutMs: readTimeoutFromArgs(args),
+      options,
+      fresh: args.fresh === true,
+    }));
+    return result?.format === "search" ? result : null;
+  } catch (error) {
+    if (searchUnsupported(error)) return null;
+    throw error;
+  }
+}
+
+function searchNotes(bridge) {
+  const notes = [];
+  const { matches = [], checked } = bridge.payload || {};
+  if (stoppedForTime(bridge)) {
+    const total = bridge.timing?.totalMs;
+    notes.push(`The plugin stopped this search at its time limit${Number.isFinite(total) ? ` after ${total} ms` : ""}, `
+      + `with ${checked ?? "some"} layer(s) searched: layers it did not reach may hold more matches. `
+      + "Search one screen frame by its id as node-id, or pass a larger timeoutMs (up to 120000).");
+  }
+  if (bridge.payload?.more) {
+    notes.push(`Only the first ${matches.length} matches are listed. Use a narrower query, or search one screen frame by its id as node-id.`);
+  }
+  notes.push(...freshnessNotes(bridge));
+  return notes;
+}
+
+function describeSearch(bridge, q) {
+  const source = provenance({ fileName: bridge.fileName, bridge });
+  const notes = searchNotes(bridge);
+  const tail = notes.length ? "\n\n" + notes.map(note => `> **Note:** ${note}`).join("\n") : "";
+  const { matches = [], checked } = bridge.payload || {};
+  const searched = Number.isFinite(checked) ? ` in ${checked} layer(s)` : "";
+  if (!matches.length) return `${source}\n\nNo results for "${q}"${searched}.${tail}`;
+  let r = `${source}\n\n# Search: "${q}" (${matches.length}${bridge.payload?.more ? "+" : ""} matches${searched})\n\n`;
+  matches.forEach((match, i) => {
+    r += `**${i + 1}. ${match.name}** (${match.type})\n- Id: ${match.id}\n`;
+    r += `- Path: ${[...(Array.isArray(match.path) ? match.path : []), match.name].join(" > ")}\n`;
+    if (match.text) r += `- Text: "${match.text}"\n`;
+    if (match.width && match.height) r += `- Size: ${match.width}x${match.height}\n`;
+    if (match.x !== undefined) r += `- Position: (${match.x}, ${match.y})\n`;
+    if (match.fill) r += `- Fill: ${match.fill}\n`;
+    r += "\n";
+  });
+  return r.trimEnd() + tail;
 }
 
 const TIMEOUT_PROPERTY = {
@@ -949,7 +1039,7 @@ async function startMCP() {
       {
         name: "search_design",
         _meta: INLINE_RESULT_META,
-        description: "Search a Figma node link (with node-id) through the live plugin bridge, or the legacy imported snapshot when source is omitted, by node name or text content. A file link only has the document index and is refused.",
+        description: "Search a Figma node link (with node-id) through the live plugin bridge, or the legacy imported snapshot when source is omitted, by node name or text content. The Design Bridge plugin searches the node itself and reads only names and text, so a section of many screens takes seconds. Each match comes with its id, path, text, size, position and fill. A file link only has the document index and is refused.",
         inputSchema: {
           type: "object",
           properties: {
@@ -1121,6 +1211,8 @@ async function startMCP() {
         const q = args?.q;
         if (!q) return err('Missing required parameter "q"');
         try {
+          const searched = await searchInPlugin(args, q);
+          if (searched) return ok(describeSearch(searched, q));
           const design = await resolveDesign(args);
           if (isDocumentIndex(design)) return err(indexOnly("Search"));
           const ql = q.toLowerCase();

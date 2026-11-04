@@ -25,7 +25,7 @@ function clock() {
 
 function bridgePlugin({
   characters = 'Hello from another page', command = 'bridge', fileKey = 'AAAAfileKeyAAAA',
-  rootName = 'Bridge Test File', saved, now, manualYield = false,
+  rootName = 'Bridge Test File', saved, now, manualYield = false, uiAcks = false,
 } = {}) {
   const time = clock()
   // A paced read hands control back to Figma with setTimeout(0). Those run on
@@ -37,7 +37,7 @@ function bridgePlugin({
     }
     return time.setTimeout(callback, delay)
   }
-  const sent = [], notifications = [], events = new Map()
+  const sent = [], notifications = [], events = new Map(), yields = []
   const storage = new Map(saved ? [['design-bridge-pairing', saved]] : [])
   const activePage = { id: '0:1', name: 'Screens', type: 'PAGE', selection: [], children: [] }
   const otherPage = { id: '0:2', name: 'Archive', type: 'PAGE', selection: [], children: [] }
@@ -53,7 +53,16 @@ function bridgePlugin({
   const figma = {
     command, currentPage: activePage, root, fileKey, closed: false,
     ui: {
-      postMessage(message) { sent.push(structuredClone(message)) },
+      // A paced read asks the panel to answer; with uiAcks the panel does, as
+      // the real one does, and otherwise the read waits on its timer.
+      postMessage(message) {
+        if (message.type === 'bridge-yield') {
+          yields.push(message.id)
+          if (uiAcks) setImmediate(() => figma.ui.onmessage({ type: 'bridge-yield-ack', id: message.id }))
+          return
+        }
+        sent.push(structuredClone(message))
+      },
       resize(width, height) { this.size = [width, height] },
     },
     showUI(html, options) { this.html = html; this.uiOptions = options },
@@ -72,7 +81,7 @@ function bridgePlugin({
   if (now) context.Date = class extends Date { static now() { return now() } }
   vm.runInNewContext(source, context)
   return {
-    figma, time, sent, notifications, target, activePage, otherPage, storage, nodes,
+    figma, time, sent, notifications, target, activePage, otherPage, storage, nodes, yields,
     emit: event => events.get(event)?.(),
     message: message => figma.ui.onmessage(message),
     ready: () => figma.ui.onmessage({ type: 'ui-ready' }),
@@ -1089,7 +1098,7 @@ test('a heartbeat of a replaced session does not start a second heartbeat chain'
   assert.equal(heartbeats(), 1, 'the old heartbeat scheduled another one for the new session')
 })
 
-test('the panel tells the bridge it can export REST JSON and report its edit count, and that it exports assets and renders', async () => {
+test('the panel tells the bridge it can export REST JSON and report its edit count, and that it exports assets and renders and searches', async () => {
   const calls = []
   const panel = ui(async (url, options = {}) => {
     calls.push({ url, body: options.body ? JSON.parse(options.body) : null })
@@ -1099,7 +1108,16 @@ test('the panel tells the bridge it can export REST JSON and report its edit cou
   await panel.post({ type: 'bridge-start', config: savedConfig })
   await settleUi()
   const register = calls.find(call => call.url.endsWith('/bridge/session'))
-  assert.deepEqual(register.body.capabilities, ['read-node', 'read-document-index', 'figma-rest', 'edit-seq', 'assets', 'render'])
+  assert.deepEqual(register.body.capabilities, ['read-node', 'read-document-index', 'figma-rest', 'edit-seq', 'assets', 'render', 'search'])
+})
+
+test('the panel answers a paced read at once, so the read does not wait on a timer Figma throttles', async () => {
+  const panel = ui(async () => new Promise(() => {}))
+  panel.messages.length = 0
+  const timers = panel.time.timers.size
+  await panel.post({ type: 'bridge-yield', id: 7 })
+  assert.deepEqual(panel.messages, [{ type: 'bridge-yield-ack', id: 7 }])
+  assert.equal(panel.time.timers.size, timers, 'no timer stands between the read and its answer')
 })
 
 // What Figma's JSON_REST_V1 export gives for a fake layer: the REST API's
@@ -1549,6 +1567,148 @@ test('Bridge sets no deadline timer for a read without a deadline', async () => 
   assert.equal(reply.result.completeness.stoppedBy, undefined)
   assert.equal(reply.result.timing.stalled, undefined)
   assert.equal(p.time.delays.length, before)
+})
+
+// A tree to search: a section of two screens, with a hidden layer and text
+// three levels down. No layer can export, so a search that tried would fail.
+function searchSection(p) {
+  const section = { id: '7:1', name: 'Finance Manager', type: 'SECTION', parent: p.otherPage, children: [] }
+  const list = {
+    id: '7:2', name: 'Sponsorship list', type: 'FRAME', x: 10.4, y: 20.6, width: 1920, height: 1080,
+    fills: [{ type: 'SOLID', color: { r: 1, g: 0.5, b: 0 } }], children: [],
+  }
+  const title = { id: '7:3', name: 'Title', type: 'TEXT', characters: 'Sponsorship overview' }
+  const hidden = { id: '7:4', name: 'Hidden sponsor', type: 'TEXT', characters: 'x', visible: false }
+  const group = { id: '7:5', name: 'Group', type: 'FRAME', children: [] }
+  const deep = { id: '7:6', name: 'Deep', type: 'TEXT', characters: 'SPONSOR deep' }
+  const other = { id: '7:7', name: 'Other', type: 'FRAME', children: [] }
+  const body = { id: '7:8', name: 'Body', type: 'TEXT', characters: 'nothing here' }
+  const link = (parent, ...children) => {
+    for (const child of children) { child.parent = parent; parent.children.push(child) }
+  }
+  link(section, list, other)
+  link(list, title, hidden, group)
+  link(group, deep)
+  link(other, body)
+  const nodes = new Map([section, list, title, hidden, group, deep, other, body].map(node => [node.id, node]))
+  p.figma.getNodeByIdAsync = async id => nodes.get(id) || null
+  return { section, nodes }
+}
+
+function searchRequest(requestId, nodeId, query, options = {}, timing = {}) {
+  return timedRequest(requestId, nodeId, {
+    representation: `search+${requestId}`, options: { representation: 'search', query, ...options }, ...timing,
+  })
+}
+
+test('Bridge searches a node by layer name and text without exporting it', async () => {
+  const p = await connectedBridgePlugin()
+  const { section } = searchSection(p)
+  await settle(p, p.message(searchRequest('search', section.id, 'sponsor', { includeHidden: false })))
+
+  const reply = bridgeReplies(p).at(-1)
+  assert.equal(reply.ok, true, reply.error)
+  const { result } = reply
+  assert.equal(result.format, 'search')
+  assert.equal(result.nodeId, section.id)
+  assert.equal(result.truncated, false)
+  assert.deepEqual(result.payload.matches.map(match => match.id), ['7:2', '7:3', '7:6'], 'case-insensitive, by name or text')
+  assert.deepEqual(result.payload.matches[0], {
+    id: '7:2', name: 'Sponsorship list', type: 'FRAME', path: ['Finance Manager'],
+    x: 10, y: 21, width: 1920, height: 1080, fill: '#FF8000',
+  })
+  assert.equal(result.payload.matches[1].text, 'Sponsorship overview')
+  assert.deepEqual(result.payload.matches[2].path, ['Finance Manager', 'Sponsorship list', 'Group'])
+  assert.equal(result.payload.query, 'sponsor')
+  assert.equal(result.payload.checked, 7, 'the hidden layer is not checked')
+  assert.equal(result.payload.more, false)
+  assert.equal(result.completeness.nodeCount, 7)
+  assert.equal(result.completeness.limitHit, false)
+  assert.equal(result.completeness.stoppedBy, undefined)
+})
+
+test('Bridge search takes hidden layers unless told not to, and stops at the depth asked', async () => {
+  const p = await connectedBridgePlugin()
+  const { section } = searchSection(p)
+  await settle(p, p.message(searchRequest('hidden', section.id, 'Sponsor')))
+  assert.deepEqual(bridgeReplies(p).at(-1).result.payload.matches.map(match => match.id), ['7:2', '7:3', '7:4', '7:6'])
+
+  await settle(p, p.message(searchRequest('shallow', section.id, 'sponsor', { depth: 2 })))
+  assert.deepEqual(bridgeReplies(p).at(-1).result.payload.matches.map(match => match.id), ['7:2', '7:3', '7:4'])
+})
+
+test('Bridge search stops at 200 matches and says there are more', async () => {
+  const p = await connectedBridgePlugin()
+  const { screen, nodes } = flatScreen(p.otherPage, 250)
+  p.figma.getNodeByIdAsync = async id => nodes.get(id) || null
+  await settle(p, p.message(searchRequest('many', screen.id, 'label')))
+
+  const { result } = bridgeReplies(p).at(-1)
+  assert.equal(result.payload.matches.length, 200)
+  assert.equal(result.payload.more, true)
+  assert.equal(result.truncated, true)
+  assert.equal(result.completeness.limitHit, true)
+})
+
+test('Bridge search stops at its deadline and answers with the matches so far', async () => {
+  const p = await connectedBridgePlugin({ now: steppingClock() })
+  const { screen, nodes } = flatScreen(p.otherPage, 400)
+  p.figma.getNodeByIdAsync = async id => nodes.get(id) || null
+  // The clock moves 20 ms a reading, and the deadline is 4.8 s in.
+  await settle(p, p.message(searchRequest('late', screen.id, 'label', {}, { enqueuedAt: 0, timeoutMs: 6000 })))
+
+  const reply = bridgeReplies(p).at(-1)
+  assert.equal(reply.ok, true, reply.error)
+  const { result } = reply
+  assert.equal(result.completeness.stoppedBy, 'time')
+  assert.equal(result.completeness.limitHit, true)
+  assert.ok(result.payload.checked > 1 && result.payload.checked < 401, `checked ${result.payload.checked}`)
+  assert.equal(result.payload.matches.length, result.payload.checked - 1, 'every label checked is a match')
+  assert.equal(result.completeness.nodeCount, result.payload.checked)
+})
+
+test('Bridge reads on when the panel answers its yield, without waiting on a timer Figma may throttle', async () => {
+  const p = await connectedBridgePlugin({ now: steppingClock(), manualYield: true, uiAcks: true })
+  const { screen, nodes } = flatScreen(p.otherPage, 40)
+  p.figma.getNodeByIdAsync = async id => nodes.get(id) || null
+  const timers = p.time.timers.size
+
+  // The timers are never run here, as in a hidden Figma that holds them back.
+  let done = false
+  const pending = p.message(searchRequest('acked', screen.id, 'label'))
+  pending.then(() => { done = true })
+  for (let i = 0; i < 2000 && !done; i++) await new Promise(resolve => setImmediate(resolve))
+  assert.equal(done, true, 'the read finished on the panel answers alone')
+
+  const { result } = bridgeReplies(p).at(-1)
+  assert.equal(result.payload.matches.length, 40)
+  assert.ok(result.timing.yields >= 5, `yields ${result.timing.yields}`)
+  assert.equal(p.yields.length, result.timing.yields)
+  assert.ok(Number.isFinite(result.timing.yieldMs) && Number.isFinite(result.timing.maxYieldMs))
+  assert.equal(p.time.timers.size, timers, 'each fallback timer was cleared once the panel answered')
+})
+
+test('Bridge reads on with its timer when the panel does not answer its yield', async () => {
+  const p = await connectedBridgePlugin({ now: steppingClock(), manualYield: true })
+  const { screen, nodes } = flatScreen(p.otherPage, 40)
+  p.figma.getNodeByIdAsync = async id => nodes.get(id) || null
+
+  const pending = p.message(searchRequest('unanswered', screen.id, 'label'))
+  for (let i = 0; i < 20; i++) await new Promise(resolve => setImmediate(resolve))
+  assert.equal(bridgeReplies(p).length, 0, 'the read waits on its timer')
+  assert.ok(p.yields.length > 0, 'it asked the panel first')
+  await settle(p, pending)
+  assert.equal(bridgeReplies(p).at(-1).result.payload.matches.length, 40)
+})
+
+test('Bridge REST read reports how often and how long it yielded to Figma', async () => {
+  const p = await connectedBridgePlugin({ now: steppingClock(), uiAcks: true })
+  const { section } = deadlineSection(p, 30)
+  await settle(p, p.message(timedRequest('rest-yields', section.id, { options: { maxNodes: 100 } })))
+  const { result } = bridgeReplies(p).at(-1)
+  assert.equal(result.format, 'figma-rest')
+  assert.ok(result.timing.yields > 0, `yields ${result.timing.yields}`)
+  assert.ok(Number.isFinite(result.timing.yieldMs))
 })
 
 // A layer tree for the asset tests: every layer gets a parent, a place in

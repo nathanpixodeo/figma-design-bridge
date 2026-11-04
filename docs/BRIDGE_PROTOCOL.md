@@ -124,7 +124,7 @@ Registers a plugin instance as the answering session for one Figma file.
   "fileKey": "abc123DEF456",
   "fileName": "Website",
   "pluginInstanceId": "plugin-7f3c",
-  "capabilities": ["read-node", "read-document-index", "figma-rest", "edit-seq", "assets", "render"]
+  "capabilities": ["read-node", "read-document-index", "figma-rest", "edit-seq", "assets", "render", "search"]
 }
 ```
 
@@ -142,10 +142,11 @@ Registers a plugin instance as the answering session for one Figma file.
 | `edit-seq` | Answers `edit-seq` at once with its edit count, which lets the bridge reuse its reads, since 1.5.0 |
 | `assets` | Exports a node's icons as SVG and its images as their files (representation `assets`), since 1.6.0 |
 | `render` | Renders a node as PNG, JPG or SVG (representation `render`), since 1.6.0 |
+| `search` | Searches a node's layers by name and text itself (representation `search`), since 1.11.0 |
 
 A read asking for `figma-rest` from a session without that capability is
 served as `node-subtree` instead, and the response says `pluginOutdated: true`.
-A live read asking for `assets` or `render` from a session without that
+A live read asking for `assets`, `render` or `search` from a session without that
 capability is refused with `409 PLUGIN_OUTDATED`: no other read can stand in
 for it.
 
@@ -361,6 +362,7 @@ The route an MCP adapter calls with the URL a user pasted.
 | `maxNodes` | integer 1–20000 | 5000 |
 | `maxBytes` | integer 1024–10000000, in UTF-8 bytes of the serialized payload | 2000000 |
 | `includeHidden` | boolean; hidden layers come back with `visible: false` | `true` |
+| `query` | string of 1–200 characters; required with `search`, refused with any other representation | none |
 
 `representation` names how a node is read:
 
@@ -411,9 +413,23 @@ The route an MCP adapter calls with the URL a user pasted.
   `scale` says the scale used. `+svg` sends `svg` (or `svgBase64`) with
   text drawn as paths. A render larger than `maxBytes` has no data and
   `truncated: true`.
+- `search`: the layers under the node whose name, or whose text for a text
+  layer, holds `query`, ignoring case. The plugin reads only names, text, box
+  and first fill, with no export, so a section of many screens takes seconds.
+  It answers with `format: "search"` and the payload
+  `{ query, matches, checked, more }`. Each match is
+  `{ id, name, type, path, text?, x, y, width, height, fill? }`: `path` holds
+  the names of the layers from the node read down to the match's parent,
+  `text` is a text layer's characters cut to 300, `x` and `y` are relative
+  to the parent, and `fill` is the first visible solid fill as `#RRGGBB`.
+  `checked` counts the layers looked at, which `completeness.nodeCount`
+  repeats. The plugin stops at 200 matches with `more: true`, or at the
+  read's deadline with `completeness.stoppedBy: "time"`; both set
+  `truncated`. `depth` and `includeHidden` apply; `maxNodes` and
+  `maxBytes` do not.
 
 A file link reads the document index whatever representation was asked for,
-except `assets` and `render`, which are refused with `400 BAD_REQUEST`:
+except `assets`, `render` and `search`, which are refused with `400 BAD_REQUEST`:
 they need a node.
 
 For `figma-rest`, the plugin first counts a subtree by walking its `children`
@@ -433,6 +449,15 @@ slices of about 50 ms and hand control back to Figma between them, so Figma, the
 panel and its heartbeats stay responsive during a long read. The plugin serves
 one read at a time, in the order they arrive.
 
+Figma throttles timers while its window is hidden or minimized, to one a
+second and then one a minute, so the plugin does not wait on a timer between
+slices. Since 1.11.0 it posts `{ type: "bridge-yield", id }` to its panel and
+goes on when the panel answers `bridge-yield-ack`, or when a `setTimeout(0)`
+fires, whichever comes first. A REST, assets or search read reports
+`timing.yields` (how many times it handed control back), `timing.yieldMs`
+(the time it waited in all) and `timing.maxYieldMs` (the longest wait). A
+large `yieldMs` means Figma kept the read waiting.
+
 A URL `node-id` in dash form (`1-23`) is canonicalized to colon form (`1:23`).
 A source with no node id asks for a lightweight document index rather than a
 whole-file dump.
@@ -441,7 +466,9 @@ Options that change the payload also change the `representation` string, so they
 are part of the cache key — a `depth: 12` read can never be served from a
 `depth: 3` entry. Because hidden layers are included by default, only
 `includeHidden: false` changes the key (`+visible-only`); `true` shares the
-default entry.
+default entry. A `query` adds `+q` and the first 16 hex digits of the SHA-256
+of the lowercased query, so each search has its own entry, and searches that
+differ only in case share one.
 
 When a limit cuts the payload, the plugin keeps the subtree in document order
 and cuts what comes last. Every layer it cuts stays in its parent as a

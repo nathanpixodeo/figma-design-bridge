@@ -384,7 +384,7 @@ async function connectBridge(){
   render()
   let data
   try{
-    data=await bridgeFetch('/bridge/session',{method:'POST',body:{fileKey:bridgeConfig.fileKey,fileName:bridgeConfig.fileName,pluginInstanceId:bridgeConfig.pluginInstanceId,capabilities:['read-node','read-document-index','figma-rest','edit-seq','assets','render']}},false)
+    data=await bridgeFetch('/bridge/session',{method:'POST',body:{fileKey:bridgeConfig.fileKey,fileName:bridgeConfig.fileName,pluginInstanceId:bridgeConfig.pluginInstanceId,capabilities:['read-node','read-document-index','figma-rest','edit-seq','assets','render','search']}},false)
   }catch(err){
     // Registering checks the token alone, so a 401 here means the token is wrong.
     if(err.status===401) err.tokenRejected=true
@@ -598,6 +598,8 @@ function copyLayer(item){
 window.addEventListener('message',async e=>{
   const msg=e.data.pluginMessage
   if(!msg) return
+  // A paced read waits on this answer instead of a timer Figma throttles while hidden.
+  if(msg.type==='bridge-yield'){parent.postMessage({pluginMessage:{type:'bridge-yield-ack',id:msg.id}},'*');return}
   switch(msg.type){
     case 'status': updateInfo(msg); break
     // An error while nothing is connecting leaves the panel idle, with Connect.
@@ -793,12 +795,61 @@ function spendNodeBytes(obj, node, limits) {
 // to Figma whenever it has worked for a slice.
 const BRIDGE_SLICE_MS = 50
 
-function createPacer(sliceMs = BRIDGE_SLICE_MS) {
+// Figma throttles timers while its window is hidden or minimized: a
+// setTimeout(0) then takes a second, and a minute once the window has been
+// hidden for a few minutes, so a walk that yields that way takes minutes. A
+// message to the panel and back is not throttled. The walk yields both ways at
+// once and goes on with whichever comes back first, so a panel that does not
+// answer still leaves the timer.
+const pendingYields = new Map()
+let yieldSeq = 0
+
+function yieldToFigma() {
+  return new Promise(resolve => {
+    let settled = false
+    let id = null
+    let timer = null
+    const done = () => {
+      if (settled) return
+      settled = true
+      if (timer !== null) clearTimeout(timer)
+      if (id !== null) pendingYields.delete(id)
+      resolve()
+    }
+    if (state.ready) {
+      id = ++yieldSeq
+      pendingYields.set(id, done)
+      try {
+        figma.ui.postMessage({ type: 'bridge-yield', id })
+      } catch {
+        pendingYields.delete(id)
+        id = null
+      }
+    }
+    if (!settled) timer = setTimeout(done, 0)
+  })
+}
+
+function yieldAnswered(id) {
+  const done = pendingYields.get(id)
+  if (done) done()
+}
+
+// stats, when given, counts the yields and the time spent waiting on them, so
+// a read can show whether Figma kept it waiting.
+function createPacer(sliceMs = BRIDGE_SLICE_MS, stats = null) {
   let sliceStart = Date.now()
   return async function pace() {
     if (Date.now() - sliceStart < sliceMs) return
-    await new Promise(resolve => setTimeout(resolve, 0))
+    const waited = Date.now()
+    await yieldToFigma()
     sliceStart = Date.now()
+    if (stats) {
+      const ms = sliceStart - waited
+      stats.yields = (stats.yields || 0) + 1
+      stats.yieldMs = (stats.yieldMs || 0) + ms
+      stats.maxYieldMs = Math.max(stats.maxYieldMs || 0, ms)
+    }
   }
 }
 
@@ -1597,11 +1648,11 @@ async function readBridgeNodeRest(request) {
   const node = await loadBridgeNode(params.nodeId, limits)
   if (!node) return missingBridgeNode(params.nodeId)
 
+  const timing = { countMs: 0, exportMs: 0, outlineMs: 0, variablesMs: 0, totalMs: 0 }
   const read = {
-    limits, pace: createPacer(), sizes: new Map(), exports: 0,
+    limits, pace: createPacer(BRIDGE_SLICE_MS, timing), sizes: new Map(), exports: 0,
     geometry: representationParts(request).includes('geometry'), vectors: [],
-    components: {}, componentSets: {}, styles: {},
-    timing: { countMs: 0, exportMs: 0, outlineMs: 0, variablesMs: 0, totalMs: 0 },
+    components: {}, componentSets: {}, styles: {}, timing,
   }
   let document
   try {
@@ -1896,10 +1947,10 @@ async function readBridgeAssets(request) {
   const node = await loadBridgeNode(params.nodeId, limits)
   if (!node) return missingBridgeNode(params.nodeId)
 
+  const timing = { countMs: 0, exportMs: 0, totalMs: 0 }
   const read = {
-    limits, pace: createPacer(), images: new Map(), bytes: 0,
-    origin: readValue(node, 'absoluteBoundingBox'),
-    timing: { countMs: 0, exportMs: 0, totalMs: 0 },
+    limits, pace: createPacer(BRIDGE_SLICE_MS, timing), images: new Map(), bytes: 0,
+    origin: readValue(node, 'absoluteBoundingBox'), timing,
   }
   const walked = await walkAssets(node, [], read)
   read.timing.countMs = Date.now() - started
@@ -1975,10 +2026,92 @@ async function readBridgeRender(request) {
   }
 }
 
+// The 'search' representation: the layers under a node whose name or text holds
+// the query, as the Find node tool matches them. Only names, text, box and
+// first fill are read, with no export, so a section of many screens is
+// searched in seconds rather than exported layer by layer.
+const SEARCH_LIMIT = 200
+const SEARCH_TEXT_CHARS = 300
+
+function paintHex(color) {
+  const channel = value => Math.round(Math.max(0, Math.min(1, Number(value) || 0)) * 255).toString(16).padStart(2, '0')
+  return `#${channel(color.r)}${channel(color.g)}${channel(color.b)}`.toUpperCase()
+}
+
+// One match, in the fields search_design shows: path holds the names of the
+// layers between the node read and the match.
+function searchMatch(node, path) {
+  const match = { id: node.id, name: node.name, type: node.type, path }
+  const characters = node.type === 'TEXT' ? readValue(node, 'characters') : undefined
+  if (typeof characters === 'string') {
+    match.text = characters.length > SEARCH_TEXT_CHARS ? `${characters.slice(0, SEARCH_TEXT_CHARS - 1)}…` : characters
+  }
+  for (const key of ['x', 'y', 'width', 'height']) {
+    const value = readValue(node, key)
+    if (typeof value === 'number') match[key] = Math.round(value)
+  }
+  const fill = shownPaints(readValue(node, 'fills'))[0]
+  if (fill && fill.type === 'SOLID' && fill.color) match.fill = paintHex(fill.color)
+  return match
+}
+
+async function readBridgeSearch(request) {
+  const started = Date.now()
+  const params = request.params || {}
+  const options = params.options || {}
+  const limits = bridgeLimits(options, readDeadline(request))
+  const node = await loadBridgeNode(params.nodeId, limits)
+  if (!node) return missingBridgeNode(params.nodeId)
+
+  const query = typeof options.query === 'string' ? options.query : ''
+  const matches = layerMatcher({ query })
+  const timing = { countMs: 0, totalMs: 0 }
+  const pace = createPacer(BRIDGE_SLICE_MS, timing)
+  const found = []
+  const stack = [{ node, depth: 0, path: [] }]
+  let checked = 0, more = false
+  while (stack.length) {
+    await pace()
+    // Out of time: the matches so far are the answer, and checked says how far it got.
+    if (readTimeUp(limits)) break
+    const { node: layer, depth, path } = stack.pop()
+    // A layer deleted while the walk was paused is skipped with its children.
+    try {
+      if (layer.removed) continue
+      if (depth > 0 && !limits.includeHidden && layer.visible === false) continue
+      checked++
+      if (await matches(layer)) {
+        if (found.length === SEARCH_LIMIT) { more = true; break }
+        found.push(searchMatch(layer, path))
+      }
+      const children = depth < limits.maxDepth && 'children' in layer ? layer.children : null
+      if (children && children.length) {
+        const below = [...path, layer.name]
+        for (let i = children.length - 1; i >= 0; i--) stack.push({ node: children[i], depth: depth + 1, path: below })
+      }
+    } catch {}
+  }
+  timing.countMs = Date.now() - started
+
+  const payload = { query, matches: found, checked, more }
+  const completeness = {
+    nodeCount: checked, byteSize: utf8Length(JSON.stringify(payload)),
+    limitHit: more || Boolean(limits.state.timeUp), truncatedNodeIds: [], ...timeUpFields(limits),
+  }
+  const page = findPageForNode(node)
+  timing.totalMs = Date.now() - started
+  return {
+    fileKey: state.bridgeFileKey, fileName: state.bridgeFileName, nodeId: node.id,
+    pageId: page ? page.id : null, pageName: page ? page.name : null, found: true,
+    truncated: completeness.limitHit, completeness, format: 'search', timing, payload,
+  }
+}
+
 function readBridgeNodeAs(request) {
   const base = representationBase(request)
   if (base === 'assets') return readBridgeAssets(request)
   if (base === 'render') return readBridgeRender(request)
+  if (base === 'search') return readBridgeSearch(request)
   return wantsRestFormat(request) ? readBridgeNodeRest(request) : readBridgeNode(request)
 }
 
@@ -2419,6 +2552,10 @@ function main() {
 
   figma.ui.onmessage = async msg => {
     switch (msg.type) {
+      case 'bridge-yield-ack':
+        yieldAnswered(msg.id)
+        break
+
       case 'ui-ready': {
         if (state.ready) break
         state.ready = true

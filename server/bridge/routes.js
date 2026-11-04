@@ -9,6 +9,7 @@
 // can be exercised against fakes and so it never hard-binds to a sibling that
 // may still be under construction.
 
+const crypto = require('crypto')
 const { verifyToken } = require('./token')
 const createPairing = require('./pairing')
 
@@ -31,6 +32,11 @@ const REST_REPRESENTATION = 'figma-rest'
 // Reads only a plugin that names them among its capabilities can answer: an
 // older plugin would read the node as JSON instead.
 const ASSET_REPRESENTATIONS = ['assets', 'render']
+// The plugin searches a node's layers by name and text itself, without
+// exporting them. It is the only read that takes the "query" option.
+const SEARCH_REPRESENTATION = 'search'
+const NODE_REPRESENTATIONS = [...ASSET_REPRESENTATIONS, SEARCH_REPRESENTATION]
+const MAX_QUERY_CHARS = 200
 // A live read may be answered with the plugin's earlier answer while the
 // plugin's edit count shows nothing changed since that read began. Figma
 // reports no edit to a variable's value, so the answer is reused for this long
@@ -322,6 +328,11 @@ function createRoutes(options = {}) {
     // The plugin includes hidden layers unless includeHidden is false, so only
     // false changes the payload, and only false may change the key.
     if (opts.includeHidden === false) parts.push('visible-only')
+    // The plugin matches without regard to case, so queries that differ only
+    // in case share a key. A digest keeps the key a short identifier.
+    if (typeof opts.query === 'string') {
+      parts.push(`q${crypto.createHash('sha256').update(opts.query.toLowerCase()).digest('hex').slice(0, 16)}`)
+    }
     return parts.length ? `${base}+${parts.join('+')}` : base
   }
 
@@ -362,10 +373,17 @@ function createRoutes(options = {}) {
           if (!isInteger(value, 1024, MAX_READ_BYTES)) return `Option "maxBytes" must be an integer between 1024 and ${MAX_READ_BYTES}`
         } else if (key === 'includeHidden') {
           if (typeof value !== 'boolean') return 'Option "includeHidden" must be a boolean'
+        } else if (key === 'query') {
+          if (typeof value !== 'string' || !value.trim() || value.length > MAX_QUERY_CHARS) {
+            return `Option "query" must be a non-empty string of up to ${MAX_QUERY_CHARS} characters`
+          }
         } else {
           return `Unknown option "${safeLabel(key)}"`
         }
       }
+      const searching = representationBase(body.options.representation) === SEARCH_REPRESENTATION
+      if (searching && body.options.query === undefined) return 'Representation "search" needs option "query"'
+      if (!searching && body.options.query !== undefined) return 'Option "query" is only for representation "search"'
     }
     return null
   }
@@ -625,7 +643,7 @@ function createRoutes(options = {}) {
           pluginOutdated = true
         }
       }
-    } else if (ASSET_REPRESENTATIONS.includes(representationBase(opts.representation))) {
+    } else if (NODE_REPRESENTATIONS.includes(representationBase(opts.representation))) {
       const base = representationBase(opts.representation)
       if (op !== 'read-node') {
         return sendError(req, res, 400, 'BAD_REQUEST',
@@ -854,7 +872,9 @@ function createRoutes(options = {}) {
     if (typeof result.fallbackReason === 'string') details.fallbackReason = safeText(result.fallbackReason)
     if (isPlainObject(result.timing)) {
       const timing = {}
-      for (const key of ['countMs', 'exportMs', 'outlineMs', 'variablesMs', 'totalMs']) {
+      // yields and yieldMs: how often the read handed control back to Figma,
+      // and how long Figma kept it waiting, which grows while Figma is hidden.
+      for (const key of ['countMs', 'exportMs', 'outlineMs', 'variablesMs', 'totalMs', 'yields', 'yieldMs', 'maxYieldMs']) {
         if (Number.isFinite(result.timing[key])) timing[key] = result.timing[key]
       }
       // The Figma call the read was waiting on when its deadline came.
