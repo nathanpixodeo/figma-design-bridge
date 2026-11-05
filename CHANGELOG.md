@@ -4,7 +4,7 @@ All notable changes to Figma Design Bridge. Versions follow
 [Semantic Versioning](https://semver.org/); the Claude Code plugin, the
 marketplace entry and both `package.json` files always carry the same number.
 
-## [Unreleased]
+## [1.12.0] - 2026-11-05
 
 The newest server owns the bridge, and agent sessions reading at once no longer
 time each other out.
@@ -607,7 +607,7 @@ audit. Nothing to migrate.
   with page and selection sync and Watch mode, and the MCP server for Claude
   Code.
 
-[Unreleased]: https://github.com/nathanpixodeo/figma-design-bridge/compare/f7080e0...main
+[1.12.0]: https://github.com/nathanpixodeo/figma-design-bridge/compare/f7080e0...main
 [1.11.0]: https://github.com/nathanpixodeo/figma-design-bridge/compare/c8d47c4...f7080e0
 [1.10.1]: https://github.com/nathanpixodeo/figma-design-bridge/compare/f95d3f1...c8d47c4
 [1.10.0]: https://github.com/nathanpixodeo/figma-design-bridge/compare/711d037...f95d3f1
