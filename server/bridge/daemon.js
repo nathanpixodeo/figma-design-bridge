@@ -401,7 +401,9 @@ async function requestHandoff(url, dataDir, serverVersion, probeOptions) {
     })
     if (response.status !== 202) return false
   } catch {
-    return false
+    // No answer: most likely the owner already stopped listening for another
+    // server's handoff. Wait for the port like an accepted handoff, rather
+    // than reuse an owner that is going away.
   } finally {
     clearTimeout(timer)
   }

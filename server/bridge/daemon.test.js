@@ -583,6 +583,29 @@ test('five servers starting at once against an older owner converge on one new o
   assert.equal((await probe(results[0].url)).serverVersion, '1.12.1')
 })
 
+test('a server whose handoff request finds the owner already closing waits for the port instead of reusing that owner', async t => {
+  const dataDir = tempDataDir(t)
+  const port = await freePort(t)
+  const old = await hostOnPort(t, port, dataDir, '1.12.0')
+  // Another server's handoff lands first: the owner lets go, and this
+  // server's own request finds nobody to answer it.
+  const fetchImpl = async (url, init) => {
+    if (String(url).endsWith('/bridge/handoff')) {
+      await globalThis.fetch(url, init)
+      throw Object.assign(new TypeError('fetch failed'), { cause: { code: 'ECONNREFUSED' } })
+    }
+    return globalThis.fetch(url, init)
+  }
+
+  const host = await startOrReuse({ port, dataDir, serverVersion: '1.12.1', fetchImpl, log: quietLog, ...fakeDeps() })
+  t.after(() => host.close('test-teardown'))
+
+  assert.equal(host.outdatedHost, false)
+  assert.equal(host.owned, true)
+  assert.deepEqual(old.handoffs, [{ version: '1.12.1' }])
+  assert.equal((await probe(host.url)).serverVersion, '1.12.1')
+})
+
 test('the newest of several servers ends up owning the port', async t => {
   const dataDir = tempDataDir(t)
   const port = await freePort(t)
