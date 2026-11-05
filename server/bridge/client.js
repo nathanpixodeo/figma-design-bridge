@@ -115,21 +115,29 @@ function createClient(options = {}) {
       return send('GET', '/bridge/status', { signal })
     },
 
-    read({ source, options: readOptions, mode, timeoutMs: readTimeoutMs, fresh, signal } = {}) {
+    // queueWaitMs: how long the read may wait for its turn in the plugin on
+    // top of timeoutMs, which then counts from when the plugin starts it.
+    read({ source, options: readOptions, mode, timeoutMs: readTimeoutMs, fresh, queueWaitMs, signal } = {}) {
       const body = { source }
       if (readOptions !== undefined) body.options = readOptions
       if (mode !== undefined) body.mode = mode
       if (readTimeoutMs !== undefined) body.timeoutMs = readTimeoutMs
       // Sent only when asked for: a bridge older than 1.5.0 rejects the field.
       if (fresh === true) body.fresh = true
+      // Sent only when it waits: a bridge older than 1.12.0 rejects the field.
+      if (Number.isInteger(queueWaitMs) && queueWaitMs > 0) body.queueWaitMs = queueWaitMs
       // Give the server room to hit its own deadline before the socket does.
-      const timeout = readTimeoutMs ? readTimeoutMs + 5000 : timeoutMs
-      return send('POST', '/bridge/read', { body, signal, timeout }).catch(error => {
-        // Such a bridge reuses nothing, so every live read it serves is fresh.
-        if (!body.fresh || error.status !== 400 || !/Unknown field "fresh"/.test(error.message)) throw error
-        const { fresh: _fresh, ...older } = body
-        return send('POST', '/bridge/read', { body: older, signal, timeout })
+      const timeoutFor = sent => (sent.timeoutMs ? sent.timeoutMs + (sent.queueWaitMs || 0) + 5000 : timeoutMs)
+      const attempt = sent => send('POST', '/bridge/read', { body: sent, signal, timeout: timeoutFor(sent) }).catch(error => {
+        // An older bridge names the first field it does not know. Without
+        // "fresh" it reuses nothing, so every live read it serves is fresh;
+        // without "queueWaitMs" the wait counts against timeoutMs, as it did.
+        const unknown = error.status === 400 && /Unknown field "(fresh|queueWaitMs)"/.exec(error.message || '')
+        if (!unknown || sent[unknown[1]] === undefined) throw error
+        const { [unknown[1]]: _dropped, ...older } = sent
+        return attempt(older)
       })
+      return attempt(body)
     },
 
     // Hands the token to the Figma plugin showing this code.

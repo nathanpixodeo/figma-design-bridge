@@ -13,7 +13,7 @@ import figmaApi from "./figma-api.js";
 
 const { fetchFigmaDesign, normalizeFigmaNode } = figmaApi;
 const require = createRequire(import.meta.url);
-const { startOrReuse } = require("./bridge/daemon.js");
+const { startOrReuse, compareVersions } = require("./bridge/daemon.js");
 const { createClient } = require("./bridge/client.js");
 const { parseSource } = require("./bridge/identity.js");
 const createSnapshotStore = require("./snapshot-store.js");
@@ -22,6 +22,10 @@ const { prepareDataDir, readConfig } = require("./data-dir.js");
 const { READ_TOOLS } = require("./tool-policy.js");
 const { fillsBackground, imagePlacement } = require("./paint-css.js");
 const { version: PACKAGE_VERSION } = require("./package.json");
+// The version this server tells the bridge it is. A newer one takes the port
+// over from an older owner. Tests and live checks set the variable to play a
+// newer server.
+const SERVER_VERSION = process.env.FIGMA_BRIDGE_TEST_SERVER_VERSION || PACKAGE_VERSION;
 
 const fileConfig = readConfig({ log: message => log(message) });
 const PORT = parseInt(process.env.FIGMA_BRIDGE_PORT || fileConfig.port || "3456", 10);
@@ -143,7 +147,28 @@ function summary(data) {
 let bridge = null; // { descriptor, client } once the bridge was started or reused
 let bridgeStartup = null;
 let takeoverPending = false; // a reused bridge went away and has not been replaced yet
+let handedOverAt = 0; // when this process handed the port to a newer server
 let anonymousLegacyWarned = false;
+
+// After this process hands the port over, its successor needs a moment to
+// listen. Until then this process waits for it instead of taking the port back.
+const HANDOFF_AWAIT_MS = 10_000;
+// A read may wait this long for its turn in the plugin on top of its own
+// timeoutMs, so agent sessions reading at once do not time each other out.
+const READ_QUEUE_WAIT_MS = 60_000;
+
+// This process owned the bridge and a newer server asked for the port. From
+// now on it uses that server like any other client.
+function handleHandoff({ version }) {
+  log(`[bridge:info] figma-bridge ${version} took the port over; this server now uses it`);
+  handedOverAt = Date.now();
+  bridge = null;
+  takeoverPending = true;
+}
+
+function withQueueWait(client) {
+  return { ...client, read: args => client.read({ queueWaitMs: READ_QUEUE_WAIT_MS, ...args }) };
+}
 
 // When this process ends up owning the port, `figma-bridge import` posts to it
 // as well, so it serves /design next to /bridge/*.
@@ -176,6 +201,9 @@ async function ensureBridge() {
       host: HOST,
       dataDir: DATA_DIR,
       maxBytes: CACHE_MAX_BYTES,
+      serverVersion: SERVER_VERSION,
+      onHandoff: handleHandoff,
+      awaitHostMs: Date.now() - handedOverAt < HANDOFF_AWAIT_MS ? HANDOFF_AWAIT_MS : 0,
       log: (level, ...args) => log(`[bridge:${level}]`, ...args),
       createFallback: legacyRoutesFor,
     }).then(descriptor => {
@@ -190,8 +218,15 @@ async function ensureBridge() {
       }
       // currentToken follows the token file, so a rotation does not lock this
       // server out of the bridge it owns or reuses.
-      bridge = { descriptor, client: createClient({ url: descriptor.url, token: descriptor.currentToken || descriptor.token }) };
+      bridge = {
+        descriptor,
+        client: withQueueWait(createClient({ url: descriptor.url, token: descriptor.currentToken || descriptor.token })),
+      };
       takeoverPending = false;
+      if (descriptor.outdatedHost) {
+        log(`[bridge:warn] the bridge on port ${PORT} runs ${descriptor.hostVersion ? `figma-bridge ${descriptor.hostVersion}` : "a figma-bridge older than 1.12.0"}, `
+          + `older than this server (${SERVER_VERSION}), and did not hand the port over`);
+      }
       return bridge.client;
     }).catch(error => {
       // Keep trying in the background (see the interval below): the port may
@@ -210,7 +245,8 @@ async function ensureBridge() {
 // a call, or be replaced by one holding a different token. Forget that
 // connection and resolve the bridge again once (taking the port over if it is
 // free) instead of failing every later call. Reads and status are idempotent.
-const RECONNECT_CODES = new Set(["UNREACHABLE", "UNAUTHORIZED", "ECONNRESET", "EPIPE", "UND_ERR_SOCKET"]);
+// BRIDGE_HANDOFF: the owner handed the port to a newer server mid-call.
+const RECONNECT_CODES = new Set(["UNREACHABLE", "UNAUTHORIZED", "ECONNRESET", "EPIPE", "UND_ERR_SOCKET", "BRIDGE_HANDOFF"]);
 
 async function withBridge(call) {
   const client = await ensureBridge();
@@ -218,7 +254,8 @@ async function withBridge(call) {
     return await call(client);
   } catch (error) {
     const stale = bridge && bridge.client === client ? bridge : null;
-    if (!RECONNECT_CODES.has(error.code) || (stale && stale.descriptor.owned)) throw error;
+    if (!RECONNECT_CODES.has(error.code)) throw error;
+    if (stale && stale.descriptor.owned && error.code !== "BRIDGE_HANDOFF") throw error;
     if (stale) {
       bridge = null;
       takeoverPending = true;
@@ -236,8 +273,16 @@ setInterval(async () => {
   if (current) {
     if (current.descriptor.owned) return;
     try {
-      await current.client.health({ timeout: 2000 });
-      return;
+      const health = await current.client.health({ timeout: 2000 });
+      // An older server took the port, for one when the newer owner exited
+      // and an older client won the race: ask it to hand the port over.
+      // An owner that already refused is not asked again until it changes.
+      const older = health?.serverVersion && compareVersions(health.serverVersion, SERVER_VERSION) < 0;
+      const refused = current.descriptor.outdatedHost && current.descriptor.hostVersion === health?.serverVersion;
+      if (!older || refused) return;
+      if (bridge !== current) return;
+      bridge = null;
+      takeoverPending = true;
     } catch {
       if (bridge !== current) return;
       bridge = null;
@@ -246,6 +291,24 @@ setInterval(async () => {
   }
   if (takeoverPending) ensureBridge().catch(() => { /* tried again on the next tick */ });
 }, 10_000).unref();
+
+// Which server answers on the port next to this one. A host older than this
+// server runs older bridge code: say so, and how to end it.
+function withVersionInfo(status) {
+  const host = status?.host || { serverVersion: null };
+  const older = !host.serverVersion || compareVersions(host.serverVersion, SERVER_VERSION) < 0;
+  const result = { thisServerVersion: SERVER_VERSION, ...status, host };
+  if (!older) return result;
+  const what = host.serverVersion ? `figma-bridge ${host.serverVersion}` : "a figma-bridge older than 1.12.0";
+  const which = host.pid ? ` (pid ${host.pid}${host.startedAt ? `, started ${host.startedAt}` : ""})` : "";
+  const find = host.pid ? "" : ` To find it on Windows, run \`netstat -ano | findstr :${PORT}\`; the last column is its pid.`;
+  const hint = `The bridge on port ${PORT} runs ${what}${which}, older than this server (${SERVER_VERSION}). `
+    + "Another Claude Code session started it before the update and still owns the port, so reads use the older "
+    + `bridge code${host.serverVersion ? "" : " and it cannot hand the port over"}. Ask the user to close that session: this server `
+    + `then takes the port over within 10 s.${find}`;
+  result.setupHints = [...(Array.isArray(status?.setupHints) ? status.setupHints : []), hint];
+  return result;
+}
 
 // read: the call waited on the Figma plugin, so a TIMEOUT means the plugin was
 // slow rather than the bridge being busy.
@@ -267,6 +330,14 @@ function describeError(error, { read = false } = {}) {
       + "\"Plugin runtime aborted\", the read was too large for the plugin's memory. Ask the user to reopen "
       + "Design Bridge in Figma, then read one screen frame rather than a section of many screens, or pass a "
       + "smaller depth or maxNodes, or includeHidden: false.";
+  } else if (error.code === "PLUGIN_ERROR" && /Unable to establish connection to Figma/i.test(error.message || "")) {
+    // Figma's own error inside the plugin: the bridge reached the plugin fine.
+    hint = " The bridge and the Design Bridge plugin are connected: Figma itself could not load this node "
+      + "within its own 10 s limit. That happens on a whole page (such as node 0-1) or a section of many "
+      + "screens, and more often while Figma is in the background. Read or search one screen frame by its "
+      + "id instead, or ask the user to bring Figma to the front, then retry.";
+  } else if (error.code === "BRIDGE_HANDOFF") {
+    hint = " A newer figma-bridge server took the bridge over during this call. Retrying is safe.";
   }
   const message = hint && !/[.!?]$/.test(error.message) ? `${error.message}.` : error.message;
   return `${prefix}${message}${hint}`;
@@ -502,18 +573,29 @@ function namesNode(source) {
 
 // A bridge from before 1.11.0 does not know the query option, and a plugin
 // from before then cannot search: the search is then made the old way.
+// The note says why: reading the node whole is slow on a large node, and an
+// agent should know a cut read may miss matches.
+const WHOLE_READ = "so this search read the whole node instead: that is slow on a large node, and a read cut at its limits may miss matches.";
+
 function searchUnsupported(error) {
-  return error?.code === "PLUGIN_OUTDATED"
-    || (error?.code === "BAD_REQUEST" && /Unknown option "query"/.test(error.message || ""))
-    || error?.code === "NO_CACHED_DATA";
+  if (error?.code === "PLUGIN_OUTDATED") {
+    return { note: `The Design Bridge plugin open in Figma is older than 1.11.0 and cannot search itself, ${WHOLE_READ} Ask the user to update the plugin.` };
+  }
+  if (error?.code === "BAD_REQUEST" && /Unknown option "query"/.test(error.message || "")) {
+    return { note: `The bridge on port ${PORT} runs a figma-bridge older than 1.11.0, started by another Claude Code session, ${WHOLE_READ} `
+      + "Ask the user to close that session: this server then takes the port over within 10 s. get_bridge_status shows the bridge's version." };
+  }
+  if (error?.code === "NO_CACHED_DATA") return { note: null };
+  return null;
 }
 
 // The plugin searches the node's layers itself and reads only their names and
 // text, which takes seconds where reading the node whole can take minutes.
-// null: this bridge or plugin cannot, or the query does not fit.
+// result null: this bridge or plugin cannot, or the query does not fit; note
+// then says why when the search falls back for a reason the agent should know.
 async function searchInPlugin(args, q) {
-  if (!args.source || !namesNode(args.source)) return null;
-  if (!q.trim() || q.length > MAX_SEARCH_QUERY) return null;
+  if (!args.source || !namesNode(args.source)) return { result: null, note: null };
+  if (!q.trim() || q.length > MAX_SEARCH_QUERY) return { result: null, note: null };
   const options = { representation: "search", query: q };
   if (args.includeHidden !== undefined) options.includeHidden = args.includeHidden;
   if (args.depth !== undefined) options.depth = args.depth;
@@ -525,9 +607,10 @@ async function searchInPlugin(args, q) {
       options,
       fresh: args.fresh === true,
     }));
-    return result?.format === "search" ? result : null;
+    return { result: result?.format === "search" ? result : null, note: null };
   } catch (error) {
-    if (searchUnsupported(error)) return null;
+    const unsupported = searchUnsupported(error);
+    if (unsupported) return { result: null, note: unsupported.note };
     throw error;
   }
 }
@@ -1136,7 +1219,7 @@ async function startMCP() {
 
       case "get_bridge_status": {
         try {
-          return ok(JSON.stringify(await withBridge(client => client.status()), null, 2));
+          return ok(JSON.stringify(withVersionInfo(await withBridge(client => client.status())), null, 2));
         } catch (error) {
           return err(describeError(error));
         }
@@ -1212,12 +1295,18 @@ async function startMCP() {
         if (!q) return err('Missing required parameter "q"');
         try {
           const searched = await searchInPlugin(args, q);
-          if (searched) return ok(describeSearch(searched, q));
-          const design = await resolveDesign(args);
+          if (searched.result) return ok(describeSearch(searched.result, q));
+          const fallback = searched.note ? `\n\n> **Note:** ${searched.note}` : "";
+          let design;
+          try {
+            design = await resolveDesign(args);
+          } catch (error) {
+            return err(describeError(error, { read: Boolean(args?.source) }) + (searched.note ? ` ${searched.note}` : ""));
+          }
           if (isDocumentIndex(design)) return err(indexOnly("Search"));
           const ql = q.toLowerCase();
           const results = findNodes(design.nodes || [], n => (n.name && n.name.toLowerCase().includes(ql)) || (n.type === "TEXT" && n.characters && n.characters.toLowerCase().includes(ql)));
-          if (!results.length) return ok(`${provenance(design)}\n\nNo results for "${q}".${caveats(design)}`);
+          if (!results.length) return ok(`${provenance(design)}\n\nNo results for "${q}".${caveats(design)}${fallback}`);
           let r = `${provenance(design)}\n\n# Search: "${q}" (${results.length} matches)\n\n`;
           results.forEach((res, i) => {
             const p = [...res.path.map(x => x.name), res.node.name].join(" > ");
@@ -1228,7 +1317,7 @@ async function startMCP() {
             if (res.node.fills?.[0]?.type === "SOLID") r += `- Fill: ${res.node.fills[0].color}\n`;
             r += "\n";
           });
-          return ok(r.trimEnd() + caveats(design));
+          return ok(r.trimEnd() + caveats(design) + fallback);
         } catch (error) { return err(describeError(error, { read: Boolean(args?.source) })); }
       }
 

@@ -68,11 +68,19 @@ const BROKER_STATUS = {
   UNAUTHORIZED: 401,
   QUEUE_FULL: 429,
   TOO_MANY_PENDING: 429,
+  BRIDGE_HANDOFF: 503,
   PLUGIN_ERROR: 502,
   NODE_NOT_FOUND: 404,
 }
 
-const READ_FIELDS = new Set(['source', 'options', 'mode', 'timeoutMs', 'fresh'])
+const READ_FIELDS = new Set(['source', 'options', 'mode', 'timeoutMs', 'fresh', 'queueWaitMs'])
+const HANDOFF_FIELDS = new Set(['version'])
+// The longest a read may wait for its turn in the plugin on top of timeoutMs.
+const MAX_QUEUE_WAIT_MS = 120_000
+// While the grace window after a start lasts, a live read waits this long at
+// most for its file's plugin to register before it fails.
+const MAX_SESSION_WAIT_MS = 20_000
+const SESSION_WAIT_STEP_MS = 100
 const READ_OPS = new Set(['read-node', 'read-document-index'])
 const SESSION_FIELDS = new Set(['fileKey', 'fileName', 'pluginInstanceId', 'capabilities'])
 const REPLY_FIELDS = new Set(['requestId', 'ok', 'result', 'error'])
@@ -150,6 +158,14 @@ function createRoutes(options = {}) {
     identity,
     token,
     protocolVersion = DEFAULT_PROTOCOL_VERSION,
+    // This server's package version; null where the caller does not know it.
+    serverVersion = null,
+    // After a start that took the port over, reads wait this long at most for
+    // the plugin to register again instead of failing at once.
+    sessionGraceMs = 0,
+    // requester version -> whether this bridge hands its port to it.
+    canHandOver = () => false,
+    onHandoff = null,
     maxBodyBytes = DEFAULT_MAX_BODY_BYTES,
     maxReplyBodyBytes = Math.max(maxBodyBytes, DEFAULT_MAX_REPLY_BODY_BYTES),
     allowedOrigins = DEFAULT_ALLOWED_ORIGINS,
@@ -166,6 +182,7 @@ function createRoutes(options = {}) {
     throw new Error('createRoutes requires a bridge token')
   }
   const currentToken = typeof token === 'function' ? token : () => token
+  const startedAt = now()
 
   // '*' is dropped deliberately: a wildcard would let any web page in the
   // user's browser drive an authenticated local daemon.
@@ -354,6 +371,9 @@ function createRoutes(options = {}) {
       return 'Field "timeoutMs" must be an integer between 1 and 120000'
     }
     if (body.fresh !== undefined && typeof body.fresh !== 'boolean') return 'Field "fresh" must be a boolean'
+    if (body.queueWaitMs !== undefined && !isInteger(body.queueWaitMs, 0, MAX_QUEUE_WAIT_MS)) {
+      return `Field "queueWaitMs" must be an integer between 0 and ${MAX_QUEUE_WAIT_MS}`
+    }
     if (body.options !== undefined) {
       if (!isPlainObject(body.options)) return 'Field "options" must be an object'
       for (const key of Object.keys(body.options)) {
@@ -626,6 +646,12 @@ function createRoutes(options = {}) {
     // A file URL without node-id gets a lightweight index, not a whole-document dump.
     const op = nodeId ? 'read-node' : 'read-document-index'
     const mode = body.mode || 'live'
+    let timeoutMs = Number.isInteger(body.timeoutMs) ? body.timeoutMs : DEFAULT_READ_TIMEOUT_MS
+    if (mode === 'live') {
+      // The time spent waiting for the plugin comes out of the read's own.
+      const waited = await waitForSessionInGrace(fileKey, timeoutMs, res)
+      if (waited > 0) timeoutMs = Math.max(Math.min(1000, timeoutMs), timeoutMs - waited)
+    }
     let pluginOutdated = false
     let cachedFallback = null
     if (isRestRepresentation(opts.representation)) {
@@ -661,8 +687,28 @@ function createRoutes(options = {}) {
 
     if (mode === 'cached') return serveCached(req, res, { fileKey, nodeId, representation, cachedFallback, envelope })
     return serveLive(req, res, {
-      fileKey, nodeId, representation, op, opts, envelope, timeoutMs: body.timeoutMs, fresh: body.fresh === true, pluginOutdated,
+      fileKey, nodeId, representation, op, opts, envelope, timeoutMs,
+      queueWaitMs: Number.isInteger(body.queueWaitMs) ? body.queueWaitMs : 0,
+      fresh: body.fresh === true, pluginOutdated,
     })
+  }
+
+  function hasLiveSession(fileKey) {
+    try { return Boolean(broker.hasSessionForFile(fileKey)) } catch { return false }
+  }
+
+  // Right after this bridge took the port over, the plugin is still
+  // registering with it. A read in that window waits for the plugin rather
+  // than failing at once. Returns how long it waited, in ms.
+  async function waitForSessionInGrace(fileKey, timeoutMs, res) {
+    const graceLeft = startedAt + sessionGraceMs - now()
+    if (graceLeft <= 0 || hasLiveSession(fileKey)) return 0
+    const begin = Date.now()
+    const until = begin + Math.min(graceLeft, timeoutMs, MAX_SESSION_WAIT_MS)
+    while (!hasLiveSession(fileKey) && Date.now() < until && !res.destroyed) {
+      await new Promise(resolve => setTimeout(resolve, SESSION_WAIT_STEP_MS))
+    }
+    return Date.now() - begin
   }
 
   function serveCached(req, res, { fileKey, nodeId, representation, cachedFallback, envelope }) {
@@ -708,7 +754,7 @@ function createRoutes(options = {}) {
     })
   }
 
-  async function serveLive(req, res, { fileKey, nodeId, representation, op, opts, envelope, timeoutMs, fresh, pluginOutdated }) {
+  async function serveLive(req, res, { fileKey, nodeId, representation, op, opts, envelope, timeoutMs, queueWaitMs, fresh, pluginOutdated }) {
     // A live read is the plugin's answer, either read now or read earlier and
     // confirmed by the plugin as unchanged since, or it is an error. No cache
     // fallback, no REST fallback.
@@ -758,6 +804,12 @@ function createRoutes(options = {}) {
       dedupeKey = `${fileKey}|${nodeId || ''}|${representation}`
     }
 
+    // A caller that hangs up (its own timeout, or a cancelled tool call) no
+    // longer waits: a read not yet handed to the plugin is then dropped, so
+    // the plugin spends its time on reads someone still wants.
+    const abandoned = new AbortController()
+    res.on('close', () => { if (!res.writableFinished) abandoned.abort() })
+
     let answer
     try {
       answer = await broker.request({
@@ -765,7 +817,9 @@ function createRoutes(options = {}) {
         op,
         params: { fileKey, nodeId, representation, options: opts },
         timeoutMs: Number.isInteger(timeoutMs) ? timeoutMs : DEFAULT_READ_TIMEOUT_MS,
+        queueWaitMs,
         dedupeKey,
+        signal: abandoned.signal,
       })
     } catch (error) {
       return sendBrokerError(req, res, error, { ...envelope, mode: 'live', representation })
@@ -1075,6 +1129,37 @@ function createRoutes(options = {}) {
     }
   }
 
+  // ── Handoff route ───────────────────────────────────────
+
+  // A newer figma-bridge server asks for the port. Only a local process that
+  // holds the token can ask, never a page in a browser or the plugin's iframe,
+  // and only a newer version is let in, so two servers cannot trade the port
+  // back and forth.
+  async function handleHandoff(req, res) {
+    if (req.headers.origin !== undefined) {
+      return sendError(req, res, 403, 'FORBIDDEN_ORIGIN', 'Only a local figma-bridge server can ask for a handoff')
+    }
+    let body
+    try { body = await readJSONBody(req) } catch (error) { return sendBodyError(req, res, error) }
+    if (!isPlainObject(body)) return sendError(req, res, 400, 'BAD_REQUEST', 'Request body must be a JSON object')
+    for (const key of Object.keys(body)) {
+      if (!HANDOFF_FIELDS.has(key)) return sendError(req, res, 400, 'BAD_REQUEST', `Unknown field "${safeLabel(key)}"`)
+    }
+    if (typeof body.version !== 'string' || !/^\d+\.\d+\.\d+/.test(body.version) || body.version.length > 40) {
+      return sendError(req, res, 400, 'BAD_REQUEST', 'Field "version" must be a version such as 1.12.0')
+    }
+    let accept = false
+    try { accept = Boolean(canHandOver(body.version)) } catch { accept = false }
+    if (!accept || typeof onHandoff !== 'function') {
+      return sendError(req, res, 409, 'HANDOFF_REFUSED',
+        `This bridge (${serverVersion || 'unknown version'}) only hands its port to a newer server`)
+    }
+    sendJSON(req, res, 202, { accepted: true, serverVersion })
+    // After the answer is out: the handoff closes this server's connections.
+    setImmediate(() => onHandoff(safeLabel(body.version)))
+    return true
+  }
+
   function handleStatus(req, res) {
     const sessions = listSessions()
     let stats = null
@@ -1099,6 +1184,8 @@ function createRoutes(options = {}) {
 
     return sendJSON(req, res, 200, {
       protocolVersion,
+      // Which server owns the port: callers compare it with their own version.
+      host: { serverVersion, pid: process.pid, startedAt: toIso(startedAt) },
       readiness: { ready, sessionCount: sessions.length, liveFileKeys },
       sessions,
       pairing: pairingStats,
@@ -1133,7 +1220,11 @@ function createRoutes(options = {}) {
     // identity and protocol version and nothing else — no token, no file names,
     // no paths.
     if (method === 'GET' && pathname === '/bridge/health') {
-      return sendJSON(req, res, 200, { status: 'ok', protocolVersion, service: SERVICE_NAME })
+      // serverVersion lets a newer server ask this one to hand its port over.
+      return sendJSON(req, res, 200, {
+        status: 'ok', protocolVersion, service: SERVICE_NAME,
+        ...(serverVersion ? { serverVersion } : {}),
+      })
     }
 
     // Asking to pair and collecting an approved pairing are how a plugin gets
@@ -1170,6 +1261,7 @@ function createRoutes(options = {}) {
 
     if (method === 'POST' && pathname === '/bridge/read') return handleRead(req, res)
     if (method === 'GET' && pathname === '/bridge/status') return handleStatus(req, res)
+    if (method === 'POST' && pathname === '/bridge/handoff') return handleHandoff(req, res)
     if (method === 'POST' && pathname === '/bridge/pair/approve') return handlePairApprove(req, res)
 
     return sendError(req, res, 404, 'NOT_FOUND', `Unknown bridge route: ${safeLabel(method)} ${safeText(pathname, 120)}`)

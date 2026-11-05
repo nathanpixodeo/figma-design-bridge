@@ -4,6 +4,51 @@ All notable changes to Figma Design Bridge. Versions follow
 [Semantic Versioning](https://semver.org/); the Claude Code plugin, the
 marketplace entry and both `package.json` files always carry the same number.
 
+## [Unreleased]
+
+The newest server owns the bridge, and agent sessions reading at once no longer
+time each other out.
+
+### Fixed
+
+- A Claude Code session left open across an update no longer keeps every other
+  session on its older bridge. Claude Code does not restart a running MCP
+  server when its plugin updates, so the first session opened kept the bridge
+  port, with its code, until it closed. Calls then failed in ways that looked
+  like a broken connection: `search_design` against a 1.8.0 bridge read whole
+  pages and hit Figma's own 10 s limit. Now a newer server asks the owner to
+  hand the port over (`POST /bridge/handoff`, token only, no browser origin).
+  The owner stops listening, fails the reads it holds with `BRIDGE_HANDOFF`,
+  which the MCP server retries on the new owner, and carries on as a client.
+  The panel in Figma reconnects by itself, and for 30 s the new owner lets a
+  read wait for it instead of failing with `NO_SESSION_FOR_FILE`. Servers
+  starting at once converge on the newest. A bridge from before 1.12.0 cannot
+  hand over: close the sessions opened before this update once.
+- Reads from many agent sessions at once no longer time each other out. The
+  bridge used to hand the panel every queued read, and each read's time ran
+  from when it was queued, so one large export used up the time of every read
+  behind it. Now the bridge keeps the queue and hands the panel one export at a
+  time, plus up to two searches or document indexes, which the panel runs on a
+  queue of their own. A read's `timeoutMs` counts from when the panel starts
+  it; the new `queueWaitMs` (up to 120000, sent as 60000 by the MCP server)
+  bounds the wait for its turn. A read whose caller hung up before its turn is
+  dropped, and a read the panel finds past its deadline is answered at once, so
+  neither holds the queue.
+- `PLUGIN_ERROR: Unable to establish connection to Figma after 10 seconds` now
+  says that the bridge and the panel are connected, and to read one screen
+  frame instead of a whole page, or to bring Figma to the front.
+
+### Added
+
+- `GET /bridge/health` reports `serverVersion`, and `GET /bridge/status` a
+  `host` with the owner's version, pid and start time. `get_bridge_status` adds
+  `thisServerVersion`, and a setup hint naming the older bridge and how to end
+  it when one still owns the port.
+- `search_design` says when it had to read the node whole because the plugin
+  or the bridge is too old to search, and that such a search is slow and may
+  miss matches.
+- The session queue holds 128 reads, up from 32.
+
 ## [1.11.0] - 2026-11-04
 
 `search_design` searches inside the plugin, and a hidden Figma no longer slows
@@ -562,7 +607,8 @@ audit. Nothing to migrate.
   with page and selection sync and Watch mode, and the MCP server for Claude
   Code.
 
-[1.11.0]: https://github.com/nathanpixodeo/figma-design-bridge/compare/c8d47c4...main
+[Unreleased]: https://github.com/nathanpixodeo/figma-design-bridge/compare/f7080e0...main
+[1.11.0]: https://github.com/nathanpixodeo/figma-design-bridge/compare/c8d47c4...f7080e0
 [1.10.1]: https://github.com/nathanpixodeo/figma-design-bridge/compare/f95d3f1...c8d47c4
 [1.10.0]: https://github.com/nathanpixodeo/figma-design-bridge/compare/711d037...f95d3f1
 [1.9.0]: https://github.com/nathanpixodeo/figma-design-bridge/compare/48d758e...711d037

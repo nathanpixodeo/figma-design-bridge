@@ -302,7 +302,7 @@ test('exceeding maxQueuePerSession rejects QUEUE_FULL and exceeding maxPendingRe
   await assert.rejects(a2, { code: 'SESSION_LOST' })
   await assert.rejects(b1, { code: 'SESSION_LOST' })
   assert.equal(clock.pendingCount(), 0)
-  assert.deepEqual(broker.stats(), { sessions: 0, pendingRequests: 0, queuedRequests: 0, coalescedHits: 0 })
+  assert.deepEqual(broker.stats(), { sessions: 0, pendingRequests: 0, queuedRequests: 0, inPluginRequests: 0, coalescedHits: 0 })
 })
 
 // ── Requirement 8: auth ─────────────────────────────────────
@@ -383,7 +383,7 @@ test('cancelAll rejects every pending request and resolves (does not hang) an in
 
   assert.equal(clock.pendingCount(), 0)
   assert.deepEqual(broker.listSessions(), [])
-  assert.deepEqual(broker.stats(), { sessions: 0, pendingRequests: 0, queuedRequests: 0, coalescedHits: 0 })
+  assert.deepEqual(broker.stats(), { sessions: 0, pendingRequests: 0, queuedRequests: 0, inPluginRequests: 0, coalescedHits: 0 })
 })
 
 test('with real timers (default options), a broker still settles and cancelAll leaves nothing scheduled', async () => {
@@ -652,11 +652,204 @@ test('a read that times out says how many reads the plugin had to serve before i
   const first = broker.request({ fileKey: 'FILE_DEFAULT', op: 'read-node', params: { nodeId: '1:1' }, timeoutMs: 500 })
   const check = broker.request({ fileKey: 'FILE_DEFAULT', op: 'edit-seq', params: {}, timeoutMs: 500 })
   const second = broker.request({ fileKey: 'FILE_DEFAULT', op: 'read-node', params: { nodeId: '1:2' }, timeoutMs: 500 })
-  const third = broker.request({ fileKey: 'FILE_DEFAULT', op: 'read-document-index', timeoutMs: 500 })
+  const index = broker.request({ fileKey: 'FILE_DEFAULT', op: 'read-document-index', timeoutMs: 500 })
+  const third = broker.request({ fileKey: 'FILE_DEFAULT', op: 'read-node', params: { nodeId: '1:3' }, timeoutMs: 500 })
   clock.advance(500)
 
   await assert.rejects(first, error => error.code === 'TIMEOUT' && error.message === 'Request timed out waiting for a plugin reply')
   await assert.rejects(check, error => error.ahead === 0, 'an edit count is answered at once, never queued behind reads')
   await assert.rejects(second, error => error.ahead === 1 && /1 earlier read was ahead of it/.test(error.message))
-  await assert.rejects(third, error => error.ahead === 2 && /2 earlier reads were ahead of it, and the Figma plugin serves one read at a time/.test(error.message))
+  await assert.rejects(index, error => error.ahead === 0, 'the document index has its own lane')
+  await assert.rejects(third, error => error.ahead === 2 && /2 earlier reads were ahead of it, and the Figma plugin serves reads like it one at a time/.test(error.message))
+})
+
+// ── Lanes and the queue-wait budget ─────────────────────────
+
+const heavyRead = (nodeId, extra = {}) => ({ fileKey: 'FILE_DEFAULT', op: 'read-node', params: { nodeId }, ...extra })
+const searchRead = (query, extra = {}) => ({
+  fileKey: 'FILE_DEFAULT', op: 'read-node', params: { nodeId: '1:1', representation: 'search', options: { query } }, ...extra,
+})
+const namesOf = polled => polled.requests.map(request => request.params?.options?.query || request.params?.nodeId || request.op)
+
+// A poll that answers at once, with an empty list when nothing can start.
+function quickPoll(broker, clock, session) {
+  return () => {
+    const polled = broker.poll(session.sessionId, session.sessionSecret, { waitMs: 0 })
+    clock.advance(0)
+    return polled
+  }
+}
+
+test('a poll is handed one heavy read, two light reads and every instant one, and the rest as lanes free up', async () => {
+  const { broker, clock } = makeHarness()
+  const session = registerTestSession(broker)
+  const poll = quickPoll(broker, clock, session)
+  const reply = requestId => broker.reply(session.sessionId, session.sessionSecret, { requestId, ok: true, result: {} })
+
+  const reads = [
+    broker.request(heavyRead('A', { timeoutMs: 5000 })),
+    broker.request(heavyRead('B', { timeoutMs: 5000 })),
+    broker.request(searchRead('s1', { timeoutMs: 5000 })),
+    broker.request(searchRead('s2', { timeoutMs: 5000 })),
+    broker.request(searchRead('s3', { timeoutMs: 5000 })),
+    broker.request({ fileKey: 'FILE_DEFAULT', op: 'ping', timeoutMs: 5000 }),
+  ]
+
+  const first = await poll()
+  assert.deepEqual(namesOf(first), ['A', 's1', 's2', 'ping'])
+  assert.equal(broker.stats().inPluginRequests, 3, 'an instant op does not hold a lane')
+  assert.deepEqual(namesOf(await poll()), [], 'nothing more until a lane frees up')
+
+  reply(first.requests[1].requestId)
+  const second = await poll()
+  assert.deepEqual(namesOf(second), ['s3'])
+  reply(first.requests[0].requestId)
+  const third = await poll()
+  assert.deepEqual(namesOf(third), ['B'])
+
+  for (const requestId of [first.requests[2], first.requests[3], second.requests[0], third.requests[0]].map(r => r.requestId)) {
+    reply(requestId)
+  }
+  await Promise.all(reads)
+  assert.equal(broker.stats().inPluginRequests, 0)
+})
+
+test('a read that waits its turn gets its full timeoutMs once the plugin is handed it', async () => {
+  const { broker, clock } = makeHarness()
+  const session = registerTestSession(broker)
+  const poll = quickPoll(broker, clock, session)
+
+  const first = broker.request(heavyRead('A', { timeoutMs: 1000 }))
+  const second = broker.request(heavyRead('B', { timeoutMs: 1000, queueWaitMs: 5000 }))
+  const handedA = (await poll()).requests[0]
+
+  clock.advance(900)
+  broker.reply(session.sessionId, session.sessionSecret, { requestId: handedA.requestId, ok: true, result: { a: 1 } })
+  await first
+
+  const handedB = (await poll()).requests[0]
+  assert.equal(handedB.params.nodeId, 'B')
+  // The plugin counts the read's time from now, not from when it was queued.
+  assert.equal(handedB.enqueuedAt, clock.now())
+  assert.equal(handedB.expiresAt, clock.now() + 1000)
+
+  clock.advance(900)
+  broker.reply(session.sessionId, session.sessionSecret, { requestId: handedB.requestId, ok: true, result: { b: 1 } })
+  assert.deepEqual((await second).result, { b: 1 })
+})
+
+test('a read gives up when its queue wait runs out, and says how many reads were ahead', async () => {
+  const { broker, clock } = makeHarness()
+  const session = registerTestSession(broker)
+
+  const stuck = broker.request(heavyRead('A', { timeoutMs: 1000 }))
+  const waiting = broker.request(heavyRead('B', { timeoutMs: 1000, queueWaitMs: 2000 }))
+  await quickPoll(broker, clock, session)()
+
+  clock.advance(1000)
+  await assert.rejects(stuck, { code: 'TIMEOUT' })
+  // The plugin still works on A, so B keeps waiting for the lane.
+  assert.equal(broker.stats().inPluginRequests, 1)
+  clock.advance(1999)
+  assert.equal(broker.stats().queuedRequests, 1)
+  clock.advance(1)
+  await assert.rejects(waiting, error => error.code === 'TIMEOUT' && error.ahead === 1)
+})
+
+test('a plugin that stopped polling fails a read in its timeoutMs, not its queue wait', async () => {
+  const { broker, clock } = makeHarness()
+  registerTestSession(broker)
+
+  const read = broker.request(heavyRead('A', { timeoutMs: 1000, queueWaitMs: 60_000 }))
+  clock.advance(1000)
+  await assert.rejects(read, { code: 'TIMEOUT' })
+})
+
+test('a late reply frees the lane at once, and a silent plugin frees it after a grace period', async () => {
+  const { broker, clock } = makeHarness({ sessionTimeoutMs: 60_000 })
+  const session = registerTestSession(broker)
+  const poll = quickPoll(broker, clock, session)
+
+  const late = broker.request(heavyRead('A', { timeoutMs: 1000 }))
+  const next = broker.request(heavyRead('B', { timeoutMs: 1000, queueWaitMs: 30_000 }))
+  const handedA = (await poll()).requests[0]
+  clock.advance(1000)
+  await assert.rejects(late, { code: 'TIMEOUT' })
+
+  const waitingPoll = broker.poll(session.sessionId, session.sessionSecret, { waitMs: 60_000 })
+  clock.advance(200)
+  const answer = broker.reply(session.sessionId, session.sessionSecret, { requestId: handedA.requestId, ok: true, result: {} })
+  assert.equal(answer.accepted, false)
+  const handedB = (await waitingPoll).requests[0]
+  assert.equal(handedB.params.nodeId, 'B')
+
+  // B is never answered: its lane frees 15 s after its own deadline.
+  const after = broker.request(heavyRead('C', { timeoutMs: 1000, queueWaitMs: 60_000 }))
+  clock.advance(1000)
+  await assert.rejects(next, { code: 'TIMEOUT' })
+  assert.equal(broker.stats().inPluginRequests, 1)
+  clock.advance(15_000)
+  assert.equal(broker.stats().inPluginRequests, 0)
+  const handedC = (await poll()).requests[0]
+  assert.equal(handedC.params.nodeId, 'C')
+  broker.reply(session.sessionId, session.sessionSecret, { requestId: handedC.requestId, ok: true, result: {} })
+  await after
+})
+
+test('a caller that stops waiting drops a queued read, and the one behind it moves up', async () => {
+  const { broker, clock } = makeHarness()
+  const session = registerTestSession(broker)
+  const poll = quickPoll(broker, clock, session)
+
+  const running = broker.request(heavyRead('A', { timeoutMs: 5000 }))
+  const controller = new AbortController()
+  const abandoned = broker.request(heavyRead('B', { timeoutMs: 5000, signal: controller.signal }))
+  const behind = broker.request(heavyRead('C', { timeoutMs: 5000 }))
+  const handedA = (await poll()).requests[0]
+
+  controller.abort()
+  await assert.rejects(abandoned, { code: 'CANCELLED' })
+  assert.equal(broker.stats().queuedRequests, 1)
+
+  broker.reply(session.sessionId, session.sessionSecret, { requestId: handedA.requestId, ok: true, result: {} })
+  await running
+  const next = (await poll()).requests
+  assert.deepEqual(next.map(request => request.params.nodeId), ['C'])
+  broker.reply(session.sessionId, session.sessionSecret, { requestId: next[0].requestId, ok: true, result: {} })
+  await behind
+})
+
+test('cancelAll for a handoff settles every read with BRIDGE_HANDOFF', async () => {
+  const { broker, clock } = makeHarness()
+  const session = registerTestSession(broker)
+  const handed = broker.request(heavyRead('A', { timeoutMs: 5000 }))
+  const queued = broker.request(heavyRead('B', { timeoutMs: 5000 }))
+  await quickPoll(broker, clock, session)()
+
+  broker.cancelAll('handoff')
+  await assert.rejects(handed, { code: 'BRIDGE_HANDOFF' })
+  await assert.rejects(queued, { code: 'BRIDGE_HANDOFF' })
+  assert.deepEqual(broker.stats(), { sessions: 0, pendingRequests: 0, queuedRequests: 0, inPluginRequests: 0, coalescedHits: 0 })
+})
+
+test('a read that settled before its lost poll reached the plugin frees its lane at once', async () => {
+  const { broker, clock } = makeHarness()
+  const session = registerTestSession(broker)
+  const controller = new AbortController()
+
+  const gone = broker.request(heavyRead('A', { timeoutMs: 1000 }))
+  const next = broker.request(heavyRead('B', { timeoutMs: 1000, queueWaitMs: 30_000 }))
+  const polled = await broker.poll(session.sessionId, session.sessionSecret, { waitMs: 0, signal: controller.signal })
+  assert.deepEqual(namesOf(polled), ['A'])
+  clock.advance(1000)
+  await assert.rejects(gone, { code: 'TIMEOUT' })
+  assert.equal(broker.stats().inPluginRequests, 1)
+
+  // The answer that carried A never reached the plugin.
+  controller.abort()
+  assert.equal(broker.stats().inPluginRequests, 0)
+  const handed = (await quickPoll(broker, clock, session)()).requests
+  assert.deepEqual(handed.map(request => request.params.nodeId), ['B'])
+  broker.reply(session.sessionId, session.sessionSecret, { requestId: handed[0].requestId, ok: true, result: {} })
+  await next
 })

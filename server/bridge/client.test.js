@@ -38,3 +38,23 @@ test('any other refusal of a read is not retried', async () => {
   await assert.rejects(client.read({ source: 'FILE1', fresh: true }), error => error.code === 'BAD_REQUEST' && /depth/.test(error.message))
   assert.equal(calls.length, 1)
 })
+
+test('a read sends queueWaitMs only when it waits', async () => {
+  const { calls, client } = fakeBridge(() => [200, { mode: 'live' }])
+  await client.read({ source: 'FILE1' })
+  await client.read({ source: 'FILE1', queueWaitMs: 0 })
+  await client.read({ source: 'FILE1', queueWaitMs: 60000 })
+  assert.deepEqual(calls.map(call => call.body.queueWaitMs), [undefined, undefined, 60000])
+})
+
+test('a bridge too old to know queueWaitMs or fresh is asked again without each, one at a time', async () => {
+  const { calls, client } = fakeBridge(body => {
+    if (body.queueWaitMs !== undefined) return [400, { code: 'BAD_REQUEST', error: 'Unknown field "queueWaitMs"' }]
+    if (body.fresh !== undefined) return [400, { code: 'BAD_REQUEST', error: 'Unknown field "fresh"' }]
+    return [200, { mode: 'live' }]
+  })
+  const result = await client.read({ source: 'FILE1', timeoutMs: 1000, fresh: true, queueWaitMs: 60000 })
+  assert.deepEqual(result, { mode: 'live' })
+  assert.equal(calls.length, 3)
+  assert.deepEqual(calls[2].body, { source: 'FILE1', timeoutMs: 1000 })
+})

@@ -5,7 +5,7 @@ const http = require('http')
 const os = require('os')
 const path = require('path')
 
-const { createDaemon, startOrReuse, probe, baseUrl, SERVICE_NAME, PROTOCOL_VERSION } = require('./daemon')
+const { createDaemon, startOrReuse, probe, baseUrl, compareVersions, SERVICE_NAME, PROTOCOL_VERSION } = require('./daemon')
 const { readToken, rotateToken, TOKEN_FILENAME } = require('./token')
 
 const quietLog = () => {}
@@ -223,6 +223,7 @@ test('probe recognizes this service and refuses to claim anything else', async t
   assert.deepEqual(await probe(daemon.url), {
     ours: true,
     protocolVersion: PROTOCOL_VERSION,
+    serverVersion: null,
     reason: 'ok',
   })
 
@@ -462,4 +463,158 @@ test('a listener that does not answer the health check in time is reported busy,
     startOrReuse({ port: stalled.address().port, dataDir, probeTimeoutMs: 100, log: quietLog }),
     { code: 'BRIDGE_BUSY' },
   )
+})
+
+// ── Version handoff ───────────────────────────────────────
+
+test('compareVersions orders x.y.z numerically, with a missing version lowest', () => {
+  assert.equal(compareVersions('1.12.0', '1.11.9'), 1)
+  assert.equal(compareVersions('1.9.0', '1.10.0'), -1)
+  assert.equal(compareVersions('1.12.0', '1.12.0'), 0)
+  assert.equal(compareVersions('1.12.0-beta.1', '1.12.0'), 0)
+  assert.equal(compareVersions(null, '1.0.0'), -1)
+  assert.equal(compareVersions('1.0.0', undefined), 1)
+  assert.equal(compareVersions(null, null), 0)
+})
+
+// A host on a fixed port, as one MCP server of a given version starts it.
+async function hostOnPort(t, port, dataDir, serverVersion, extra = {}) {
+  const handoffs = []
+  const host = await startOrReuse({
+    port, dataDir, serverVersion, log: quietLog, ...fakeDeps(),
+    onHandoff: info => handoffs.push(info),
+    ...extra,
+  })
+  t.after(() => host.close('test-teardown'))
+  return { host, handoffs }
+}
+
+test('probe reports the version of the server that owns the port', async t => {
+  const daemon = await startDaemon(t, { serverVersion: '1.12.0' })
+  const found = await probe(daemon.url)
+  assert.equal(found.ours, true)
+  assert.equal(found.serverVersion, '1.12.0')
+})
+
+test('startOrReuse has an older owner hand the port over, and starts the bridge itself', async t => {
+  const dataDir = tempDataDir(t)
+  const port = await freePort(t)
+  const old = await hostOnPort(t, port, dataDir, '1.12.0')
+  assert.equal(old.host.started, true)
+
+  const { host } = await hostOnPort(t, port, dataDir, '1.12.1')
+
+  assert.equal(host.started, true)
+  assert.equal(host.owned, true)
+  assert.equal(host.handedOver, true)
+  assert.equal(host.outdatedHost, false)
+  assert.equal(host.port, port)
+  assert.deepEqual(old.handoffs, [{ version: '1.12.1' }])
+  assert.equal(old.host.server.listening, false)
+  const found = await probe(host.url)
+  assert.equal(found.serverVersion, '1.12.1')
+})
+
+test('startOrReuse reuses an owner of the same version or newer, and never asks it to hand over', async t => {
+  const dataDir = tempDataDir(t)
+  const port = await freePort(t)
+  const owner = await hostOnPort(t, port, dataDir, '1.12.1')
+
+  for (const version of ['1.12.1', '1.12.0', '1.3.0']) {
+    const reused = await startOrReuse({ port, dataDir, serverVersion: version, log: quietLog, ...fakeDeps() })
+    assert.equal(reused.reused, true, version)
+    assert.equal(reused.hostVersion, '1.12.1')
+    assert.equal(reused.outdatedHost, false)
+  }
+  assert.deepEqual(owner.handoffs, [])
+  assert.equal(owner.host.server.listening, true)
+})
+
+test('startOrReuse reuses an owner from before 1.12.0 and says it is outdated', async t => {
+  const dataDir = tempDataDir(t)
+  const port = await freePort(t)
+  // No serverVersion: what a bridge from before 1.12.0 reports.
+  const owner = await hostOnPort(t, port, dataDir, undefined)
+
+  const reused = await startOrReuse({ port, dataDir, serverVersion: '1.12.0', log: quietLog, ...fakeDeps() })
+
+  assert.equal(reused.reused, true)
+  assert.equal(reused.hostVersion, null)
+  assert.equal(reused.outdatedHost, true)
+  assert.equal(owner.host.server.listening, true)
+})
+
+test('an owner refuses a handoff without the token, from a browser, or to a server not newer than it', async t => {
+  const dataDir = tempDataDir(t)
+  const port = await freePort(t)
+  const owner = await hostOnPort(t, port, dataDir, '1.12.0')
+  const url = `${owner.host.url}/bridge/handoff`
+  const post = (headers, body) => fetch(url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...headers },
+    body: JSON.stringify(body),
+  })
+  const auth = { authorization: `Bearer ${owner.host.token}` }
+
+  assert.equal((await post({}, { version: '9.0.0' })).status, 401)
+  assert.equal((await post({ ...auth, origin: 'https://www.figma.com' }, { version: '9.0.0' })).status, 403)
+  const same = await post(auth, { version: '1.12.0' })
+  assert.equal(same.status, 409)
+  assert.equal((await same.json()).code, 'HANDOFF_REFUSED')
+  assert.equal((await post(auth, { version: '1.12.0', extra: true })).status, 400)
+  assert.deepEqual(owner.handoffs, [])
+  assert.equal(owner.host.server.listening, true)
+})
+
+test('five servers starting at once against an older owner converge on one new owner', async t => {
+  const dataDir = tempDataDir(t)
+  const port = await freePort(t)
+  const old = await hostOnPort(t, port, dataDir, '1.12.0')
+
+  const results = await Promise.all(Array.from({ length: 5 }, () => startOrReuse({
+    port, dataDir, serverVersion: '1.12.1', log: quietLog, ...fakeDeps(),
+  })))
+  t.after(() => Promise.all(results.map(result => result.close('test-teardown'))))
+
+  assert.equal(results.filter(result => result.started).length, 1)
+  assert.ok(results.every(result => result.url === results[0].url))
+  assert.ok(results.every(result => result.outdatedHost === false))
+  assert.equal(old.handoffs.length, 1)
+  assert.equal((await probe(results[0].url)).serverVersion, '1.12.1')
+})
+
+test('the newest of several servers ends up owning the port', async t => {
+  const dataDir = tempDataDir(t)
+  const port = await freePort(t)
+  await hostOnPort(t, port, dataDir, '1.12.0')
+
+  const middle = await hostOnPort(t, port, dataDir, '1.12.1')
+  const newest = await hostOnPort(t, port, dataDir, '1.13.0')
+  const late = await startOrReuse({ port, dataDir, serverVersion: '1.12.1', log: quietLog, ...fakeDeps() })
+
+  assert.equal(middle.host.started, true)
+  assert.deepEqual(middle.handoffs, [{ version: '1.13.0' }])
+  assert.equal(newest.host.owned, true)
+  assert.equal(late.reused, true)
+  assert.equal(late.hostVersion, '1.13.0')
+  assert.equal((await probe(newest.host.url)).serverVersion, '1.13.0')
+})
+
+test('a server that just handed the port over waits for its successor instead of taking it back', async t => {
+  const dataDir = tempDataDir(t)
+  const port = await freePort(t)
+  // Nothing listens yet; the successor binds after a moment.
+  let successor = null
+  setTimeout(() => {
+    startOrReuse({ port, dataDir, serverVersion: '1.12.1', log: quietLog, ...fakeDeps() })
+      .then(host => { successor = host })
+  }, 300)
+  t.after(() => successor && successor.close('test-teardown'))
+
+  const reused = await startOrReuse({
+    port, dataDir, serverVersion: '1.12.0', awaitHostMs: 5000, log: quietLog, ...fakeDeps(),
+  })
+
+  assert.equal(reused.reused, true)
+  assert.equal(reused.hostVersion, '1.12.1')
 })

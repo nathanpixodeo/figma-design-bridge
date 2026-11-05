@@ -1450,3 +1450,123 @@ test('no response body on any route contains the bridge token or a session secre
     assert.equal(raw.includes('DO-NOT-LEAK'), false, raw.slice(0, 160))
   }
 })
+
+// ── Version, handoff and parallel reads ───────────────────
+
+test('health and status name the server version that owns the port when it is known', async t => {
+  const ctx = await withServer(t, { routeOptions: { serverVersion: '1.12.0' } })
+
+  const health = await ctx.call({ path: '/bridge/health' })
+  assert.deepEqual(Object.keys(health.body).sort(), ['protocolVersion', 'serverVersion', 'service', 'status'])
+  assert.equal(health.body.serverVersion, '1.12.0')
+
+  const status = await ctx.authed({ path: '/bridge/status' })
+  assert.equal(status.body.host.serverVersion, '1.12.0')
+  assert.equal(status.body.host.pid, process.pid)
+  assert.match(status.body.host.startedAt, /^\d{4}-\d{2}-\d{2}T/)
+})
+
+test('a handoff needs the token, no web origin, and a newer version, and then reaches the owner', async t => {
+  const handoffs = []
+  const ctx = await withServer(t, {
+    routeOptions: {
+      serverVersion: '1.12.0',
+      canHandOver: version => version === '1.12.1',
+      onHandoff: version => handoffs.push(version),
+    },
+  })
+  const handoff = (body, headers = {}) => ctx.authed({ method: 'POST', path: '/bridge/handoff', body, headers })
+
+  assert.equal((await ctx.call({ method: 'POST', path: '/bridge/handoff', body: { version: '1.12.1' } })).status, 401)
+  const browser = await handoff({ version: '1.12.1' }, { origin: 'http://localhost:5173' })
+  assert.equal(browser.status, 403)
+  assert.equal(browser.body.code, 'FORBIDDEN_ORIGIN')
+  assert.equal((await handoff({})).status, 400)
+  assert.equal((await handoff({ version: '1.12.1', force: true })).status, 400)
+  const older = await handoff({ version: '1.11.0' })
+  assert.equal(older.status, 409)
+  assert.equal(older.body.code, 'HANDOFF_REFUSED')
+  assert.deepEqual(handoffs, [])
+
+  const accepted = await handoff({ version: '1.12.1' })
+  assert.equal(accepted.status, 202)
+  assert.deepEqual(accepted.body, { accepted: true, serverVersion: '1.12.0' })
+  // Called after the answer went out, so the caller hears 202 first.
+  await new Promise(resolve => setImmediate(resolve))
+  assert.deepEqual(handoffs, ['1.12.1'])
+})
+
+test('right after a handoff, a live read waits for the plugin to register again', async t => {
+  const ctx = await withServer(t, { routeOptions: { sessionGraceMs: 30_000 } })
+
+  const read = ctx.authed({ method: 'POST', path: '/bridge/read', body: { source: FILE_URL, timeoutMs: 5000 } })
+  await new Promise(resolve => setTimeout(resolve, 300))
+  assert.equal(ctx.broker.calls.requests.length, 0, 'the read waits for a session')
+  await ctx.register('FILE1', 'plugin-a')
+
+  const res = await read
+  assert.equal(res.status, 200)
+  assert.equal(ctx.broker.calls.requests.length, 1)
+  // The wait came out of the read's own time.
+  assert.ok(ctx.broker.calls.requests[0].timeoutMs < 5000)
+})
+
+test('a read waiting for the plugin to register again still gives up within its timeout', async t => {
+  const ctx = await withServer(t, { routeOptions: { sessionGraceMs: 30_000 } })
+
+  const started = Date.now()
+  const res = await ctx.authed({ method: 'POST', path: '/bridge/read', body: { source: FILE_URL, timeoutMs: 1000 } })
+  assert.equal(res.status, 409)
+  assert.equal(res.body.code, 'NO_SESSION_FOR_FILE')
+  assert.ok(Date.now() - started >= 900 && Date.now() - started < 4000)
+})
+
+test('queueWaitMs must be a whole number of milliseconds up to 120000, and reaches the broker', async t => {
+  const ctx = await withServer(t)
+  await ctx.register('FILE1', 'plugin-a')
+  const read = queueWaitMs => ctx.authed({ method: 'POST', path: '/bridge/read', body: { source: FILE_URL, queueWaitMs } })
+
+  for (const bad of [-1, 120_001, 1.5, '60000', null]) {
+    const res = await read(bad)
+    assert.equal(res.status, 400, String(bad))
+  }
+  assert.equal(ctx.broker.calls.requests.length, 0)
+
+  const res = await read(60_000)
+  assert.equal(res.status, 200)
+  assert.equal(ctx.broker.calls.requests.at(-1).queueWaitMs, 60_000)
+})
+
+test('reads waiting when the bridge hands over fail with BRIDGE_HANDOFF, so callers retry on the new owner', async t => {
+  const broker = createBroker()
+  const ctx = await withServer(t, { broker })
+  await ctx.register('FILE1', 'plugin-a')
+
+  const read = ctx.authed({ method: 'POST', path: '/bridge/read', body: { source: FILE_URL, timeoutMs: 5000 } })
+  await new Promise(resolve => setTimeout(resolve, 100))
+  broker.cancelAll('handoff')
+
+  const res = await read
+  assert.equal(res.status, 503)
+  assert.equal(res.body.code, 'BRIDGE_HANDOFF')
+})
+
+test('a read whose caller hung up is dropped before the plugin is handed it', async t => {
+  const broker = createBroker()
+  t.after(() => broker.cancelAll('test done'))
+  const ctx = await withServer(t, { broker })
+  await ctx.register('FILE1', 'plugin-a')
+
+  const caller = http.request({
+    host: '127.0.0.1', port: ctx.port, method: 'POST', path: '/bridge/read', headers: ctx.auth,
+  })
+  caller.on('error', () => {})
+  caller.end(JSON.stringify({ source: FILE_URL, timeoutMs: 30_000 }))
+  for (let i = 0; i < 50 && broker.stats().queuedRequests === 0; i++) await new Promise(resolve => setTimeout(resolve, 20))
+  assert.equal(broker.stats().queuedRequests, 1)
+
+  caller.destroy()
+  for (let i = 0; i < 50 && broker.stats().queuedRequests > 0; i++) await new Promise(resolve => setTimeout(resolve, 20))
+  assert.equal(broker.stats().queuedRequests, 0)
+  assert.equal(broker.stats().pendingRequests, 0)
+})

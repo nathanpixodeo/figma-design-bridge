@@ -89,6 +89,7 @@ of envelope. Every route rejects unknown fields rather than ignoring them.
 | `DELETE` | `/bridge/session/:id` | token + session secret |
 | `POST` | `/bridge/read` | token |
 | `GET` | `/bridge/status` | token |
+| `POST` | `/bridge/handoff` | token, no `Origin` header |
 | `POST` | `/bridge/pair` | none (see [Pairing](#pairing)) |
 | `GET` | `/bridge/pair/:id` | pairing secret |
 | `POST` | `/bridge/pair/approve` | token |
@@ -104,9 +105,15 @@ whether a listener already on the port is this bridge or a foreign process.
 {
   "status": "ok",
   "service": "figma-design-bridge",
-  "protocolVersion": "1.0"
+  "protocolVersion": "1.0",
+  "serverVersion": "1.12.0"
 }
 ```
+
+`serverVersion` is the version of the figma-bridge server that owns the port.
+Since 1.12.0; a bridge from before then leaves it out. A newer server uses it
+to ask an older owner to hand the port over (see
+[`POST /bridge/handoff`](#post-bridgehandoff)).
 
 It deliberately carries nothing else — no token, no file keys, no session list,
 no data directory.
@@ -212,12 +219,26 @@ edit Figma reports to the plugin moves on; the plugin answers it at once with
 `{ "fileKey": "…", "editSeq": 7 }`, outside its read queue, even in the middle
 of a read.
 
-The plugin serves reads one at a time, in the order they arrive. A read still
-waiting when its `expiresAt` passes is skipped: its caller already has its
-`TIMEOUT`. A read has a deadline a little before `expiresAt`: a fifth of the
-time between `enqueuedAt` and `expiresAt`, between 1 and 5 seconds, is left for
-the answer to reach the bridge. A read that reaches its turn after that
-deadline is refused at once with an error that says so. One that is still
+Since 1.12.0 the bridge keeps each session's queue and hands a poll only the
+reads the plugin can start now, in two lanes:
+
+| Lane | Reads | In the plugin at once |
+|------|-------|-----------------------|
+| heavy | `read-node` as `figma-rest`, `node-subtree`, `assets` or `render` | 1 |
+| light | `read-node` as `search`, and `read-document-index` | 2 |
+| instant | `edit-seq`, `ping` | no limit, handed at once |
+
+A handed read holds its lane until the plugin replies, even after its caller
+timed out, or until 15 s after its `expiresAt`. `enqueuedAt` is the moment the
+read was handed out, so the plugin counts the read's `timeoutMs` from then.
+
+The plugin serves the heavy lane one read at a time, in the order they arrive,
+and the light lane on a queue of its own beside it: a search does not wait for
+another caller's export of a large frame. A read has a deadline a little before
+`expiresAt`: a fifth of the time between `enqueuedAt` and `expiresAt`, between
+1 and 5 seconds, is left for the answer to reach the bridge. A read that
+reaches its turn after that deadline is refused at once with an error that says
+so, which also frees its lane. One that is still
 running at the deadline stops, and answers with what it read (see
 [A read cut by its deadline](#a-read-cut-by-its-deadline)). A read waiting right behind the same read (same op, node,
 representation and options) is answered with that read's result when no edit
@@ -353,6 +374,7 @@ The route an MCP adapter calls with the URL a user pasted.
 | `mode` | No | `"live"` (default) or `"cached"` |
 | `timeoutMs` | No | 1–120000, default 30000 |
 | `fresh` | No | `true` reads again instead of reusing an unchanged read (see [Reuse](#reuse)). Since 1.5.0; send it only when `true`, since an older bridge rejects the field |
+| `queueWaitMs` | No | 0–120000, default 0. How long the read may wait for its lane on top of `timeoutMs`. `timeoutMs` then counts from when the plugin is handed the read, or from when its lane has room if the plugin is not polling. With 0, as before 1.12.0, the wait counts against `timeoutMs`. Since 1.12.0; send it only when above 0, since an older bridge rejects the field. The MCP server sends 60000 |
 | `options` | No | See below |
 
 | Option | Range | Plugin default |
@@ -447,7 +469,7 @@ For `node-subtree`, the plugin walks roughly 270–600 nodes a second, so 20,000
 nodes take about 90 s, close to the 120 s `timeoutMs` ceiling. Both walks run in
 slices of about 50 ms and hand control back to Figma between them, so Figma, the
 panel and its heartbeats stay responsive during a long read. The plugin serves
-one read at a time, in the order they arrive.
+one heavy read at a time, in the order they arrive (see the poll route).
 
 Figma throttles timers while its window is hidden or minimized, to one a
 second and then one a minute, so the plugin does not wait on a timer between
@@ -605,6 +627,7 @@ Readiness and actionable setup errors. Never connection secrets.
 ```json
 {
   "protocolVersion": "1.0",
+  "host": { "serverVersion": "1.12.0", "pid": 35452, "startedAt": "2026-11-05T09:00:00.000Z" },
   "readiness": { "ready": true, "sessionCount": 1, "liveFileKeys": ["abc123DEF456"] },
   "sessions": [
     {
@@ -631,6 +654,37 @@ Readiness and actionable setup errors. Never connection secrets.
 Session fields are copied through an explicit allowlist, so a secret cannot
 reach this response even if the broker grows a new field. When nothing is
 connected, `setupHints` explains what to do.
+
+`host` names the process that owns the port. Since 1.12.0; a bridge from before
+then leaves it out. The MCP server's `get_bridge_status` adds
+`thisServerVersion`, and a setup hint when the owner is older than it.
+
+---
+
+### `POST /bridge/handoff`
+
+A newer figma-bridge server asks the owner of the port to hand it over. Claude
+Code does not restart a running MCP server when its plugin updates, so without
+this the first session opened keeps serving the bridge with older code until it
+closes.
+
+```json
+{ "version": "1.12.1" }
+```
+
+The route needs the token and refuses any request that carries an `Origin`
+header (`403 FORBIDDEN_ORIGIN`), so neither a web page nor the plugin's iframe
+can call it. The owner accepts only a version newer than its own:
+
+- `202 { "accepted": true, "serverVersion": "1.12.0" }`. Right after the answer,
+  the owner stops listening, fails the reads it holds with `BRIDGE_HANDOFF`,
+  and carries on as a client of the new owner.
+- `409 HANDOFF_REFUSED` for the same version or an older one.
+
+The new owner binds the port and, for its first 30 s, a live read for a file
+with no session waits for the plugin to register again, up to 20 s and within
+its `timeoutMs`, instead of failing with `NO_SESSION_FOR_FILE`. The plugin
+notices the closed connection and registers again on its own.
 
 ---
 
@@ -739,8 +793,11 @@ Errors are distinguishable by design: an agent can tell "plugin offline" from
 | `INTERNAL_ERROR` | 500 | Unmapped failure |
 | `FILE_MISMATCH` | 502 | A result claimed a different file and was discarded |
 | `UPSTREAM_INVALID` | 502 | The plugin returned an unusable result |
+| `HANDOFF_REFUSED` | 409 | `/bridge/handoff` asked for a version that is not newer than the owner |
 | `SESSION_LOST` | 503 | The answering session went away mid-request |
-| `TIMEOUT` | 504 | The plugin did not answer within `timeoutMs`. The message says how many reads of that session were ahead of it |
+| `BRIDGE_HANDOFF` | 503 | The bridge handed its port to a newer server before the read finished. Retry: the new owner serves it |
+| `CANCELLED` | — | The caller closed its connection before the read was handed out; the read is dropped. Never sent, since nobody is left to read it |
+| `TIMEOUT` | 504 | The plugin did not answer within `timeoutMs`, or the read waited past `timeoutMs` + `queueWaitMs` for its lane. The message says how many reads of that lane were ahead of it |
 
 An error body is **flat**: `error` is the human-readable message string and
 `code` is the machine-readable code. They are siblings, not nested.
@@ -826,6 +883,16 @@ frees up.
 Concurrent MCP starts converge on a single daemon: a lost `EADDRINUSE` race
 re-probes and reuses the winner.
 
+Since 1.12.0 `startOrReuse` takes the server's own version. An owner that
+reports an older `serverVersion` is asked to hand the port over (see
+[`POST /bridge/handoff`](#post-bridgehandoff)); the caller then binds the port.
+Every round probes again, so servers starting at once converge on the newest.
+An owner from before 1.12.0 cannot hand over: it is reused, and the descriptor
+says `outdatedHost: true`. It keeps the port until its session closes, and
+`get_bridge_status` says so. An MCP server that is not the owner also checks
+the owner's version every 10 s, so an older server that took the port while no
+one held it is replaced.
+
 ---
 
 ## Known limitations
@@ -839,8 +906,10 @@ re-probes and reuses the winner.
   `timeoutMs`. The read fails with `TIMEOUT`; retry with a larger `timeoutMs`
   (up to 120000) or a smaller `depth` or `maxNodes`.
 - **Reads of one file take turns.** Figma runs a plugin on one thread, so the
-  panel open on a file reads one node at a time. Reads of different files run
-  in parallel, and reused reads do not wait (see [Reuse](#reuse)).
+  panel open on a file exports one node at a time. Searches and the document
+  index run beside it, reads of different files run in parallel, and reused
+  reads do not wait (see [Reuse](#reuse)). A read that waits its turn keeps its
+  full `timeoutMs` when it passes `queueWaitMs`.
 - **Reuse can miss an edit Figma does not report.** A change to a variable's
   value alone, for one, does not move the plugin's edit count. Pass
   `fresh: true` after such a change.

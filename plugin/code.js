@@ -2154,13 +2154,15 @@ function readBridgeDocumentIndex(request) {
   }
 }
 
-async function handleBridgeRequest(sessionId, request) {
-  const previous = repeatableBridgeRead
-  repeatableBridgeRead = null
+// lane 'heavy' or 'light' (see bridgeLaneOf). Only the heavy lane keeps a read
+// for the retry right behind it: a light read is quick to make again.
+async function handleBridgeRequest(sessionId, request, lane = 'heavy') {
+  let previous = null
+  if (lane === 'heavy') {
+    previous = repeatableBridgeRead
+    repeatableBridgeRead = null
+  }
   if (!request || !request.requestId) return
-  // The bridge gave up on a read that waited here past its deadline, and the
-  // caller already has its timeout: nobody is left to read it for.
-  if (Number.isFinite(request.expiresAt) && Date.now() > request.expiresAt) return
   if (!state.bridgeFileKey || request.params?.fileKey !== state.bridgeFileKey) {
     figma.ui.postMessage({ type: 'bridge-result', sessionId, requestId: request.requestId, ok: false, error: 'Request file does not match the connected Figma file.' })
     return
@@ -2174,7 +2176,8 @@ async function handleBridgeRequest(sessionId, request) {
     return
   }
   // Too little time is left to read anything: the caller hears why now,
-  // rather than a timeout later.
+  // rather than a timeout later. A read past its deadline is answered too, so
+  // the bridge frees its lane for the reads behind it at once.
   const deadline = readDeadline(request)
   if (Number.isFinite(deadline) && Date.now() >= deadline) {
     figma.ui.postMessage({
@@ -2183,7 +2186,8 @@ async function handleBridgeRequest(sessionId, request) {
     })
     return
   }
-  state.bridgeReading = true
+  // A count: a light read can run while a heavy one is paused.
+  state.bridgeReading++
   // Taken before the read starts: an edit made while it runs leaves the result
   // behind the count, so the bridge never reuses it.
   const editSeq = state.editSeq
@@ -2194,13 +2198,13 @@ async function handleBridgeRequest(sessionId, request) {
     else throw new Error(`Unsupported bridge operation: ${request.op}`)
     result.editSeq = editSeq
     // A read cut by its deadline is not reused: a retry may have more time.
-    if (!(result.completeness && result.completeness.stoppedBy)) keepForNextRead({ key, editSeq, result })
+    if (lane === 'heavy' && !(result.completeness && result.completeness.stoppedBy)) keepForNextRead({ key, editSeq, result })
     replyBridgeRead(sessionId, request, result)
   } catch (error) {
     figma.ui.postMessage({ type: 'bridge-result', sessionId, requestId: request.requestId, ok: false, error: error.message || String(error) })
   } finally {
-    state.bridgeReading = false
-    if (state.editedDuringRead) {
+    state.bridgeReading = Math.max(0, state.bridgeReading - 1)
+    if (state.bridgeReading === 0 && state.editedDuringRead) {
       state.editedDuringRead = false
       reportBridgeEdit()
     }
@@ -2214,11 +2218,21 @@ function replyBridgeRead(sessionId, request, result) {
   figma.ui.postMessage({ type: 'bridge-result', sessionId, requestId: request.requestId, ok: true, result })
 }
 
-// One read at a time: a paced walk lets other work run between its slices, and
-// two walks at once would hold two trees in the plugin's memory.
+// One heavy read at a time: a paced walk lets other work run between its
+// slices, and two walks at once would hold two trees in the plugin's memory.
+// Light reads (a search, the document index) hold only names and text, so they
+// run on their own queue beside it: a search from one agent session does not
+// wait for another session's export of a large frame.
 let bridgeQueue = Promise.resolve()
-// Reads waiting their turn, oldest first.
+let lightBridgeQueue = Promise.resolve()
+// Heavy reads waiting their turn, oldest first.
 const waitingBridgeReads = []
+
+function bridgeLaneOf(request) {
+  if (request && request.op === 'read-document-index') return 'light'
+  if (request && request.op === 'read-node' && representationBase(request) === 'search') return 'light'
+  return 'heavy'
+}
 // A caller that timed out and retried queues the same read again behind the
 // one still running for it. That read's answer is kept for the retry, but only
 // while the retry is next in line, so it never sits in memory during another read.
@@ -2239,10 +2253,15 @@ function queueBridgeRequest(sessionId, request) {
     answerEditSeq(sessionId, request)
     return Promise.resolve()
   }
+  if (bridgeLaneOf(request) === 'light') {
+    const light = lightBridgeQueue.then(() => handleBridgeRequest(sessionId, request, 'light'))
+    lightBridgeQueue = light.catch(() => {})
+    return light
+  }
   waitingBridgeReads.push(request)
   const run = bridgeQueue.then(() => {
     waitingBridgeReads.shift()
-    return handleBridgeRequest(sessionId, request)
+    return handleBridgeRequest(sessionId, request, 'heavy')
   })
   bridgeQueue = run.catch(() => {})
   return run
@@ -2516,7 +2535,7 @@ function resizePanel(height) {
 const state = {
   ready: false,
   bridgeFileKey: null, bridgeFileName: null, bridgeConnected: false, bridgeToken: '',
-  lastBridgeNode: null, lastBridgeRequest: null, bridgeReading: false, editedDuringRead: false, editSeq: 0,
+  lastBridgeNode: null, lastBridgeRequest: null, bridgeReading: 0, editedDuringRead: false, editSeq: 0,
   findSeq: 0,
   pluginInstanceId: `plugin-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
 }

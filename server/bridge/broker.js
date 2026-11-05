@@ -11,6 +11,15 @@ const ALLOWED_OPS = new Set(['read-node', 'read-document-index', 'ping', 'edit-s
 // Answered by the plugin at once, outside its one-read-at-a-time queue, so it
 // never counts as a read waiting ahead of another.
 const INSTANT_OPS = new Set(['ping', 'edit-seq'])
+// The plugin runs heavy reads (exports, walks of whole subtrees) one at a time
+// and light ones (search, the document index) beside them. The broker hands a
+// read to the plugin only when its lane has room, so a read's time starts when
+// the plugin can start it, not while it waits behind others.
+const LANE_LIMITS = { heavy: 1, light: 2 }
+const LIGHT_REPRESENTATIONS = new Set(['search'])
+// A handed read the plugin never answers stops holding its lane this long
+// after its deadline. Answers that late do happen while Figma is hidden.
+const LATE_REPLY_GRACE_MS = 15_000
 const MAX_PARAMS_BYTES = 256 * 1024
 const MAX_PLUGIN_ERROR_MESSAGE = 400
 const PLUGIN_ERROR_CODES = new Set(['NODE_NOT_FOUND'])
@@ -44,11 +53,11 @@ const errors = {
     return brokerError('SESSION_LOST', message, extra)
   },
   timeout(fileKey, requestId, ahead = 0) {
-    // The plugin serves one read at a time, so a read can time out only
-    // because others were served first. Saying so tells the caller why.
+    // The plugin serves the reads of one lane in turn, so a read can time out
+    // because others of its kind were served first. Saying so tells the caller why.
     const message = ahead > 0
       ? `Request timed out waiting for a plugin reply: ${ahead} earlier ${ahead === 1 ? 'read was' : 'reads were'} ahead of it, `
-        + 'and the Figma plugin serves one read at a time'
+        + 'and the Figma plugin serves reads like it one at a time. Pass queueWaitMs to let a read wait its turn'
       : 'Request timed out waiting for a plugin reply'
     return brokerError('TIMEOUT', message, { fileKey, requestId, ahead })
   },
@@ -61,6 +70,20 @@ const errors = {
   tooManyPending() {
     return brokerError('TOO_MANY_PENDING', 'Too many pending broker requests')
   },
+  handoff(extra) {
+    return brokerError('BRIDGE_HANDOFF',
+      'This bridge handed its port to a newer figma-bridge server before the read finished. Retry the call.', extra)
+  },
+  cancelled(extra) {
+    return brokerError('CANCELLED', 'The caller stopped waiting for this read', extra)
+  },
+}
+
+function laneOf(op, params) {
+  if (INSTANT_OPS.has(op)) return 'instant'
+  if (op === 'read-document-index') return 'light'
+  const representation = params && typeof params.representation === 'string' ? params.representation : ''
+  return LIGHT_REPRESENTATIONS.has(representation.split('+')[0]) ? 'light' : 'heavy'
 }
 
 // ── Small helpers ────────────────────────────────────────────
@@ -83,12 +106,17 @@ function dedupeKeyFor(fileKey, dedupeKey) {
   return `${fileKey}\u0000${dedupeKey}`
 }
 
+// enqueuedAt on the wire is when the read's time began, which is when it was
+// handed to the plugin: the plugin keeps a share of that time for its reply.
 function requestToWireFormat(req) {
   if (!req) return null
-  return { requestId: req.requestId, op: req.op, params: req.params, enqueuedAt: req.enqueuedAt, expiresAt: req.expiresAt }
+  return {
+    requestId: req.requestId, op: req.op, params: req.params,
+    enqueuedAt: req.handedAt || req.enqueuedAt, expiresAt: req.expiresAt,
+  }
 }
 
-function validateRequestInput({ fileKey, op, params, timeoutMs, dedupeKey }, defaultTimeoutMs) {
+function validateRequestInput({ fileKey, op, params, timeoutMs, queueWaitMs, dedupeKey }, defaultTimeoutMs) {
   if (typeof fileKey !== 'string' || fileKey.length === 0) {
     throw errors.badRequest('fileKey must be a non-empty string')
   }
@@ -123,6 +151,14 @@ function validateRequestInput({ fileKey, op, params, timeoutMs, dedupeKey }, def
     effectiveTimeout = timeoutMs
   }
 
+  let queueWait = 0
+  if (queueWaitMs !== undefined && queueWaitMs !== null) {
+    if (typeof queueWaitMs !== 'number' || !Number.isFinite(queueWaitMs) || queueWaitMs < 0) {
+      throw errors.badRequest('queueWaitMs must be a non-negative number')
+    }
+    queueWait = queueWaitMs
+  }
+
   let dk = null
   if (dedupeKey !== undefined && dedupeKey !== null) {
     if (typeof dedupeKey !== 'string' || dedupeKey.length === 0) {
@@ -131,7 +167,7 @@ function validateRequestInput({ fileKey, op, params, timeoutMs, dedupeKey }, def
     dk = dedupeKey
   }
 
-  return { fileKey, op, params: clonedParams, timeoutMs: effectiveTimeout, dedupeKey: dk }
+  return { fileKey, op, params: clonedParams, timeoutMs: effectiveTimeout, queueWaitMs: queueWait, dedupeKey: dk }
 }
 
 // ── Broker factory ───────────────────────────────────────────
@@ -139,7 +175,8 @@ function validateRequestInput({ fileKey, op, params, timeoutMs, dedupeKey }, def
 function createBroker(options = {}) {
   const requestTimeoutMs = options.requestTimeoutMs || 30000
   const sessionTimeoutMs = options.sessionTimeoutMs || 90000
-  const maxQueuePerSession = options.maxQueuePerSession || 32
+  // Many agent sessions read the same file at once; a coalesced read counts once.
+  const maxQueuePerSession = options.maxQueuePerSession || 128
   const maxPendingRequests = options.maxPendingRequests || 256
   const now = options.now || (() => Date.now())
   const setTimer = options.setTimer || setTimeout
@@ -270,6 +307,7 @@ function createBroker(options = {}) {
     }
     session.pendingRequestIds.clear()
     session.queue.length = 0
+    clearInPlugin(session)
     return rejected
   }
 
@@ -277,29 +315,134 @@ function createBroker(options = {}) {
     const req = requests.get(requestId)
     if (!req || req.settled) return
     settleRequest(req, false, null, errors.timeout(req.fileKey, req.requestId, req.ahead))
+    // A read that timed out in the queue lets the one behind it start.
+    if (!req.handedAt) deliverToSession(req.sessionId)
   }
 
-  // Reads already waiting for the session, which the plugin serves before this one.
-  function readsAhead(session) {
+  function deliverToSession(sessionId) {
+    const session = sessions.get(sessionId)
+    if (session && session.alive) deliverQueuedRequests(session)
+  }
+
+  function armTimer(req, at) {
+    if (req.timer) clearTimer(req.timer)
+    req.timer = setTimer(() => handleRequestTimeout(req.requestId), Math.max(0, at - now()))
+  }
+
+  // Reads of the same lane already waiting for the session, which the plugin
+  // serves before this one.
+  function readsAhead(session, lane) {
     let ahead = 0
     for (const requestId of session.pendingRequestIds) {
       const req = requests.get(requestId)
-      if (req && !req.settled && !INSTANT_OPS.has(req.op)) ahead++
+      if (req && !req.settled && req.lane === lane) ahead++
+    }
+    for (const requestId of session.inPlugin.keys()) {
+      const req = requests.get(requestId)
+      // A read that timed out still keeps the plugin busy until it answers.
+      if (req && req.settled && req.lane === lane) ahead++
     }
     return ahead
   }
 
-  // Hands the whole queue to a poll and remembers what went out, so the poll
-  // can give it back if its answer never reaches the plugin.
+  // ── Lanes ────────────────────────────────────────────────────
+
+  function clearInPlugin(session) {
+    for (const entry of session.inPlugin.values()) clearTimer(entry.releaseTimer)
+    session.inPlugin.clear()
+  }
+
+  // The plugin answered a read, or stayed silent past its grace: its lane has
+  // room again.
+  function releaseFromPlugin(session, requestId) {
+    const entry = session.inPlugin.get(requestId)
+    if (!entry) return
+    clearTimer(entry.releaseTimer)
+    session.inPlugin.delete(requestId)
+    deliverQueuedRequests(session)
+  }
+
+  // The queued reads the plugin can start now, oldest first in each lane.
+  function startableRequests(session) {
+    const busy = { heavy: 0, light: 0 }
+    for (const entry of session.inPlugin.values()) busy[entry.lane]++
+    const ready = []
+    for (const requestId of session.queue) {
+      const req = requests.get(requestId)
+      if (!req || req.settled) continue
+      if (req.lane === 'instant') {
+        ready.push(requestId)
+      } else if (busy[req.lane] < LANE_LIMITS[req.lane]) {
+        busy[req.lane]++
+        ready.push(requestId)
+      }
+    }
+    return ready
+  }
+
+  // A handed read's time starts now, bounded by how long its caller waits.
+  function markHanded(session, req) {
+    const handedAt = now()
+    req.handedAt = handedAt
+    req.expiresAt = Math.min(req.deadlineAt, handedAt + req.timeoutMs)
+    armTimer(req, req.expiresAt)
+    if (req.lane === 'instant') return
+    const releaseTimer = setTimer(
+      () => releaseFromPlugin(session, req.requestId),
+      Math.max(0, req.expiresAt - handedAt) + LATE_REPLY_GRACE_MS,
+    )
+    session.inPlugin.set(req.requestId, { lane: req.lane, releaseTimer })
+  }
+
+  // A handed read that never reached the plugin waits in the queue again, on
+  // the clock it had there.
+  function markQueued(session, req) {
+    const entry = session.inPlugin.get(req.requestId)
+    if (entry) {
+      clearTimer(entry.releaseTimer)
+      session.inPlugin.delete(req.requestId)
+    }
+    req.handedAt = null
+    req.expiresAt = req.deadlineAt
+    armTimer(req, req.deadlineAt)
+  }
+
+  // Hands a poll the reads the plugin can start now and remembers what went
+  // out, so the poll can give them back if its answer never reaches the plugin.
+  // false: nothing could be handed.
   function handOut(session, waiter) {
-    waiter.handed = session.queue.splice(0, session.queue.length)
-    waiter.resolve({ requests: waiter.handed.map(id => requestToWireFormat(requests.get(id))).filter(Boolean) })
+    const ready = startableRequests(session)
+    if (ready.length === 0) return false
+    const handed = new Set(ready)
+    session.queue = session.queue.filter(id => !handed.has(id))
+    for (const requestId of ready) markHanded(session, requests.get(requestId))
+    waiter.handed = ready
+    waiter.resolve({ requests: ready.map(id => requestToWireFormat(requests.get(id))).filter(Boolean) })
+    return true
+  }
+
+  // The wait for a lane is the only wait queueWaitMs covers. Once a read could
+  // start, timeoutMs runs whether or not the plugin polls for it, so a plugin
+  // that stopped polling fails a read in timeoutMs, not timeoutMs + queueWaitMs.
+  function startClocks(session) {
+    for (const requestId of startableRequests(session)) {
+      const req = requests.get(requestId)
+      if (!req || req.lane === 'instant' || req.startableAt !== null) continue
+      req.startableAt = now()
+      const capped = req.startableAt + req.timeoutMs
+      if (capped >= req.deadlineAt) continue
+      req.deadlineAt = capped
+      req.expiresAt = capped
+      armTimer(req, capped)
+    }
   }
 
   function deliverQueuedRequests(session) {
+    startClocks(session)
     if (!session.waitingPoll) return
     if (session.queue.length === 0) return
     const waiter = session.waitingPoll
+    if (startableRequests(session).length === 0) return
     session.waitingPoll = null
     clearTimer(waiter.timer)
     handOut(session, waiter)
@@ -319,10 +462,31 @@ function createBroker(options = {}) {
       const req = requests.get(id)
       return req && !req.settled
     })
+    // A read that settled meanwhile never reached the plugin either: it holds
+    // no lane, and nothing is left to send it to.
+    for (const requestId of waiter.handed) {
+      if (!unanswered.includes(requestId) && session.inPlugin.has(requestId)) {
+        clearTimer(session.inPlugin.get(requestId).releaseTimer)
+        session.inPlugin.delete(requestId)
+      }
+    }
     waiter.handed = []
-    if (unanswered.length === 0) return
+    for (const requestId of unanswered) markQueued(session, requests.get(requestId))
     session.queue.unshift(...unanswered)
-    deliverQueuedRequests(session)
+    if (session.alive) deliverQueuedRequests(session)
+  }
+
+  // The caller stopped waiting. Other callers of a coalesced read still get
+  // it; a read nobody waits for any more is dropped unless the plugin has it.
+  function abandonRequest(req, waiter) {
+    const index = req.waiters.indexOf(waiter)
+    if (index === -1 || req.settled) return
+    req.waiters.splice(index, 1)
+    waiter.reject(errors.cancelled({ fileKey: req.fileKey, requestId: req.requestId }))
+    if (req.waiters.length === 0 && !req.handedAt) {
+      settleRequest(req, false, null, errors.cancelled({ fileKey: req.fileKey, requestId: req.requestId }))
+      deliverToSession(req.sessionId)
+    }
   }
 
   // The session a new request goes to: the one heard from most recently. A
@@ -380,6 +544,8 @@ function createBroker(options = {}) {
       closedAt: null,
       queue: [],
       pendingRequestIds: new Set(),
+      // requestId -> { lane, releaseTimer }: handed reads the plugin has not answered.
+      inPlugin: new Map(),
       waitingPoll: null,
       expiryTimer: null,
     }
@@ -444,15 +610,26 @@ function createBroker(options = {}) {
     }
   }
 
-  function request({ fileKey, op, params, timeoutMs, dedupeKey } = {}) {
+  // queueWaitMs: how long the read may wait for its lane on top of timeoutMs.
+  // 0 keeps the clock of older callers: the wait counts against timeoutMs.
+  // signal: aborts when the caller stops waiting.
+  function request({ fileKey, op, params, timeoutMs, queueWaitMs, dedupeKey, signal } = {}) {
     sweep()
     return new Promise((resolve, reject) => {
+      if (signal && signal.aborted) {
+        reject(errors.cancelled({ fileKey }))
+        return
+      }
       let validated
       try {
-        validated = validateRequestInput({ fileKey, op, params, timeoutMs, dedupeKey }, requestTimeoutMs)
+        validated = validateRequestInput({ fileKey, op, params, timeoutMs, queueWaitMs, dedupeKey }, requestTimeoutMs)
       } catch (err) {
         reject(err)
         return
+      }
+      const waiter = { resolve, reject }
+      const watch = req => {
+        if (signal) signal.addEventListener('abort', () => abandonRequest(req, waiter), { once: true })
       }
 
       const targetSession = sessionToServe(validated.fileKey)
@@ -467,7 +644,8 @@ function createBroker(options = {}) {
         if (existingId) {
           const existingReq = requests.get(existingId)
           if (existingReq && !existingReq.settled) {
-            existingReq.waiters.push({ resolve, reject })
+            existingReq.waiters.push(waiter)
+            watch(existingReq)
             coalescedHits++
             return
           }
@@ -486,6 +664,10 @@ function createBroker(options = {}) {
 
       const requestId = randomId()
       const enqueuedAt = now()
+      const lane = laneOf(validated.op, validated.params)
+      // The caller gives up at deadlineAt; the plugin gets timeoutMs from the
+      // moment it is handed the read, within that.
+      const deadlineAt = enqueuedAt + validated.timeoutMs + (lane === 'instant' ? 0 : validated.queueWaitMs)
       const req = {
         requestId,
         fileKey: validated.fileKey,
@@ -493,14 +675,20 @@ function createBroker(options = {}) {
         op: validated.op,
         params: validated.params,
         dedupeKey: validated.dedupeKey,
+        lane,
         enqueuedAt,
-        expiresAt: enqueuedAt + validated.timeoutMs,
-        ahead: INSTANT_OPS.has(validated.op) ? 0 : readsAhead(targetSession),
+        timeoutMs: validated.timeoutMs,
+        deadlineAt,
+        handedAt: null,
+        // When the read's lane first had room for it: see startClocks.
+        startableAt: null,
+        expiresAt: deadlineAt,
+        ahead: lane === 'instant' ? 0 : readsAhead(targetSession, lane),
         settled: false,
         settledAt: null,
         timedOut: false,
         timer: null,
-        waiters: [{ resolve, reject }],
+        waiters: [waiter],
       }
       requests.set(requestId, req)
       pendingRequestsCount++
@@ -508,9 +696,10 @@ function createBroker(options = {}) {
       targetSession.queue.push(requestId)
       if (validated.dedupeKey) dedupeIndex.set(dedupeKeyFor(validated.fileKey, validated.dedupeKey), requestId)
 
-      req.timer = setTimer(() => handleRequestTimeout(requestId), validated.timeoutMs)
+      armTimer(req, deadlineAt)
+      watch(req)
 
-      if (targetSession.waitingPoll) deliverQueuedRequests(targetSession)
+      deliverQueuedRequests(targetSession)
     })
   }
 
@@ -530,10 +719,7 @@ function createBroker(options = {}) {
       const waiter = { resolve, timer: null, handed: [] }
       if (signal) signal.addEventListener('abort', () => abandonPoll(session, waiter), { once: true })
 
-      if (session.queue.length > 0) {
-        handOut(session, waiter)
-        return
-      }
+      if (session.queue.length > 0 && handOut(session, waiter)) return
 
       // A well-behaved client only keeps one poll in flight; if a second one
       // arrives anyway, resolve the superseded one immediately instead of
@@ -555,7 +741,18 @@ function createBroker(options = {}) {
 
   function reply(sessionId, sessionSecret, { requestId, ok, result, error } = {}) {
     const session = authSession(sessionId, sessionSecret)
+    // Any answer, even a late one or an error, means the plugin is done with
+    // the read. Released after the settle below, so the next read in the lane
+    // is handed out with this one's outcome already known.
+    const holding = session.inPlugin.has(requestId)
+    try {
+      return answerRequest(session, requestId, ok, result, error)
+    } finally {
+      if (holding) releaseFromPlugin(session, requestId)
+    }
+  }
 
+  function answerRequest(session, requestId, ok, result, error) {
     const req = requests.get(requestId)
     if (!req) return { accepted: false, reason: 'UNKNOWN_REQUEST' }
     if (req.settled) {
@@ -586,14 +783,17 @@ function createBroker(options = {}) {
     return { accepted: true }
   }
 
+  // reason 'handoff': a newer server takes the port, and callers retry there.
   function cancelAll(reason) {
     const message = reason || 'Broker shutting down'
     for (const req of requests.values()) {
       if (!req.settled) {
-        settleRequest(req, false, null, errors.sessionLost(message, { fileKey: req.fileKey, requestId: req.requestId }))
+        const extra = { fileKey: req.fileKey, requestId: req.requestId }
+        settleRequest(req, false, null, reason === 'handoff' ? errors.handoff(extra) : errors.sessionLost(message, extra))
       }
     }
     for (const session of sessions.values()) {
+      clearInPlugin(session)
       if (session.expiryTimer) {
         clearTimer(session.expiryTimer)
         session.expiryTimer = null
@@ -617,13 +817,17 @@ function createBroker(options = {}) {
 
   function stats() {
     let queuedRequests = 0
+    let inPluginRequests = 0
     for (const session of sessions.values()) {
-      if (session.alive) queuedRequests += session.queue.length
+      if (!session.alive) continue
+      queuedRequests += session.queue.length
+      inPluginRequests += session.inPlugin.size
     }
     return {
       sessions: aliveSessionCount,
       pendingRequests: pendingRequestsCount,
       queuedRequests,
+      inPluginRequests,
       coalescedHits,
     }
   }

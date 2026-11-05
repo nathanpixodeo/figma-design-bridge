@@ -476,20 +476,42 @@ test('Bridge reports an edit made while a read is paused only after that read re
   assert.equal(p.sent.filter(message => message.type === 'bridge-invalidate').length, 2, 'later edits go out at once')
 })
 
-test('Bridge serves one read at a time, in the order they arrive', async () => {
+test('Bridge serves one heavy read at a time, in the order they arrive', async () => {
   const p = await connectedBridgePlugin({ now: steppingClock(), manualYield: true })
   const { screen, nodes } = flatScreen(p.otherPage, 30)
   p.figma.getNodeByIdAsync = async id => nodes.get(id) || null
 
   const slow = p.message(readRequest('slow', screen.id))
-  const quick = p.message({
-    type: 'bridge-request', sessionId: 'session-1',
-    request: { requestId: 'quick', op: 'read-document-index', params: { fileKey: 'AAAAfileKeyAAAA' } },
-  })
-  await settle(p, Promise.all([slow, quick]))
+  const next = p.message(readRequest('next', screen.children[0].id))
+  await settle(p, Promise.all([slow, next]))
 
   const order = p.sent.filter(message => message.type === 'bridge-result').map(message => message.requestId)
-  assert.deepEqual(order, ['slow', 'quick'])
+  assert.deepEqual(order, ['slow', 'next'])
+})
+
+test('Bridge answers a search or the document index while a heavy read is still running', async () => {
+  const p = await connectedBridgePlugin({ now: steppingClock(), manualYield: true })
+  const { screen, nodes } = flatScreen(p.otherPage, 30)
+  p.figma.getNodeByIdAsync = async id => nodes.get(id) || null
+
+  const slow = p.message(readRequest('slow', screen.id))
+  const index = p.message({
+    type: 'bridge-request', sessionId: 'session-1',
+    request: { requestId: 'index', op: 'read-document-index', params: { fileKey: 'AAAAfileKeyAAAA' } },
+  })
+  const search = p.message({
+    type: 'bridge-request', sessionId: 'session-1',
+    request: {
+      requestId: 'search', op: 'read-node',
+      params: { fileKey: 'AAAAfileKeyAAAA', nodeId: screen.id, representation: 'search', options: { query: 'Layer 1' } },
+    },
+  })
+  await settle(p, Promise.all([slow, index, search]))
+
+  const replies = p.sent.filter(message => message.type === 'bridge-result')
+  assert.deepEqual(replies.map(message => message.requestId), ['index', 'search', 'slow'])
+  assert.ok(replies.every(message => message.ok), JSON.stringify(replies.filter(message => !message.ok)))
+  assert.equal(replies[1].result.format, 'search')
 })
 
 test('Bridge skips a layer deleted while the walk was paused', async () => {
@@ -1363,7 +1385,7 @@ test('Bridge answers its edit count at once, even mid-read, and stamps each read
   assert.equal(results().at(-1).result.editSeq, 1)
 })
 
-test('Bridge skips a read whose deadline passed while it waited', async () => {
+test('Bridge does not start a read whose deadline passed while it waited, and says so', async () => {
   const p = await connectedBridgePlugin()
   const results = () => p.sent.filter(message => message.type === 'bridge-result')
   const read = (requestId, expiresAt) => p.message({
@@ -1371,10 +1393,13 @@ test('Bridge skips a read whose deadline passed while it waited', async () => {
     request: { requestId, op: 'read-node', expiresAt, params: { fileKey: 'AAAAfileKeyAAAA', nodeId: p.target.id } },
   })
 
+  // The reply frees the read's lane in the bridge at once.
   await read('expired', Date.now() - 1)
-  assert.equal(results().length, 0)
+  assert.deepEqual(results().map(message => [message.requestId, message.ok]), [['expired', false]])
+  assert.match(results()[0].error, /did not start it/)
   await read('current', Date.now() + 60_000)
-  assert.deepEqual(results().map(message => message.requestId), ['current'])
+  assert.deepEqual(results().map(message => message.requestId), ['expired', 'current'])
+  assert.equal(results()[1].ok, true)
 })
 
 test('Bridge answers a read waiting right behind the same read with its answer, unless an edit came in between', async () => {
@@ -1386,7 +1411,6 @@ test('Bridge answers a read waiting right behind the same read with its answer, 
     return nodes.get(id) || null
   }
   const results = () => p.sent.filter(message => message.type === 'bridge-result')
-  const index = { type: 'bridge-request', sessionId: 'session-1', request: { requestId: 'index', op: 'read-document-index', params: { fileKey: 'AAAAfileKeyAAAA' } } }
 
   // A caller timed out and asked again while the first read was still running.
   await settle(p, Promise.all([p.message(readRequest('first', screen.id)), p.message(readRequest('retry', screen.id))]))
@@ -1402,10 +1426,17 @@ test('Bridge answers a read waiting right behind the same read with its answer, 
   assert.equal(reads, 3, 'an edit during the read made the next one read again')
   assert.equal(results().at(-1).result.editSeq, 1)
 
-  // Another read in between: the answer is not held while it runs.
-  await settle(p, Promise.all([p.message(readRequest('before', screen.id)), p.message(index), p.message(readRequest('behind', screen.id))]))
+  // Another heavy read in between: the answer is not held while it runs.
+  const between = readRequest('between', screen.children[0].id)
+  await settle(p, Promise.all([p.message(readRequest('before', screen.id)), p.message(between), p.message(readRequest('behind', screen.id))]))
   assert.equal(reads, 5)
-  assert.deepEqual(results().slice(-3).map(message => message.requestId), ['before', 'index', 'behind'])
+  assert.deepEqual(results().slice(-3).map(message => message.requestId), ['before', 'between', 'behind'])
+
+  // A light read in between runs beside them, so the retry still gets the answer.
+  const index = { type: 'bridge-request', sessionId: 'session-1', request: { requestId: 'index', op: 'read-document-index', params: { fileKey: 'AAAAfileKeyAAAA' } } }
+  await settle(p, Promise.all([p.message(readRequest('again', screen.id)), p.message(index), p.message(readRequest('again-retry', screen.id))]))
+  assert.equal(reads, 6)
+  assert.deepEqual(results().slice(-3).map(message => message.requestId), ['index', 'again', 'again-retry'])
 })
 
 // Read deadlines. Figma can leave a call unsettled. A read still ends a little
@@ -1472,8 +1503,11 @@ test('Bridge serves the reads queued behind one that Figma never finishes', asyn
   section.children[0].exportAsync = never
   const index = { type: 'bridge-request', sessionId: 'session-1', request: { requestId: 'index', op: 'read-document-index', params: { fileKey: 'AAAAfileKeyAAAA' } } }
 
-  await settle(p, Promise.all([p.message(timedRequest('stuck', section.id)), p.message(index)]))
-  assert.deepEqual(bridgeReplies(p).map(message => [message.requestId, message.ok]), [['stuck', true], ['index', true]])
+  const behind = timedRequest('behind', section.children[1].id, { options: {} })
+
+  await settle(p, Promise.all([p.message(timedRequest('stuck', section.id)), p.message(index), p.message(behind)]))
+  // The index runs beside the stuck read; the heavy read waits for it to end.
+  assert.deepEqual(bridgeReplies(p).map(message => [message.requestId, message.ok]), [['index', true], ['stuck', true], ['behind', true]])
 })
 
 test('Bridge keeps the variables it named before its deadline', async () => {

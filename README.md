@@ -173,6 +173,12 @@ Then restart running Claude Code, Codex, agy and Gemini CLI sessions, and close 
 the Design Bridge panel in Figma. The manifest path stays the same, so Figma
 needs no new import. [CHANGELOG.md](CHANGELOG.md) lists what changed.
 
+Since 1.12.0 a session you forget to restart no longer keeps the bridge on old
+code: the first new session asks it to hand the port over, and the panel in
+Figma reconnects by itself. A bridge from before 1.12.0 cannot hand over, so
+after updating from one, close the sessions that were open before the update
+once. `get_bridge_status` shows which version owns the port.
+
 On Windows, npm cannot replace files that a running program holds open. If the
 update fails with `EPERM` or `EBUSY`, close Claude Code, Codex, agy and Gemini CLI, stop a
 `figma-bridge start` that is running, and run `figma-bridge update` again.
@@ -804,8 +810,18 @@ line.
 
 Every agent session shares one bridge, and every read of a file goes to the
 Design Bridge panel open on that file. Figma runs a plugin on one thread, so the
-panel reads one node at a time; reads of different files run in parallel. Since
+panel exports one node at a time; reads of different files run in parallel. Since
 1.5.0, agents reading the same file wait on each other far less:
+
+- **Searches do not wait for exports.** Since 1.12.0 the bridge hands the panel
+  one export at a time, and up to two searches or document indexes beside it,
+  on a queue of their own. A read that waits for its turn keeps its full
+  `timeoutMs` from when the panel starts it: the MCP server lets a read wait up
+  to 60 s for its turn (`queueWaitMs`). A read whose agent gave up before its
+  turn is dropped instead of keeping the others waiting.
+- **The newest server owns the bridge.** Since 1.12.0 a newer server asks an
+  older owner to hand the port over, so a session left open across an update
+  does not keep every other session on its older code.
 
 - **One native export instead of a walk.** A node is read with Figma's own
   `exportAsync({ format: 'JSON_REST_V1' })` instead of property by property in
@@ -1213,7 +1229,8 @@ claude -p "Based on these text nodes, write better copy for the landing page: $T
 | Reads are slow, or time out, only while Figma is minimized or behind another window | Figma throttles timers in a hidden window, and a plugin older than 1.11.0 paced its reads with them. Close Design Bridge and open it again to load the current plugin. Until then, keep Figma visible during a large read. |
 | A read says the plugin stopped it at its time limit | Figma did not finish a call in time, and the note names the call and the layer. The layers it did not reach are placeholders. Read one screen frame by its id as `node-id` rather than the whole section, or pass a larger `timeoutMs` (up to 120000). |
 | A read says `pluginOutdated: true`, or that Design Bridge is too old to export REST JSON | The panel open in Figma runs a plugin older than 1.5.0, which reads its own way and can miss attributes such as per-corner radii. Close Design Bridge and open it again: Figma loads the plugin's code anew. With a clone, `git pull` first. |
-| A read says the bridge is older than the MCP server | Every agent session shares the bridge the first one started, and that one runs an older version. Close every Claude Code, Codex, agy and Gemini CLI session so the next one starts the new bridge, then reopen Design Bridge in Figma. |
+| A read says the bridge is older than the MCP server, or `get_bridge_status` says the bridge runs an older figma-bridge | Every agent session shares the bridge the first one started, and that one runs an older version. Since 1.12.0 a newer server takes the port over by itself; a bridge from before 1.12.0 cannot hand over. Close the session that started it (`get_bridge_status` shows its pid, or on Windows run `netstat -ano \| findstr :3456`): a newer session takes the port within 10 s, and the panel in Figma reconnects by itself. |
+| `PLUGIN_ERROR: ... Unable to establish connection to Figma after 10 seconds` | The bridge and the panel are connected; Figma itself did not load the node in time. That happens on a whole page (node `0-1`) or a section of many screens, more often while Figma is in the background. Read or search one screen frame by its id instead, or bring Figma to the front and retry. |
 | Figma's console shows `Plugin runtime aborted` and the panel closes; the read fails with `SESSION_LOST` | The read was too large for the plugin's memory. Reopen Design Bridge, then read one screen frame rather than a section of many screens, or pass a smaller `depth` or `maxNodes`, or `includeHidden: false`. A panel left open for hours is closer to the limit; reopening it starts fresh. |
 | MCP tools return "No design data" | Call `sync_figma_design` with a Figma URL first. |
 

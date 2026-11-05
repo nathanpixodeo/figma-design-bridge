@@ -624,6 +624,7 @@ test("search_design has the plugin search the node, and reads the node whole onl
   assert.match(old, /# Search: "Sponsor" \(1 matches\)/);
   assert.match(old, /\*\*1\. Sponsor badge\*\* \(FRAME\)/);
   assert.deepEqual(oldReads, ["figma-rest+d50"], "the plugin too old to search reads the node whole");
+  assert.match(old, /> \*\*Note:\*\* The Design Bridge plugin open in Figma is older than 1\.11\.0 and cannot search itself, so this search read the whole node instead/);
 });
 
 const ASSET_CAPABILITIES = ["read-node", "read-document-index", "figma-rest", "edit-seq", "assets", "render"];
@@ -923,4 +924,107 @@ test("npm start and the plugin's MCP server share one bridge with no data direct
   const status = await client.callTool({ name: "get_bridge_status", arguments: {} });
   assert.equal(status.isError, undefined, textOf(status));
   assert.doesNotMatch(client.serverLogs(), /bridge daemon listening/);
+});
+
+// ── Version handoff ─────────────────────────────────────────
+
+async function hostVersion(port) {
+  try {
+    return (await (await fetch(`http://127.0.0.1:${port}/bridge/health`)).json()).serverVersion || null;
+  } catch {
+    return undefined;
+  }
+}
+
+test("a newer MCP server takes the bridge over from an older one, which keeps reading through it", async t => {
+  const dataDir = tempDataDir(t);
+  const port = await freePort();
+  const env = { FIGMA_BRIDGE_DATA_DIR: dataDir, FIGMA_BRIDGE_PORT: String(port) };
+
+  const older = await connectMcp(t, { ...env, FIGMA_BRIDGE_TEST_SERVER_VERSION: "1.12.0" });
+  await waitFor(async () => (await hostVersion(port)) === "1.12.0");
+  const newer = await connectMcp(t, { ...env, FIGMA_BRIDGE_TEST_SERVER_VERSION: "1.12.1" });
+  await waitFor(async () => (await hostVersion(port)) === "1.12.1", 15_000);
+  assert.match(older.serverLogs(), /figma-bridge 1\.12\.1 took the port over; this server now uses it/);
+
+  // The plugin registers again with the new owner, and the older server reads through it.
+  await fakePlugin(t, port, dataDir, "HandoffFile1", request => (request.op === "edit-seq"
+    ? { fileKey: "HandoffFile1", editSeq: 1 }
+    : {
+      fileKey: "HandoffFile1", fileName: "Handoff", nodeId: request.params.nodeId, pageId: "0:1", pageName: "Home",
+      completeness: { nodeCount: 1, byteSize: 60, limitHit: false, truncatedNodeIds: [] },
+      payload: { id: request.params.nodeId, name: "Screen", type: "FRAME" },
+    }));
+  const read = await older.callTool({
+    name: "get_design_summary", arguments: { source: "https://www.figma.com/design/HandoffFile1/Handoff?node-id=1-2" },
+  });
+  assert.equal(read.isError, undefined, textOf(read));
+  assert.match(textOf(read), /Source: Handoff, node 1:2, live read/);
+
+  const status = JSON.parse(textOf(await older.callTool({ name: "get_bridge_status", arguments: {} })));
+  assert.equal(status.thisServerVersion, "1.12.0");
+  assert.equal(status.host.serverVersion, "1.12.1");
+  assert.ok(!status.setupHints.some(hint => /older than this server/.test(hint)), "a newer host is not a problem");
+  const own = JSON.parse(textOf(await newer.callTool({ name: "get_bridge_status", arguments: {} })));
+  assert.equal(own.thisServerVersion, "1.12.1");
+  assert.equal(own.host.pid, status.host.pid);
+});
+
+test("get_bridge_status says when a bridge from before 1.12.0 holds the port, and how to end it", async t => {
+  const dataDir = tempDataDir(t);
+  const port = await freePort();
+  // No serverVersion: what an older bridge reports. It cannot hand over.
+  const owner = await createDaemon({ port, dataDir, log: () => {} });
+  t.after(() => owner.close());
+
+  const client = await connectMcp(t, {
+    FIGMA_BRIDGE_DATA_DIR: dataDir, FIGMA_BRIDGE_PORT: String(port), FIGMA_BRIDGE_TEST_SERVER_VERSION: "1.12.0",
+  });
+  const status = JSON.parse(textOf(await client.callTool({ name: "get_bridge_status", arguments: {} })));
+  assert.equal(status.thisServerVersion, "1.12.0");
+  assert.equal(status.host.serverVersion, null);
+  const hint = status.setupHints.at(-1);
+  assert.match(hint, new RegExp(`The bridge on port ${port} runs a figma-bridge older than 1\\.12\\.0 \\(pid \\d+, started [^)]+\\), older than this server \\(1\\.12\\.0\\)`));
+  assert.match(hint, /cannot hand the port over\. Ask the user to close that session/);
+  assert.match(client.serverLogs(), /a figma-bridge older than 1\.12\.0, older than this server \(1\.12\.0\), and did not hand the port over/);
+  assert.equal(owner.server.listening, true, "the older bridge is never stopped from here");
+});
+
+test("a Figma connection error says the bridge is connected, and to read one screen frame", async t => {
+  const dataDir = tempDataDir(t);
+  const port = await freePort();
+  const client = await connectMcp(t, { FIGMA_BRIDGE_DATA_DIR: dataDir, FIGMA_BRIDGE_PORT: String(port) });
+  await waitFor(() => bridgeHealthy(port));
+
+  const base = `http://127.0.0.1:${port}`;
+  const auth = { authorization: `Bearer ${tokenIn(dataDir)}`, "content-type": "application/json" };
+  const session = await (await fetch(`${base}/bridge/session`, {
+    method: "POST", headers: auth, body: JSON.stringify({ fileKey: "PageFile1", fileName: "Page", pluginInstanceId: "page-plugin" }),
+  })).json();
+  const headers = { ...auth, "x-session-secret": session.sessionSecret };
+  let running = true;
+  t.after(() => { running = false; });
+  (async () => {
+    while (running) {
+      let polled;
+      try {
+        polled = await (await fetch(`${base}/bridge/session/${session.sessionId}/poll?waitMs=1000`, { headers })).json();
+      } catch {
+        return;
+      }
+      for (const request of polled.requests || []) {
+        await fetch(`${base}/bridge/session/${session.sessionId}/reply`, {
+          method: "POST", headers,
+          body: JSON.stringify({ requestId: request.requestId, ok: false, error: "in getNodeByIdAsync: Unable to establish connection to Figma after 10 seconds" }),
+        }).catch(() => {});
+      }
+    }
+  })();
+
+  const read = await client.callTool({
+    name: "get_design_tree", arguments: { source: "https://www.figma.com/design/PageFile1/Page?node-id=0-1" },
+  });
+  assert.equal(read.isError, true);
+  assert.match(textOf(read), /^Error: PLUGIN_ERROR: .*Unable to establish connection to Figma after 10 seconds\. The bridge and the Design Bridge plugin are connected: Figma itself could not load this node/);
+  assert.match(textOf(read), /Read or search one screen frame by its id instead/);
 });

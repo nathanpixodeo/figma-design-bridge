@@ -16,6 +16,15 @@ const SERVICE_NAME = 'figma-design-bridge'
 const DEFAULT_HOST = '127.0.0.1'
 const DEFAULT_PORT = 3456
 const DEFAULT_PROBE_TIMEOUT_MS = 1500
+// How long a server that asked for the port waits for the older owner to let go.
+const HANDOFF_WAIT_MS = 5000
+// Rounds of probe, hand over and start before startOrReuse settles on reuse.
+const MAX_START_ROUNDS = 3
+// After a handoff the plugin registers again within seconds; reads arriving in
+// that window wait for it instead of failing at once.
+const HANDOFF_SESSION_GRACE_MS = 30_000
+// Lets the answers to reads cancelled by a handoff reach their callers.
+const HANDOFF_DRAIN_MS = 200
 
 // Binding anywhere else would expose the bridge, and its token, to the network.
 const LOOPBACK_BIND_HOSTS = new Set(['127.0.0.1', 'localhost', '::1'])
@@ -50,6 +59,22 @@ function portOf(url) {
 function majorOf(version) {
   const match = /^(\d+)\./.exec(String(version || ''))
   return match ? match[1] : null
+}
+
+// Orders two x.y.z versions: -1, 0 or 1. A missing or malformed version sorts
+// before any real one, because only servers from before 1.12.0 report none.
+function compareVersions(a, b) {
+  const parse = value => {
+    const match = /^(\d+)\.(\d+)\.(\d+)/.exec(String(value || ''))
+    return match ? match.slice(1).map(Number) : null
+  }
+  const x = parse(a)
+  const y = parse(b)
+  if (!x || !y) return x ? 1 : (y ? -1 : 0)
+  for (let i = 0; i < 3; i++) {
+    if (x[i] !== y[i]) return x[i] < y[i] ? -1 : 1
+  }
+  return 0
 }
 
 function isCompatibleProtocol(remote, local) {
@@ -114,6 +139,9 @@ async function createDaemon(options = {}) {
     maxBodyBytes,
     allowedOrigins,
     protocolVersion = PROTOCOL_VERSION,
+    serverVersion = null,
+    sessionGraceMs = 0,
+    onHandoff = null,
     now = () => Date.now(),
     log = defaultLog,
     fallback = null,
@@ -142,8 +170,29 @@ async function createDaemon(options = {}) {
   const broker = options.broker
     || factoryFrom(loadSibling('broker'), 'createBroker', 'broker')({ now, log, identity })
 
+  let actualPort = port
+  let closeDaemon = null
+
+  // A newer server asked for the port: stop listening at once so it can bind,
+  // and tell the owner, which carries on as that server's client.
+  let handedOver = false
+  function handOver(version) {
+    if (handedOver || !closeDaemon) return
+    handedOver = true
+    log('info', `bridge daemon: handing port ${actualPort} over to figma-bridge ${version}`)
+    try {
+      if (typeof onHandoff === 'function') onHandoff({ version })
+    } catch (error) {
+      log('warn', `bridge daemon: handoff callback failed: ${error.message}`)
+    }
+    closeDaemon('handoff').catch(() => {})
+  }
+
   const handler = createRoutes({
-    broker, cache, identity, token: currentToken, protocolVersion, maxBodyBytes, allowedOrigins, now, log,
+    broker, cache, identity, token: currentToken, protocolVersion, serverVersion, sessionGraceMs,
+    canHandOver: requester => Boolean(serverVersion) && compareVersions(requester, serverVersion) > 0,
+    onHandoff: handOver,
+    maxBodyBytes, allowedOrigins, now, log,
   })
 
   // The legacy router authenticates with the daemon's own token, which is only
@@ -188,26 +237,31 @@ async function createDaemon(options = {}) {
   server.on('error', error => log('error', `bridge daemon: server error: ${error.message}`))
 
   const address = server.address()
-  const actualPort = address && typeof address === 'object' ? address.port : port
+  actualPort = address && typeof address === 'object' ? address.port : port
   const url = baseUrl(host, actualPort)
 
   let closing = null
   function close(reason = 'daemon-close') {
     if (closing) return closing
     closing = (async () => {
-      // Release every waiter first so an in-flight long poll cannot keep the
+      // Stop listening first, so a successor can take the port at once.
+      const done = new Promise(resolve => server.close(() => resolve()))
+      // Release every waiter so an in-flight long poll cannot keep the
       // process alive after close() resolves.
       try { if (typeof broker.cancelAll === 'function') broker.cancelAll(reason) } catch {}
       if (typeof server.closeIdleConnections === 'function') server.closeIdleConnections()
-      const done = new Promise(resolve => server.close(() => resolve()))
+      // A handoff lets the answers to the reads it cancelled reach their
+      // callers, who retry them on the new owner.
+      if (reason === 'handoff') await new Promise(resolve => setTimeout(resolve, HANDOFF_DRAIN_MS))
       if (typeof server.closeAllConnections === 'function') server.closeAllConnections()
       await done
     })()
     return closing
   }
+  closeDaemon = close
 
   log('info', `bridge daemon listening on ${url}`)
-  return { server, url, port: actualPort, host, token, currentToken, broker, cache, identity, protocolVersion, close }
+  return { server, url, port: actualPort, host, token, currentToken, broker, cache, identity, protocolVersion, serverVersion, close }
 }
 
 function endJSON(res, status, body) {
@@ -259,7 +313,9 @@ async function probe(url, options = {}) {
   if (!isCompatibleProtocol(reported, protocolVersion)) {
     return { ours: false, protocolVersion: reported, reason: 'incompatible-protocol' }
   }
-  return { ours: true, protocolVersion: reported, reason: 'ok' }
+  // null: a bridge from before 1.12.0, which reports no version and cannot hand over.
+  const serverVersion = typeof body.serverVersion === 'string' ? body.serverVersion : null
+  return { ours: true, protocolVersion: reported, serverVersion, reason: 'ok' }
 }
 
 function occupiedError(url, result) {
@@ -287,7 +343,11 @@ function busyError(url) {
   return error
 }
 
-function reuseDescriptor(url, dataDir, result) {
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+function reuseDescriptor(url, dataDir, result, serverVersion) {
   const stored = readToken(dataDir)
   return {
     reused: true,
@@ -298,12 +358,67 @@ function reuseDescriptor(url, dataDir, result) {
     token: stored ? stored.token : null,
     currentToken: stored ? createTokenSource(dataDir, stored.token) : () => null,
     protocolVersion: result.protocolVersion,
+    // The owner's version: null for a bridge from before 1.12.0.
+    hostVersion: result.serverVersion || null,
+    // The owner is older than this server and did not hand the port over.
+    outdatedHost: Boolean(serverVersion) && compareVersions(result.serverVersion, serverVersion) < 0,
     server: null,
     // We did not start it, so we never stop it.
     close: async () => {},
   }
 }
 
+// A busy owner is probed again with more time. awaitHostMs keeps probing a
+// free port that long: right after this server handed the port over, its
+// successor may not listen yet.
+async function probeOwner(url, probeOptions, awaitHostMs = 0) {
+  let found = await probe(url, probeOptions)
+  for (let retry = 0; found.reason === 'timeout' && retry < 2; retry++) {
+    found = await probe(url, { ...probeOptions, timeoutMs: probeOptions.timeoutMs * 2 })
+  }
+  const deadline = Date.now() + awaitHostMs
+  while (found.reason === 'no-listener' && Date.now() < deadline) {
+    await sleep(200)
+    found = await probe(url, probeOptions)
+  }
+  return found
+}
+
+// Asks an older owner to hand the port over, then waits until it lets go.
+// false: the owner refused or could not be asked, or did not let go in time.
+async function requestHandoff(url, dataDir, serverVersion, probeOptions) {
+  const stored = readToken(dataDir)
+  if (!stored || !stored.token) return false
+  const fetchImpl = probeOptions.fetchImpl || globalThis.fetch
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), probeOptions.timeoutMs * 2)
+  try {
+    const response = await fetchImpl(`${url}/bridge/handoff`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${stored.token}` },
+      body: JSON.stringify({ version: serverVersion }),
+      signal: controller.signal,
+    })
+    if (response.status !== 202) return false
+  } catch {
+    return false
+  } finally {
+    clearTimeout(timer)
+  }
+  const deadline = Date.now() + HANDOFF_WAIT_MS
+  while (Date.now() < deadline) {
+    const found = await probe(url, probeOptions)
+    // Free, or already taken by a server at least as new as this one.
+    if (found.reason === 'no-listener') return true
+    if (found.ours && compareVersions(found.serverVersion, serverVersion) >= 0) return true
+    await sleep(100)
+  }
+  return false
+}
+
+// Reuses the bridge on the port, has an older owner hand it over, or starts
+// one. Many servers may run this at once: every round probes again, so they
+// converge on one owner, the newest of them.
 async function startOrReuse(options = {}) {
   const {
     port = DEFAULT_PORT,
@@ -311,6 +426,8 @@ async function startOrReuse(options = {}) {
     dataDir,
     probeTimeoutMs = DEFAULT_PROBE_TIMEOUT_MS,
     fetchImpl,
+    serverVersion = null,
+    awaitHostMs = 0,
   } = options
 
   if (typeof dataDir !== 'string' || !dataDir.trim()) throw new Error('startOrReuse requires a dataDir')
@@ -320,44 +437,70 @@ async function startOrReuse(options = {}) {
 
   const url = baseUrl(host, port)
   const probeOptions = { timeoutMs: probeTimeoutMs, fetchImpl }
+  let handedOver = false
 
-  let first = await probe(url, probeOptions)
-  for (let retry = 0; first.reason === 'timeout' && retry < 2; retry++) {
-    first = await probe(url, { ...probeOptions, timeoutMs: probeTimeoutMs * 2 })
-  }
-  if (first.ours) return reuseDescriptor(url, dataDir, first)
-  if (first.reason === 'timeout') throw busyError(url)
-  if (first.reason !== 'no-listener') throw occupiedError(url, first)
-
-  try {
-    const daemon = await createDaemon(options)
-    return {
-      reused: false,
-      started: true,
-      owned: true,
-      url: daemon.url,
-      port: daemon.port,
-      token: daemon.token,
-      currentToken: daemon.currentToken,
-      protocolVersion: daemon.protocolVersion,
-      server: daemon.server,
-      close: daemon.close,
+  for (let round = 0; round < MAX_START_ROUNDS; round++) {
+    const found = await probeOwner(url, probeOptions, round === 0 ? awaitHostMs : 0)
+    if (found.ours) {
+      // Only an owner that reports its version can hand over. One from before
+      // 1.12.0 is reused, and the descriptor says it is outdated.
+      const older = Boolean(serverVersion && found.serverVersion)
+        && compareVersions(found.serverVersion, serverVersion) < 0
+      if (!older || round === MAX_START_ROUNDS - 1) return reuseDescriptor(url, dataDir, found, serverVersion)
+      if (!(await requestHandoff(url, dataDir, serverVersion, probeOptions))) {
+        return reuseDescriptor(url, dataDir, found, serverVersion)
+      }
+      handedOver = true
+      // Another server may have taken the freed port first: decide again.
+      const after = await probe(url, probeOptions)
+      if (after.ours) continue
+    } else if (found.reason === 'timeout') {
+      throw busyError(url)
+    } else if (found.reason !== 'no-listener') {
+      throw occupiedError(url, found)
     }
-  } catch (error) {
-    if (errorCode(error) !== 'EADDRINUSE') throw error
-    // Lost the race between the probe and listen(). Re-probe once: if the
-    // winner is ours, converge on it rather than failing or starting a second.
-    const second = await probe(url, { ...probeOptions, timeoutMs: probeTimeoutMs * 2 })
-    if (second.ours) return reuseDescriptor(url, dataDir, second)
-    if (second.reason === 'timeout') throw busyError(url)
-    throw occupiedError(url, second)
+
+    try {
+      const daemon = await createDaemon({
+        ...options,
+        sessionGraceMs: handedOver
+          ? Math.max(options.sessionGraceMs || 0, HANDOFF_SESSION_GRACE_MS)
+          : options.sessionGraceMs,
+      })
+      return {
+        reused: false,
+        started: true,
+        owned: true,
+        handedOver,
+        url: daemon.url,
+        port: daemon.port,
+        token: daemon.token,
+        currentToken: daemon.currentToken,
+        protocolVersion: daemon.protocolVersion,
+        hostVersion: serverVersion,
+        outdatedHost: false,
+        server: daemon.server,
+        close: daemon.close,
+      }
+    } catch (error) {
+      if (errorCode(error) !== 'EADDRINUSE') throw error
+      // Lost the race between the probe and listen(): the next round converges
+      // on the winner rather than failing or starting a second.
+    }
   }
+
+  const last = await probeOwner(url, probeOptions)
+  if (last.ours) return reuseDescriptor(url, dataDir, last, serverVersion)
+  if (last.reason === 'timeout') throw busyError(url)
+  throw occupiedError(url, last)
 }
 
 module.exports = {
   createDaemon,
   startOrReuse,
   probe,
+  compareVersions,
+  HANDOFF_SESSION_GRACE_MS,
   PROTOCOL_VERSION,
   SERVICE_NAME,
   baseUrl,
