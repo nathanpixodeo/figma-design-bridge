@@ -2,7 +2,9 @@ const test = require('node:test')
 const assert = require('node:assert/strict')
 const fs = require('fs')
 const http = require('http')
+const net = require('net')
 const os = require('os')
+const { once } = require('events')
 const path = require('path')
 
 const { createDaemon, startOrReuse, probe, baseUrl, compareVersions, SERVICE_NAME, PROTOCOL_VERSION } = require('./daemon')
@@ -580,7 +582,61 @@ test('five servers starting at once against an older owner converge on one new o
   assert.ok(results.every(result => result.url === results[0].url))
   assert.ok(results.every(result => result.outdatedHost === false))
   assert.equal(old.handoffs.length, 1)
+  // Waits out the old owner's drain, which turns kept-alive connections away.
+  await old.host.close('test-teardown')
   assert.equal((await probe(results[0].url)).serverVersion, '1.12.1')
+})
+
+test('a daemon handing its port over turns away a request on a kept-alive connection', async t => {
+  const daemon = await startDaemon(t, { serverVersion: '1.12.0' })
+  const socket = net.connect(daemon.port, '127.0.0.1')
+  t.after(() => socket.destroy())
+  await once(socket, 'connect')
+  let raw = ''
+  socket.on('data', chunk => { raw += chunk })
+  const socketClosed = once(socket, 'close')
+  // A request already begun keeps its connection open while the daemon closes.
+  socket.write('GET /bridge/health HTTP/1.1\r\nHost: 127.0.0.1\r\n')
+  await new Promise(resolve => setTimeout(resolve, 50))
+  const closed = daemon.close('handoff')
+  socket.write('\r\n')
+  await socketClosed
+  await closed
+
+  assert.match(raw, /^HTTP\/1\.1 503/)
+  assert.match(raw, /connection: close/i)
+  assert.match(raw, /"code":"BRIDGE_HANDOFF"/)
+  assert.doesNotMatch(raw, /"serverVersion"/)
+})
+
+test('probe reports a bridge that is handing its port over, and only that 503 as such', async () => {
+  const answer = body => async () => new Response(JSON.stringify(body), {
+    status: 503, headers: { 'content-type': 'application/json' },
+  })
+  const handing = await probe('http://127.0.0.1:1', { fetchImpl: answer({ code: 'BRIDGE_HANDOFF', service: SERVICE_NAME }) })
+  assert.equal(handing.ours, false)
+  assert.equal(handing.reason, 'handing-over')
+
+  const foreign = await probe('http://127.0.0.1:1', { fetchImpl: answer({ code: 'BRIDGE_HANDOFF', service: 'other' }) })
+  assert.equal(foreign.reason, 'http-503')
+})
+
+test('startOrReuse waits for a bridge handing its port over, then starts with the grace window', async t => {
+  const dataDir = tempDataDir(t)
+  const port = await freePort(t)
+  let refusals = 3
+  const fetchImpl = async (url, init) => {
+    if (url.endsWith('/bridge/health') && refusals-- > 0) {
+      return new Response(JSON.stringify({ code: 'BRIDGE_HANDOFF', service: SERVICE_NAME }), { status: 503 })
+    }
+    return fetch(url, init)
+  }
+  const host = await startOrReuse({ port, dataDir, serverVersion: '1.12.1', fetchImpl, log: quietLog, ...fakeDeps() })
+  t.after(() => host.close('test-teardown'))
+
+  assert.equal(host.started, true)
+  assert.equal(host.handedOver, true)
+  assert.equal(host.outdatedHost, false)
 })
 
 test('a server whose handoff request finds the owner already closing waits for the port instead of reusing that owner', async t => {

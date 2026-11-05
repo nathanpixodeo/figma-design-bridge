@@ -678,7 +678,11 @@ can call it. The owner accepts only a version newer than its own:
 
 - `202 { "accepted": true, "serverVersion": "1.12.0" }`. Right after the answer,
   the owner stops listening, fails the reads it holds with `BRIDGE_HANDOFF`,
-  and carries on as a client of the new owner.
+  and carries on as a client of the new owner. For the 200 ms it takes those
+  answers to go out, a request that reaches it on a kept-alive connection,
+  `/bridge/health` included, gets `503 BRIDGE_HANDOFF` with
+  `Connection: close`, never an answer as the owner. A probe reads that as a
+  bridge handing over and waits for the new owner.
 - `409 HANDOFF_REFUSED` for the same version or an older one.
 
 The new owner binds the port and, for its first 30 s, a live read for a file
@@ -795,7 +799,7 @@ Errors are distinguishable by design: an agent can tell "plugin offline" from
 | `UPSTREAM_INVALID` | 502 | The plugin returned an unusable result |
 | `HANDOFF_REFUSED` | 409 | `/bridge/handoff` asked for a version that is not newer than the owner |
 | `SESSION_LOST` | 503 | The answering session went away mid-request |
-| `BRIDGE_HANDOFF` | 503 | The bridge handed its port to a newer server before the read finished. Retry: the new owner serves it |
+| `BRIDGE_HANDOFF` | 503 | The bridge handed its port to a newer server before the read finished, or while the request was arriving. Retry: the new owner serves it |
 | `CANCELLED` | — | The caller closed its connection before the read was handed out; the read is dropped. Never sent, since nobody is left to read it |
 | `TIMEOUT` | 504 | The plugin did not answer within `timeoutMs`, or the read waited past `timeoutMs` + `queueWaitMs` for its lane. The message says how many reads of that lane were ahead of it |
 

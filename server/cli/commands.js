@@ -178,6 +178,7 @@ async function describeBridge(port, dataDir, token) {
   if (!probed.ours) {
     if (probed.reason === 'no-listener') return ['not running (it starts with Claude Code, Codex, agy or Gemini CLI, or figma-bridge start)']
     if (probed.reason === 'timeout') return [`port ${port} accepted the connection but did not answer in time (busy with a large read?)`]
+    if (probed.reason === 'handing-over') return [`handing port ${port} over to a newer figma-bridge server: check again in a moment`]
     return [`port ${port} is held by another program (${probed.reason})`]
   }
   const legacy = await getJson(`${url}/health`, 2000)

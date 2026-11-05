@@ -172,6 +172,7 @@ async function createDaemon(options = {}) {
 
   let actualPort = port
   let closeDaemon = null
+  let closeReason = null
 
   // A newer server asked for the port: stop listening at once so it can bind,
   // and tell the owner, which carries on as that server's client.
@@ -202,6 +203,18 @@ async function createDaemon(options = {}) {
     : fallback
 
   const server = http.createServer((req, res) => {
+    // Once the port is handed over, a request reaching this daemon came on a
+    // kept-alive connection. Serving it as the owner would show a caller the
+    // old owner after it let go, so it is turned away and the connection closed.
+    if (closeReason === 'handoff') {
+      res.shouldKeepAlive = false
+      endJSON(res, 503, {
+        error: 'This bridge handed its port to a newer figma-bridge server. Retry the call.',
+        code: 'BRIDGE_HANDOFF',
+        service: SERVICE_NAME,
+      })
+      return
+    }
     let handled
     try {
       handled = handler(req, res)
@@ -243,6 +256,7 @@ async function createDaemon(options = {}) {
   let closing = null
   function close(reason = 'daemon-close') {
     if (closing) return closing
+    closeReason = reason
     closing = (async () => {
       // Stop listening first, so a successor can take the port at once.
       const done = new Promise(resolve => server.close(() => resolve()))
@@ -299,6 +313,15 @@ async function probe(url, options = {}) {
     clearTimeout(timer)
   }
 
+  if (response.status === 503) {
+    // A bridge in the middle of handing its port over, reached on a kept-alive
+    // connection. Its successor answers in a moment.
+    let refusal = null
+    try { refusal = await response.json() } catch {}
+    if (refusal && refusal.service === SERVICE_NAME && refusal.code === 'BRIDGE_HANDOFF') {
+      return { ours: false, protocolVersion: null, reason: 'handing-over' }
+    }
+  }
   if (!response.ok) return { ours: false, protocolVersion: null, reason: `http-${response.status}` }
 
   let body
@@ -368,13 +391,18 @@ function reuseDescriptor(url, dataDir, result, serverVersion) {
   }
 }
 
-// A busy owner is probed again with more time. awaitHostMs keeps probing a
-// free port that long: right after this server handed the port over, its
-// successor may not listen yet.
+// A busy owner is probed again with more time, and one handing the port over
+// is waited out. awaitHostMs keeps probing a free port that long: right after
+// this server handed the port over, its successor may not listen yet.
 async function probeOwner(url, probeOptions, awaitHostMs = 0) {
   let found = await probe(url, probeOptions)
   for (let retry = 0; found.reason === 'timeout' && retry < 2; retry++) {
     found = await probe(url, { ...probeOptions, timeoutMs: probeOptions.timeoutMs * 2 })
+  }
+  const handoffDeadline = Date.now() + HANDOFF_WAIT_MS
+  while (found.reason === 'handing-over' && Date.now() < handoffDeadline) {
+    await sleep(100)
+    found = { ...(await probe(url, probeOptions)), afterHandoff: true }
   }
   const deadline = Date.now() + awaitHostMs
   while (found.reason === 'no-listener' && Date.now() < deadline) {
@@ -382,6 +410,21 @@ async function probeOwner(url, probeOptions, awaitHostMs = 0) {
     found = await probe(url, probeOptions)
   }
   return found
+}
+
+// Free, or already taken by a server at least as new as this one.
+function released(found, serverVersion) {
+  return found.reason === 'no-listener'
+    || (found.ours && compareVersions(found.serverVersion, serverVersion) >= 0)
+}
+
+async function waitForRelease(url, serverVersion, probeOptions) {
+  const deadline = Date.now() + HANDOFF_WAIT_MS
+  while (Date.now() < deadline) {
+    if (released(await probe(url, probeOptions), serverVersion)) return true
+    await sleep(100)
+  }
+  return false
 }
 
 // Asks an older owner to hand the port over, then waits until it lets go.
@@ -392,6 +435,7 @@ async function requestHandoff(url, dataDir, serverVersion, probeOptions) {
   const fetchImpl = probeOptions.fetchImpl || globalThis.fetch
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), probeOptions.timeoutMs * 2)
+  let accepted = true
   try {
     const response = await fetchImpl(`${url}/bridge/handoff`, {
       method: 'POST',
@@ -399,7 +443,7 @@ async function requestHandoff(url, dataDir, serverVersion, probeOptions) {
       body: JSON.stringify({ version: serverVersion }),
       signal: controller.signal,
     })
-    if (response.status !== 202) return false
+    accepted = response.status === 202
   } catch {
     // No answer: most likely the owner already stopped listening for another
     // server's handoff. Wait for the port like an accepted handoff, rather
@@ -407,15 +451,14 @@ async function requestHandoff(url, dataDir, serverVersion, probeOptions) {
   } finally {
     clearTimeout(timer)
   }
-  const deadline = Date.now() + HANDOFF_WAIT_MS
-  while (Date.now() < deadline) {
+  if (!accepted) {
+    // The refusal may come from an owner already handing the port to another
+    // server, or from a successor that took it meanwhile.
     const found = await probe(url, probeOptions)
-    // Free, or already taken by a server at least as new as this one.
-    if (found.reason === 'no-listener') return true
-    if (found.ours && compareVersions(found.serverVersion, serverVersion) >= 0) return true
-    await sleep(100)
+    if (released(found, serverVersion)) return true
+    if (found.reason !== 'handing-over') return false
   }
-  return false
+  return waitForRelease(url, serverVersion, probeOptions)
 }
 
 // Reuses the bridge on the port, has an older owner hand it over, or starts
@@ -443,6 +486,9 @@ async function startOrReuse(options = {}) {
 
   for (let round = 0; round < MAX_START_ROUNDS; round++) {
     const found = await probeOwner(url, probeOptions, round === 0 ? awaitHostMs : 0)
+    // The port was being handed to another server: a daemon started here
+    // gives the plugin the same time to register again.
+    if (found.afterHandoff) handedOver = true
     if (found.ours) {
       // Only an owner that reports its version can hand over. One from before
       // 1.12.0 is reused, and the descriptor says it is outdated.
@@ -450,13 +496,16 @@ async function startOrReuse(options = {}) {
         && compareVersions(found.serverVersion, serverVersion) < 0
       if (!older || round === MAX_START_ROUNDS - 1) return reuseDescriptor(url, dataDir, found, serverVersion)
       if (!(await requestHandoff(url, dataDir, serverVersion, probeOptions))) {
-        return reuseDescriptor(url, dataDir, found, serverVersion)
+        // Reuse what holds the port now, not what held it before the request.
+        const now = await probeOwner(url, probeOptions)
+        if (now.ours) return reuseDescriptor(url, dataDir, now, serverVersion)
+        continue
       }
       handedOver = true
       // Another server may have taken the freed port first: decide again.
       const after = await probe(url, probeOptions)
       if (after.ours) continue
-    } else if (found.reason === 'timeout') {
+    } else if (found.reason === 'timeout' || found.reason === 'handing-over') {
       throw busyError(url)
     } else if (found.reason !== 'no-listener') {
       throw occupiedError(url, found)
@@ -493,7 +542,7 @@ async function startOrReuse(options = {}) {
 
   const last = await probeOwner(url, probeOptions)
   if (last.ours) return reuseDescriptor(url, dataDir, last, serverVersion)
-  if (last.reason === 'timeout') throw busyError(url)
+  if (last.reason === 'timeout' || last.reason === 'handing-over') throw busyError(url)
   throw occupiedError(url, last)
 }
 
